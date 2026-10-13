@@ -40,6 +40,8 @@ pub struct LiveInfo {
     pub notice: Option<String>,
     /// The keyboard hook is on (the window is in front), and keys sent so far.
     pub keyboard_active: bool,
+    /// Why not, when not.
+    pub keyboard_off: Option<&'static str>,
     pub keys_sent: u64,
     /// Key-down read from the hook → written to the connection.
     pub key_send: Timing,
@@ -105,7 +107,11 @@ fn encode(frame: &nocomputer_proto::VideoFrame) -> Vec<u8> {
     out.extend_from_slice(&0u32.to_le_bytes()); // key_us, set by live_next
     out.push(codec.len() as u8);
     out.extend_from_slice(codec);
-    out.extend_from_slice(&frame.data);
+    match frame.keyframe.then(|| crate::sps::no_reorder(&frame.data)).flatten() {
+        // So the decoder shows each frame at once (see sps.rs).
+        Some(data) => out.extend_from_slice(&data),
+        None => out.extend_from_slice(&frame.data),
+    }
     out
 }
 
@@ -339,6 +345,7 @@ pub fn live_settings(command_key: crate::keys::CommandKey) {
 #[tauri::command]
 pub fn live_info(live: tauri::State<'_, Live>) -> LiveInfo {
     let mut info = live.info.lock().unwrap().clone();
-    (info.keyboard_active, info.keys_sent) = crate::hook::status();
+    let (state, keys_sent) = crate::hook::status();
+    (info.keyboard_active, info.keyboard_off, info.keys_sent) = (state.is_ok(), state.err(), keys_sent);
     info
 }

@@ -477,7 +477,7 @@ function startInput(launch) {
     const i = await invoke('live_info').catch(() => null);
     if (!i) return;
     info.notice = i.notice;
-    if (info.hook) info.keyboard = i.keyboard_active ? `keys on (${i.keys_sent} sent)` : 'keys off (window not in front)';
+    if (info.hook) info.keyboard = i.keyboard_active ? `keys on (${i.keys_sent} sent)` : `keys off (${i.keyboard_off ?? 'unknown'})`;
     const ms = (avg, max) => `${avg.toFixed(0)}/${max.toFixed(0)}`;
     if (i.key_frame?.n) {
       const shown = info.keyShown ? `, shown ${ms(info.keyShown.avg, info.keyShown.max)}` : '';

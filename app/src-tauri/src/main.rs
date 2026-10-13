@@ -18,6 +18,7 @@ mod bench;
 mod hook;
 mod keys;
 mod live;
+mod sps;
 
 use serde::Serialize;
 use std::path::PathBuf;

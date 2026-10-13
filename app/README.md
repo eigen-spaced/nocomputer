@@ -41,6 +41,7 @@ nocomputer-viewer.exe --check [--require-hardware] --connect HOST
 - **Delivery:** `live.rs` connects when the page asks for its first frame. The page pulls frames with a long-poll invoke (the pull path from the IPC bench) as raw bytes.
 - **Dropping:** if the page or decoder falls behind, frames are dropped up to the next keyframe and one is requested. After a decoder error the page waits for a keyframe.
 - **Timestamps:** decoder timestamps are the host's `host_us`.
+- **No reordering:** each keyframe's SPS is rewritten to say frames are never reordered (`sps.rs`). VideoToolbox's SPS has a VUI without `bitstream_restriction`, so Chromium's decoder held several frames before output, and on a quiet screen, where frames come only on change, each waited for later ones.
 - **Exit:** the session is closed on exit, so the host frees its single-controller slot at once.
 - **Check mode:** `--check` decodes the first 300 frames and prints a JSON summary: frames, keyframes, drops on each side, size, and the largest gap between host timestamps.
 
@@ -60,9 +61,19 @@ Live mode sends input on the authenticated control stream. Nothing typed is logg
 - **Viewer shortcuts:** Ctrl+Alt+Shift with F (fullscreen), N (native), H (status), R (reset) or the arrows (pan). These never reach the host.
 - **Release:** held keys and buttons are released when the window loses the foreground, on disconnect, and by the host at every session start and end.
 - **Not capturable:** Ctrl+Alt+Del and Win+L are handled by Windows before any hook and always act locally.
-- **Status bar:** drops, decode errors, keyframe age, arrival jitter (the worst difference over 2 s between an arrival gap on this PC and the matching capture gap on the host; each gap is on one clock), the deepest decode queue over 2 s, and the keyboard state.
+- **Status bar:** drops, decode errors, keyframe age, arrival jitter (the worst difference over 2 s between an arrival gap on this PC and the matching capture gap on the host; each gap is on one clock), the deepest decode queue over 2 s, the keyboard state (and why it is off: window not in front, no session, helper not running), and key timing. Key timing starts when a key-down is read from the hook: *send* ends when it is written to the connection, *key→frame* when the next video frame arrives, and *shown* when that frame leaves the decoder (avg/max over the last 32). Each part is on one monotonic clock; the Rust-to-page hop (about 3 ms) is not counted. The next frame is the key's echo only if nothing else on the screen changes, so measure typing into a still window with the pointer parked.
+- **Foreground:** a WinEvent hook reports the window coming to the front, and a 250 ms poll of `GetForegroundWindow` backs it up; in one run the events never arrived and the keyboard stayed off.
 
 Recorded 2026-10-13 against the Mac host (user-confirmed): pointer, clicks, dragging and typing work, and video keeps updating while dragging. Over Tailscale the path was relayed through DERP (Dubai, about 30 ms) although both machines were on the same Wi-Fi, and typing visibly lagged. With `--via` to the Mac's LAN address the user found it "definitely" snappier. The direct-path failure is not yet diagnosed.
+
+Key timing over Tailscale (DERP), 2026-10-13, typing into a still Terminal on the Mac, viewer numbers in ms as avg/max:
+
+| | key→frame | shown | n |
+| --- | --- | --- | --- |
+| Before the SPS rewrite (about 4 fps on a quiet screen) | 52 / 249 | 573 / 1509 | 39 |
+| After | 56 / 164 | 58 / 166 | 89 |
+
+*send* stayed at most 0.2 ms. After the rewrite, a frame is decoded about 2 ms after it arrives; the user called typing "blazing fast". The Mac side at the same time (its own clock, 60 fps): key injected → next captured frame 40.5 / 62.2 ms, encode 15.1 / 24.9 ms. The two sides' "next frame" can be different frames, so these don't add up exactly.
 
 ## What counts as hardware-decode evidence
 

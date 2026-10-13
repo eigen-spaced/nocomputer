@@ -66,10 +66,21 @@ fn viewer() -> std::sync::MutexGuard<'static, Viewer> {
     VIEWER.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Whether keys are going to the host right now, and how many have.
-pub fn status() -> (bool, u64) {
+/// Whether keys are going to the host right now (or why not), and how many have.
+pub fn status() -> (Result<(), &'static str>, u64) {
     let v = viewer();
-    (v.settings.active && v.helper.is_some(), v.keys_sent)
+    let state = if v.helper.is_none() {
+        Err("keyboard helper not running")
+    } else if !v.foreground {
+        Err("window not in front")
+    } else if !v.connected {
+        Err("no session")
+    } else if !v.settings.active {
+        Err("hook not switched on")
+    } else {
+        Ok(())
+    };
+    (state, v.keys_sent)
 }
 
 fn update(change: impl FnOnce(&mut Settings)) {
@@ -208,8 +219,12 @@ mod windows {
         // SAFETY: a valid callback; out of context, so it runs on this thread's message
         // loop. The hook lasts as long as the process.
         unsafe { SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, std::ptr::null_mut(), Some(foreground_changed), 0, 0, WINEVENT_OUTOFCONTEXT) };
-        // SAFETY: no preconditions.
-        foreground(unsafe { GetForegroundWindow() } as isize);
+        // Also poll: a missed foreground event must not leave the keyboard off (or on).
+        std::thread::spawn(|| loop {
+            // SAFETY: no preconditions.
+            foreground(unsafe { GetForegroundWindow() } as isize);
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        });
     }
 
     unsafe extern "system" fn foreground_changed(_: HWINEVENTHOOK, _: u32, hwnd: HWND, _: i32, _: i32, _: u32, _: u32) {

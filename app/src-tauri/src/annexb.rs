@@ -57,7 +57,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// Byte ranges of NAL units, each starting at its start code.
-fn nal_ranges(data: &[u8]) -> Vec<(usize, usize, usize)> {
+pub(crate) fn nal_ranges(data: &[u8]) -> Vec<(usize, usize, usize)> {
     // (start code begin, payload begin, end)
     let mut starts = Vec::new();
     let mut i = 0;
