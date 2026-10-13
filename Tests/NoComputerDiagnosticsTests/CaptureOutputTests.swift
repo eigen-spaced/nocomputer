@@ -16,17 +16,19 @@ struct CaptureOutputTests {
         }
     }
 
-    private func frame(_ status: SCFrameStatus) throws -> CMSampleBuffer {
+    private func frame(_ status: SCFrameStatus, width: Int = 8, height: Int = 8,
+                       time: Int64 = 42) throws -> CMSampleBuffer {
         var pixel: CVPixelBuffer?
-        #expect(CVPixelBufferCreate(kCFAllocatorDefault, 8, 8, kCVPixelFormatType_32BGRA,
-                                   nil, &pixel) == kCVReturnSuccess)
+        #expect(CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA,
+                                   [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary,
+                                   &pixel) == kCVReturnSuccess)
         let buffer = try #require(pixel)
         var format: CMVideoFormatDescription?
         #expect(CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,
                                                                    imageBuffer: buffer,
                                                                    formatDescriptionOut: &format) == noErr)
         var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 30),
-                                       presentationTimeStamp: CMTime(value: 42, timescale: 30),
+                                       presentationTimeStamp: CMTime(value: time, timescale: 30),
                                        decodeTimeStamp: .invalid)
         var sample: CMSampleBuffer?
         let description = try #require(format)
@@ -43,11 +45,46 @@ struct CaptureOutputTests {
         return result
     }
 
-    private func send(_ status: SCFrameStatus, to output: CaptureOutput) throws {
+    private func send(_ status: SCFrameStatus, to output: CaptureOutput, width: Int = 8, height: Int = 8,
+                      time: Int64 = 42) throws {
         // The callback does not use the stream instance; use a minimal local
         // stream without starting capture or requesting screen permissions.
         let stream = SCStream(filter: SCContentFilter(), configuration: SCStreamConfiguration(), delegate: nil)
-        output.stream(stream, didOutputSampleBuffer: try frame(status), of: .screen)
+        output.stream(stream, didOutputSampleBuffer: try frame(status, width: width, height: height, time: time),
+                      of: .screen)
+    }
+
+    private func waitFor(_ condition: () -> Bool) async throws {
+        for _ in 0..<200 where !condition() { try await Task.sleep(nanoseconds: 10_000_000) }
+    }
+
+    @Test func keyframeRequestOnAStillScreenRepeatsTheLastFrameAsAnIDR() async throws {
+        let encoder = try VideoEncoder(width: 320, height: 240)
+        defer { encoder.close() }
+        let output = CaptureOutput(encoder: encoder)
+        try send(.complete, to: output, width: 320, height: 240)
+        try await waitFor { encoder.snapshot().encoded == 1 }
+        output.requestKeyframe(queue: DispatchQueue(label: "test"), delay: .milliseconds(10))
+        try await waitFor { encoder.snapshot().encoded == 2 }
+        let state = encoder.snapshot()
+        #expect(state.encoded == 2)
+        #expect(state.keyframes == 2)
+        #expect(state.error == nil)
+    }
+
+    @Test func keyframeRequestUsesANewFrameInsteadOfRepeating() async throws {
+        let encoder = try VideoEncoder(width: 320, height: 240)
+        defer { encoder.close() }
+        let output = CaptureOutput(encoder: encoder)
+        try send(.complete, to: output, width: 320, height: 240, time: 1)
+        try await waitFor { encoder.snapshot().encoded == 1 }
+        output.requestKeyframe(queue: DispatchQueue(label: "test"), delay: .milliseconds(200))
+        try send(.complete, to: output, width: 320, height: 240, time: 2)
+        try await Task.sleep(nanoseconds: 500_000_000)
+        let state = encoder.snapshot()
+        #expect(state.encoded == 2)
+        #expect(state.keyframes == 2)
+        #expect(state.error == nil)
     }
 
     @Test func onlyCompleteFramesAreCounted() throws {
@@ -59,6 +96,19 @@ struct CaptureOutputTests {
         #expect(state.callbacks == 4)
         #expect(state.completeFrames == 1)
         #expect(state.lastComplete == completeTime)
+    }
+
+    @Test func keyDownIsTimedToTheNextCompleteFrameOnly() throws {
+        let output = CaptureOutput()
+        output.markKeyDown()
+        output.markKeyDown() // a second key before any frame keeps the first time
+        try send(.idle, to: output)
+        #expect(output.snapshot().keyToFrameCount == 0)
+        try send(.complete, to: output)
+        try send(.complete, to: output, time: 43)
+        let state = output.snapshot()
+        #expect(state.keyToFrameCount == 1)
+        #expect(state.keyToFrameMaxMilliseconds >= 0)
     }
 
     @Test func terminalErrorWinsOverLateFrames() throws {

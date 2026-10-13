@@ -29,6 +29,7 @@ final class RemoteHost {
     nonisolated(unsafe) private var trustCheckedAt: TimeInterval = -.infinity
     nonisolated(unsafe) private var trusted = false
     nonisolated(unsafe) private var untrustedDrops = 0
+    nonisolated(unsafe) private var timedOutput: CaptureOutput?
 
     var running: Bool { link != nil }
 
@@ -48,7 +49,7 @@ final class RemoteHost {
         let link = HostLink(executable: executable)
         link.onStartStream = { [weak self] in self?.sessionStarted() }
         link.onStopStream = { [weak self] in self?.stopStream(reason: "no controlling session") }
-        link.onRequestKeyframe = { [weak self] in self?.capture.output?.encoder?.requestKeyframe() }
+        link.onRequestKeyframe = { [weak self] in self?.capture.requestKeyframe() }
         link.onEvent = { [weak self] in self?.event($0) }
         link.onExit = { [weak self] in self?.exited($0) }
         link.onInput = { [weak self] input in self?.inputQueue.async { self?.inject(input) } }
@@ -69,13 +70,20 @@ final class RemoteHost {
     func statusLine() -> String {
         guard let link else { return "Remote access off" }
         let state = link.snapshot()
-        let encoder = capture.output?.encoder?.snapshot()
         let input = inputQueue.sync { (injector?.state ?? InputSnapshot(), untrustedDrops) }
-        return "Remote access on; streaming=\(capture.stream != nil ? "yes" : "no"); sent=\(state.accessUnits) (keyframes \(state.keyframes), \(state.bytes) bytes); pipe drops=\(state.pressureDrops)+\(state.dependentDrops) dependent; peak queued=\(state.peakQueued)"
-            + (encoder.map { "; encoder raw drops=\($0.rawDrops)" } ?? "")
-            // Counts only; no key identities.
-            + "\nInput: pointer=\(input.0.pointerEvents) buttons=\(input.0.buttonEvents) scroll=\(input.0.scrollEvents) keys=\(input.0.keyEvents) unmapped=\(input.0.unmappedKeys) releaseAll=\(input.0.releaseAlls)"
-            + (input.1 > 0 ? " dropped without Accessibility=\(input.1)" : "")
+        var line = "Remote access on; streaming=\(capture.stream != nil ? "yes" : "no"); sent=\(state.accessUnits) (keyframes \(state.keyframes), \(state.bytes) bytes); pipe drops=\(state.pressureDrops)+\(state.dependentDrops) dependent; peak queued=\(state.peakQueued)"
+        if let e = capture.output?.encoder?.snapshot() {
+            let average = e.encoded > 0 ? e.totalMilliseconds / Double(e.encoded) : 0
+            line += String(format: "; encoder raw drops=%d; encode avg=%.1f ms max=%.1f ms", e.rawDrops, average, e.maxMilliseconds)
+        }
+        if let c = capture.output?.snapshot(), c.keyToFrameCount > 0 {
+            let average = c.keyToFrameTotalMilliseconds / Double(c.keyToFrameCount)
+            line += String(format: "; key→frame avg=%.1f ms max=%.1f ms (n=%d)", average, c.keyToFrameMaxMilliseconds, c.keyToFrameCount)
+        }
+        // Counts only; no key identities.
+        line += "\nInput: pointer=\(input.0.pointerEvents) buttons=\(input.0.buttonEvents) scroll=\(input.0.scrollEvents) keys=\(input.0.keyEvents) unmapped=\(input.0.unmappedKeys) releaseAll=\(input.0.releaseAlls)"
+        if input.1 > 0 { line += " dropped without Accessibility=\(input.1)" }
+        return line
     }
 
     private func sessionStarted() {
@@ -97,7 +105,8 @@ final class RemoteHost {
                 try await capture.start(sampleConsumer: { [weak link] in link?.submit($0) },
                     onStop: { reason in DispatchQueue.main.async { [weak self] in self?.captureEnded(reason) } })
                 if !streamWanted { await stopCapture() }
-                if let display = capture.displayID { inputQueue.async { self.inputDisplay = display } }
+                let output = capture.output
+                if let display = capture.displayID { inputQueue.async { self.inputDisplay = display; self.timedOutput = output } }
                 log("Streaming: \(capture.displayDescription)")
             } catch {
                 captureEnded(error.localizedDescription)
@@ -209,6 +218,7 @@ final class RemoteHost {
         let bounds = CGDisplayBounds(inputDisplay)
         if let injector { injector.update(displayBounds: bounds) } else { injector = InputInjector(displayBounds: bounds) }
         injector?.handle(input)
+        if case .key(_, .down) = input { timedOutput?.markKeyDown() }
     }
 
     private func log(_ message: String) { onLog?(message) }

@@ -44,6 +44,8 @@ final class VideoEncoder {
     // Remote access asks for keyframes on demand, so the periodic interval is
     // only a safety net (docs/macos-feasibility.md has the measurement).
     static let remoteKeyframeSeconds = 20
+    // Matches the built-in display, so a change waits at most ~17 ms to be captured.
+    static let frameRate = 60
 
     init(width: Int, height: Int, keyframeSeconds: Int = VideoEncoder.remoteKeyframeSeconds,
          sampleConsumer: ((CMSampleBuffer) -> Void)? = nil) throws {
@@ -73,8 +75,8 @@ final class VideoEncoder {
                 (kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse!),
                 (kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_Main_AutoLevel),
                 (kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: Self.bitrate)),
-                (kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: 30)),
-                (kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: 30 * keyframeSeconds)),
+                (kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: Self.frameRate)),
+                (kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: Self.frameRate * keyframeSeconds)),
                 (kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: keyframeSeconds))
             ] as [(CFString, CFTypeRef)] {
                 try Self.check(VTSessionSetProperty(session, key: key, value: value), "set \(key)")

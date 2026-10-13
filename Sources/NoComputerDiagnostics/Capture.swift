@@ -9,14 +9,26 @@ struct CaptureSnapshot {
     var errorDomain: String?
     var errorCode: Int?
     var stoppedAt: TimeInterval?
+    // Key-down injected → next complete frame, on this Mac's monotonic clock.
+    // Counts and times only; never which key.
+    var keyToFrameCount = 0
+    var keyToFrameTotalMilliseconds = 0.0
+    var keyToFrameMaxMilliseconds = 0.0
 }
 
 // Hands complete frames straight to the encoder on the capture queue; only the
 // counters cross to the main thread.
-final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate {
+// Shared across queues; all mutable state is behind `lock`.
+final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     private let lock = NSLock()
     private var state = CaptureSnapshot()
     let encoder: VideoEncoder?
+    // The latest complete frame, kept so a keyframe request on a still screen
+    // can be answered: ScreenCaptureKit delivers no new image until something
+    // changes. Never copied or written anywhere.
+    private var lastBuffer: CVPixelBuffer?
+    private var lastPresentationTime: CMTime?
+    private var keyDownAt: TimeInterval?
     // Called once, on the capture queue, when the system ends the stream.
     private let onStop: ((String) -> Void)?
 
@@ -39,6 +51,7 @@ final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate {
         state.errorDomain = failure.domain
         state.errorCode = failure.code
         state.stoppedAt = ProcessInfo.processInfo.systemUptime
+        lastBuffer = nil
         lock.unlock()
         encoder?.close()
         onStop?(error.localizedDescription)
@@ -60,10 +73,49 @@ final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate {
         defer { lock.unlock() }
         guard state.stoppedAt == nil else { return }
         state.callbacks += 1
-        if status == .complete {
+        if status == .complete, let buffer = sampleBuffer.imageBuffer {
             state.completeFrames += 1
             state.lastComplete = ProcessInfo.processInfo.systemUptime
+            lastBuffer = buffer
+            lastPresentationTime = sampleBuffer.presentationTimeStamp
+            if let keyDownAt {
+                let milliseconds = (state.lastComplete! - keyDownAt) * 1000
+                state.keyToFrameCount += 1
+                state.keyToFrameTotalMilliseconds += milliseconds
+                state.keyToFrameMaxMilliseconds = max(state.keyToFrameMaxMilliseconds, milliseconds)
+                self.keyDownAt = nil
+            }
         }
+    }
+
+    // A key-down was just injected; the next complete frame is timed against it.
+    // Rough: that frame may not yet show the key's effect.
+    func markKeyDown() {
+        lock.lock()
+        if keyDownAt == nil { keyDownAt = ProcessInfo.processInfo.systemUptime }
+        lock.unlock()
+    }
+
+    // The next encoded frame is an IDR. If no new frame arrives within `delay`,
+    // the last one is encoded again so the IDR goes out anyway. `queue` must be
+    // the queue frames are delivered on, so the repeat cannot interleave with them.
+    func requestKeyframe(queue: DispatchQueue, delay: DispatchTimeInterval = .milliseconds(100)) {
+        guard let encoder else { return }
+        encoder.requestKeyframe()
+        let seen = snapshot().completeFrames
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in self?.repeatIfIdle(since: seen) }
+    }
+
+    private func repeatIfIdle(since seen: Int) {
+        lock.lock()
+        guard state.stoppedAt == nil, state.completeFrames == seen,
+              let buffer = lastBuffer, let previous = lastPresentationTime else { lock.unlock(); return }
+        // 1 ms after the frame it repeats: captured frames are at least 16 ms
+        // apart, so the next real one still has a later timestamp.
+        let time = CMTimeAdd(previous, CMTime(value: 1, timescale: 1000))
+        lastPresentationTime = time
+        lock.unlock()
+        encoder?.encode(buffer, presentationTime: time)
     }
 }
 
@@ -132,8 +184,9 @@ final class CaptureSession {
             maximumWidth: maximumWidth, even: true)
         configuration.width = Int(size.width)
         configuration.height = Int(size.height)
-        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 30)
-        configuration.queueDepth = 3
+        configuration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(VideoEncoder.frameRate))
+        // One surface stays held as the last frame for keyframe repeats.
+        configuration.queueDepth = 4
         configuration.showsCursor = true
         configuration.capturesAudio = false
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
@@ -150,7 +203,7 @@ final class CaptureSession {
         do {
             try await candidate.startCapture()
             displayID = display.displayID
-            displayDescription = "Display \(display.displayID): \(display.width)×\(display.height); content points=\(filter.contentRect.size), pixelScale=\(filter.pointPixelScale); stream \(configuration.width)×\(configuration.height), 30 fps requested"
+            displayDescription = "Display \(display.displayID): \(display.width)×\(display.height); content points=\(filter.contentRect.size), pixelScale=\(filter.pointPixelScale); stream \(configuration.width)×\(configuration.height), \(VideoEncoder.frameRate) fps requested"
         } catch {
             encoder.close()
             stream = nil
@@ -158,6 +211,8 @@ final class CaptureSession {
             throw error
         }
     }
+
+    func requestKeyframe() { output?.requestKeyframe(queue: queue) }
 
     func stop() async throws {
         retireStoppedStream()
