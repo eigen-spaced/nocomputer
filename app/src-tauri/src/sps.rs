@@ -374,6 +374,25 @@ mod tests {
         assert_eq!(parsed(&rewrite(&nal).expect("rewritten")), Some(NO_REORDER));
     }
 
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    /// From the Mac host's M3 encoder, 1600x1040: normal rate control, then low-latency
+    /// rate control in Main, Constrained Baseline and Constrained High.
+    #[test]
+    fn mac_encoder_variants() {
+        let normal = hex("274d002aab403201074d4043404080");
+        assert!(matches!(parsed(&normal), Some(Sps::Unrestricted { vui_present: true, max_num_ref_frames: 1, .. })));
+        assert_eq!(parsed(&rewrite(&normal).unwrap()), Some(NO_REORDER));
+        for low_latency in ["274d002a898a300c8041d35010d01078402134", "2742c02a898a300c8041d35010d01078402134", "27640c2aac131460190083a6a021a020f0804268"] {
+            let nal = hex(low_latency);
+            let restricted = Sps::Restricted { max_num_reorder_frames: 0, max_dec_frame_buffering: 5 };
+            assert_eq!(parsed(&nal), Some(restricted), "{low_latency} already says no reordering");
+            assert_eq!(rewrite(&nal), None, "{low_latency} is left alone");
+        }
+    }
+
     #[test]
     fn escaping_round_trips() {
         let data = [0, 0, 0, 0, 1, 0, 0, 2, 0, 0, 3, 7];
@@ -391,3 +410,4 @@ mod tests {
         assert_eq!(parsed(&garbage), None, "bits after the VUI");
     }
 }
+
