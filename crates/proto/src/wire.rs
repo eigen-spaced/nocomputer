@@ -36,6 +36,10 @@ pub enum ErrorCode {
     /// Another pairing request is pending, or one was just denied.
     PairingUnavailable,
     BadRequest,
+    /// Another device is in control of the host.
+    Busy,
+    /// A newer session from the same device took over this one.
+    Replaced,
     #[serde(other)]
     Unknown,
 }

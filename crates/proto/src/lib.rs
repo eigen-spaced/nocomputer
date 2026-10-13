@@ -29,6 +29,8 @@ pub const DEFAULT_PORT: u16 = 47900;
 
 /// QUIC application close code the host uses when it revokes a live session.
 pub(crate) const CLOSE_REVOKED: u32 = 0x10;
+/// ... and when a newer session from the same device takes over.
+pub(crate) const CLOSE_REPLACED: u32 = 0x11;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

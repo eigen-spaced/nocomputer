@@ -68,6 +68,8 @@ struct Inner {
     approver: Approver,
     gate: Mutex<PairingGate>,
     live: Mutex<HashMap<Fingerprint, Vec<quinn::Connection>>>,
+    /// The one controlling session.
+    controller: Mutex<Option<(Fingerprint, quinn::Connection)>>,
 }
 
 pub struct Host {
@@ -93,7 +95,7 @@ impl Host {
             return Err(Error::Protocol("invalid host name".into()));
         }
         let endpoint = quinn::Endpoint::server(tls::finish_server(tls)?, addr)?;
-        let inner = Inner { fingerprint, config, clients: Mutex::new(clients), approver, gate: Mutex::default(), live: Mutex::default() };
+        let inner = Inner { fingerprint, config, clients: Mutex::new(clients), approver, gate: Mutex::default(), live: Mutex::default(), controller: Mutex::default() };
         Ok(Host { endpoint, inner: Arc::new(inner) })
     }
 
@@ -174,14 +176,22 @@ impl Inner {
         match status {
             ClientStatus::Revoked => refuse(&mut send, ErrorCode::Revoked, "this device's access was revoked").await,
             ClientStatus::Paired { name } => {
-                write_msg(&mut send, &Message::Welcome { version: PROTOCOL_VERSION, host_name: self.config.name.clone(), paired: true }).await?;
-                self.live.lock().unwrap().entry(device).or_default().push(conn.clone());
-                self.emit(HostEvent::Session { device, name, reported_name: device_name });
-                let result = session(&mut send, &mut recv).await;
-                if let Some(conns) = self.live.lock().unwrap().get_mut(&device) {
-                    conns.retain(|c| c.stable_id() != conn.stable_id());
+                if !self.claim_control(device, conn) {
+                    return refuse(&mut send, ErrorCode::Busy, "another device is connected to this host").await;
                 }
-                self.emit(HostEvent::SessionEnded { device });
+                let result = async {
+                    write_msg(&mut send, &Message::Welcome { version: PROTOCOL_VERSION, host_name: self.config.name.clone(), paired: true }).await?;
+                    self.live.lock().unwrap().entry(device).or_default().push(conn.clone());
+                    self.emit(HostEvent::Session { device, name, reported_name: device_name });
+                    let result = session(&mut send, &mut recv).await;
+                    if let Some(conns) = self.live.lock().unwrap().get_mut(&device) {
+                        conns.retain(|c| c.stable_id() != conn.stable_id());
+                    }
+                    self.emit(HostEvent::SessionEnded { device });
+                    result
+                }
+                .await;
+                self.release_control(conn);
                 result
             }
             ClientStatus::Unknown => {
@@ -194,6 +204,31 @@ impl Inner {
                     Err(_) => Err(Error::Timeout("pairing request")),
                 }
             }
+        }
+    }
+
+    /// One controlling session at a time. A closed session frees the slot at once,
+    /// including one closed by revocation. The same device connecting again (for
+    /// example after a network change, before its old connection times out) replaces
+    /// its old session; any other device is refused until the slot is free.
+    fn claim_control(&self, device: Fingerprint, conn: &quinn::Connection) -> bool {
+        let mut slot = self.controller.lock().unwrap();
+        if let Some((holder, old)) = slot.as_ref() {
+            if old.close_reason().is_none() {
+                if *holder != device {
+                    return false;
+                }
+                old.close(crate::CLOSE_REPLACED.into(), b"replaced");
+            }
+        }
+        *slot = Some((device, conn.clone()));
+        true
+    }
+
+    fn release_control(&self, conn: &quinn::Connection) {
+        let mut slot = self.controller.lock().unwrap();
+        if slot.as_ref().is_some_and(|(_, c)| c.stable_id() == conn.stable_id()) {
+            *slot = None;
         }
     }
 

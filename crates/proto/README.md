@@ -15,6 +15,7 @@ Transport, device identity and pairing for nocomputer, shared by the viewer and 
 
   There are no short codes; the user compares full fingerprints. One request can be pending at a time host-wide. Unanswered requests time out after 60 s, and a denial or timeout blocks all requests for 10 s. An unpaired device can only send `Hello` and `PairRequest`; anything else ends the connection.
 - **Revocation.** A revoked device stays listed as revoked, so it can't simply pair again. `Host::revoke` closes its live connections immediately. A revocation written by another process (`nocomputer-pair revoke`) applies from the next connection, because the host reads the list from disk on each one.
+- **One controller.** The host serves one session at a time; a different paired device is refused with `busy` until that session ends, closes or is revoked. The same device connecting again (for example after a network change, before the old connection times out) takes over, and its old session ends with `replaced`. Pairing connections don't count. A session whose network silently dropped holds the slot until the 30 s idle timeout.
 - **Pinned reconnect.** If a pinned host presents a different certificate, the viewer fails with `HostIdentityChanged { expected, presented }` and connects to nothing.
 
 ## Storage
@@ -47,7 +48,7 @@ nocomputer-pair clients | revoke FINGERPRINT | forget HOST[:PORT]
 
 ## Status
 
-Verified on Windows, 2026-10-13, on the target client: all 18 tests pass (`cargo test`, including the DPAPI store); `cargo clippy --all-targets` is clean; and a local `host`/`pair`/`connect` run with separate state folders works.
+Verified on Windows, 2026-10-13, on the target client: all 20 tests pass (`cargo test`, including the DPAPI store); `cargo clippy --all-targets` is clean; and a local `host`/`pair`/`connect` run with separate state folders works.
 
 Verified between machines, 2026-10-13: the Windows client paired with the MacBook Air host over the tailnet, with matching full fingerprints on both screens and approval on the Mac. Pinned reconnects then worked without prompting, with control-channel pings of 26–28 ms. Revoking the device on the Mac closed a live session from Windows, and the next connection was refused as revoked. The Mac side (build, Keychain store, tests) was run by the Mac session. Details are in `docs/development-plan.md`, Milestone 2.
 
@@ -55,6 +56,5 @@ Session names come from the pairing record. The name a device sends in `Hello` i
 
 Not yet verified:
 - Linux key storage.
-- One controlling viewer at a time.
 - Video, input and clipboard streams.
 - Linking into the Tauri viewer and the Swift host.

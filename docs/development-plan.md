@@ -168,13 +168,14 @@ First slice implemented (2026-10-13): `crates/proto` (see its README).
 - Pairing: SSH-style, comparing full fingerprints on both screens with local approval on the host. One request may be pending at a time, with an approval timeout and a cooldown after a denial. Revocation is sticky and closes live connections.
 - Storage: private identities in DPAPI on Windows and the Keychain on macOS. Other platforms refuse rather than fall back to a plain file.
 
-On Windows, 18 loopback tests pass, covering:
+On Windows, 20 loopback tests pass, covering:
 - pairing, reconnecting and denial
 - revocation
 - impersonation by a different key
 - stolen host and client certificates without their keys (these tests fail if signature verification is removed)
 - unpaired devices limited to pairing, version mismatch, message size limits, name spoofing
 - sessions named from the pairing record, not the device's self-reported name
+- one controller at a time: another device is refused as busy, and the same device reconnecting replaces its old session
 - DPAPI storage
 
 Paired across machines over the tailnet (2026-10-13), with `nocomputer-pair`:
@@ -185,7 +186,6 @@ Paired across machines over the tailnet (2026-10-13), with `nocomputer-pair`:
 - **Revocation:** with a session open from Windows (98 pings, mostly 28–40 ms, with spikes to 226 ms), the user revoked the device on the Mac. The host closed the live connection at once, and a fresh connect was refused with `Revoked`. The viewer had reported the live drop only as "connection lost"; it now reports the host's revocation close code as `Revoked`.
 
 Still pending:
-- the single-controller rule
 - video, input and clipboard streams
 - integration into the viewer and host
 

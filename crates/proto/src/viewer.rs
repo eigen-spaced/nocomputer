@@ -103,14 +103,15 @@ impl Session {
     }
 
     /// A stream error after the host closed the connection says only "connection lost";
-    /// report a revocation as such.
+    /// report a revocation or takeover as such.
     fn explain_close(&self, error: Error) -> Error {
-        match self.channel.conn.close_reason() {
-            Some(quinn::ConnectionError::ApplicationClosed(c)) if c.error_code == crate::CLOSE_REVOKED.into() => {
-                Error::Remote { code: ErrorCode::Revoked, message: "the host revoked this device's access".into() }
-            }
-            _ => error,
-        }
+        let Some(quinn::ConnectionError::ApplicationClosed(close)) = self.channel.conn.close_reason() else { return error };
+        let (code, message) = match u32::try_from(close.error_code.into_inner()) {
+            Ok(crate::CLOSE_REVOKED) => (ErrorCode::Revoked, "the host revoked this device's access"),
+            Ok(crate::CLOSE_REPLACED) => (ErrorCode::Replaced, "a newer session from this device took over"),
+            _ => return error,
+        };
+        Error::Remote { code, message: message.into() }
     }
 
     pub async fn close(self) {

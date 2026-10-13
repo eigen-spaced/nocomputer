@@ -132,6 +132,51 @@ async fn sessions_are_named_from_the_pairing_not_the_hello() {
 }
 
 #[tokio::test]
+async fn one_controller_at_a_time() {
+    let host = host_with(&Identity::generate().unwrap(), true);
+    let (first, second) = (viewer(), viewer());
+    let host_fp = pair(&first, &host).await;
+    pair(&second, &host).await;
+
+    let Outcome::Ready(mut active) = first.connect(host.addr, Some(host_fp)).await.unwrap() else { panic!() };
+    assert_eq!(remote_code(second.connect(host.addr, Some(host_fp)).await), ErrorCode::Busy);
+    active.ping().await.unwrap();
+
+    // Closing frees the slot.
+    active.close().await;
+    let Outcome::Ready(mut active) = second.connect(host.addr, Some(host_fp)).await.unwrap() else { panic!("slot was not freed by close") };
+    active.ping().await.unwrap();
+    assert_eq!(remote_code(first.connect(host.addr, Some(host_fp)).await), ErrorCode::Busy);
+
+    // So does revocation.
+    assert!(host.host.revoke(&second.fingerprint()).unwrap());
+    let Outcome::Ready(mut active) = first.connect(host.addr, Some(host_fp)).await.unwrap() else { panic!("slot was not freed by revocation") };
+    active.ping().await.unwrap();
+}
+
+#[tokio::test]
+async fn same_device_reconnecting_replaces_its_session() {
+    let host = host_with(&Identity::generate().unwrap(), true);
+    let viewer = viewer();
+    let host_fp = pair(&viewer, &host).await;
+    let Outcome::Ready(mut old) = viewer.connect(host.addr, Some(host_fp)).await.unwrap() else { panic!() };
+    old.ping().await.unwrap();
+
+    let Outcome::Ready(mut new) = viewer.connect(host.addr, Some(host_fp)).await.unwrap() else { panic!("same device was refused") };
+    new.ping().await.unwrap();
+    match old.ping().await {
+        Err(Error::Remote { code: ErrorCode::Replaced, .. }) => {}
+        other => panic!("old session must end as replaced, got {other:?}"),
+    }
+    // The old session's end must not free the slot the new one holds.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let other = Viewer::new(Identity::generate().unwrap(), "other").unwrap();
+    pair(&other, &host).await;
+    assert_eq!(remote_code(other.connect(host.addr, Some(host_fp)).await), ErrorCode::Busy);
+    new.ping().await.unwrap();
+}
+
+#[tokio::test]
 async fn first_contact_never_yields_a_session_even_when_paired() {
     let host = host_with(&Identity::generate().unwrap(), true);
     let viewer = viewer();
