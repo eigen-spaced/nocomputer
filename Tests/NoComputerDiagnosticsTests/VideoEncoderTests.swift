@@ -12,13 +12,6 @@ struct VideoEncoderTests {
         }
     }
 
-    @Test func emptyMetricsAreFinite() {
-        let state = EncoderSnapshot()
-        #expect(state.summary.contains("0.00/0.00 ms"))
-        #expect((state.metadata["meanEncodeMilliseconds"] as? Double) == 0)
-        #expect(state.inFlight == 0)
-    }
-
     // Opt in: exercises the real local encoder, not screen capture or TCC.
     @Test(.enabled(if: ProcessInfo.processInfo.environment["NOCOMPUTER_TEST_HARDWARE"] == "1"))
     func hardwareEncodesSyntheticFramesAndCloses() async throws {

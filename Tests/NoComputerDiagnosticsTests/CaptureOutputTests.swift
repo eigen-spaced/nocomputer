@@ -16,36 +16,6 @@ struct CaptureOutputTests {
         }
     }
 
-    @Test func metadataOnlyModeCountsFramesWithoutRetainingPreview() throws {
-        let output = CaptureOutput(previewEnabled: false)
-        try send(.complete, to: output)
-        #expect(output.snapshot().completeFrames == 1)
-        #expect(output.snapshot().lastComplete != nil)
-        #expect(output.snapshot().image == nil)
-        #expect(output.snapshot().sourceVisible)
-    }
-
-    @Test func staticPreviewRemainsCurrentWhileIdleCallbacksArrive() throws {
-        let output = CaptureOutput()
-        try send(.complete, to: output)
-        try send(.idle, to: output)
-        var state = output.snapshot()
-        let now = ProcessInfo.processInfo.systemUptime
-        state.lastComplete = now - 60
-        state.lastCallback = now - 0.1
-        #expect(state.previewIsCurrent(at: now))
-        state.lastCallback = now - 3
-        #expect(!state.previewIsCurrent(at: now))
-    }
-
-    @Test func stoppedPreviewIsNeverCurrentEvenWithRecentCallback() throws {
-        let output = CaptureOutput()
-        try send(.complete, to: output)
-        var state = output.snapshot()
-        let now = ProcessInfo.processInfo.systemUptime
-        state.stoppedAt = now
-        #expect(!state.previewIsCurrent(at: now))
-    }
     private func frame(_ status: SCFrameStatus) throws -> CMSampleBuffer {
         var pixel: CVPixelBuffer?
         #expect(CVPixelBufferCreate(kCFAllocatorDefault, 8, 8, kCVPixelFormatType_32BGRA,
@@ -80,36 +50,15 @@ struct CaptureOutputTests {
         output.stream(stream, didOutputSampleBuffer: try frame(status), of: .screen)
     }
 
-    @Test func idleIsNotCountedAsNewImage() throws {
+    @Test func onlyCompleteFramesAreCounted() throws {
         let output = CaptureOutput()
         try send(.complete, to: output)
         let completeTime = output.snapshot().lastComplete
-        try send(.idle, to: output)
+        for status: SCFrameStatus in [.idle, .blank, .suspended] { try send(status, to: output) }
         let state = output.snapshot()
-        #expect(state.callbacks == 2)
+        #expect(state.callbacks == 4)
         #expect(state.completeFrames == 1)
         #expect(state.lastComplete == completeTime)
-        #expect(state.presentationTime == 1.4)
-    }
-
-    @Test func blankDisplayClearsPreview() throws {
-        let output = CaptureOutput()
-        try send(.complete, to: output)
-        #expect(output.snapshot().image != nil)
-        try send(.blank, to: output)
-        #expect(output.snapshot().image == nil)
-        #expect(output.snapshot().completeFrames == 1)
-        #expect(!output.snapshot().sourceVisible)
-    }
-
-    @Test func suspendedStreamClearsPreviewAndCanResume() throws {
-        let output = CaptureOutput()
-        try send(.complete, to: output)
-        try send(.suspended, to: output)
-        #expect(output.snapshot().image == nil)
-        try send(.complete, to: output)
-        #expect(output.snapshot().completeFrames == 2)
-        #expect(output.snapshot().callbacks == 3)
     }
 
     @Test func terminalErrorWinsOverLateFrames() throws {
@@ -120,12 +69,10 @@ struct CaptureOutputTests {
         output.stream(stream, didStopWithError: error)
         try send(.complete, to: output)
         let state = output.snapshot()
-        #expect(state.image == nil)
         #expect(state.callbacks == 1)
         #expect(state.stoppedAt != nil)
         #expect(state.errorDomain == SCStreamErrorDomain)
         #expect(state.errorCode == -3815)
-        #expect(!state.sourceVisible)
     }
 
     @Test @MainActor func stoppedStreamDoesNotBlockRestartOrStop() async throws {
@@ -136,7 +83,7 @@ struct CaptureOutputTests {
         output.stream(stream, didStopWithError: NSError(domain: SCStreamErrorDomain, code: -3815))
         #expect(session.retireStoppedStream())
         #expect(session.stream == nil)
-        #expect(session.output === output) // Export retains terminal evidence.
+        #expect(session.output === output)
         #expect(!session.retireStoppedStream())
         try await session.stop() // Must not call stopCapture on the dead stream.
         #expect(session.output == nil)

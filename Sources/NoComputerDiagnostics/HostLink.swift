@@ -58,6 +58,9 @@ final class HostLink {
     var onRequestKeyframe: (() -> Void)?
     var onEvent: ((Data) -> Void)?
     var onExit: ((String) -> Void)?
+    // Not on the main queue: called in order on the pipe reader's queue, so
+    // input never waits behind UI work. The receiver must not block.
+    var onInput: ((RemoteInput) -> Void)?
 
     private let process = Process()
     private let input = Pipe()
@@ -120,6 +123,8 @@ final class HostLink {
     }
 
     func captureStopped(reason: String) { send(.captureStopped(reason: reason)) }
+
+    func inputUnavailable(reason: String) { send(.inputUnavailable(reason: reason)) }
 
     func decide(requestID: UInt64, approve: Bool) { send(.pairingDecision(requestID: requestID, approve: approve)) }
 
@@ -212,6 +217,10 @@ final class HostLink {
                 lock.unlock()
                 continue
             }
+            if case let .input(input) = message {
+                onInput?(input)
+                continue
+            }
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 switch message {
@@ -220,6 +229,7 @@ final class HostLink {
                 case .stopStream: self.onStopStream?()
                 case .requestKeyframe: self.expectKeyframe(); self.onRequestKeyframe?()
                 case let .event(json): self.onEvent?(json)
+                case .input: break
                 }
             }
         }

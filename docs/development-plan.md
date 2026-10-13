@@ -200,7 +200,8 @@ End to end between machines (2026-10-13): the Mac app's bundled host streamed th
   - Sent: 2785 access units, 59 of them keyframes, 25,591,003 bytes in total, which is about 9.2 KB per frame, or 1.8 Mbit/s at 24 fps.
   - Drops: none from pipe pressure. There was 1 dependent drop: a P-frame in flight at stream start, before the forced IDR, dropped by design. Peak queue 1, no encoder drops.
   - Sessions started and stopped capture as designed, and the app showed the stored device name.
-- **Keyframe interval:** the encoder still forces an IDR every 60 frames or 2 s, carried over from the Milestone 1 diagnostics. With keyframes now on demand, a long safety interval (10–30 s) should save bandwidth. To measure before and after; Mac side.
+- **Keyframe interval:** now 20 s for remote access (measured in [macos-feasibility.md](macos-feasibility.md#remote-access-keyframe-interval)); live rate still to measure.
+- **Diagnostics removed (2026-10-13, user request):** the Mac app keeps only permissions, Remote access, status, and an in-memory log. Capture is whole-display, hardware H.264, sRGB only. The removed controls are at `d03ac78`.
 
 Still pending:
 - input and clipboard streams

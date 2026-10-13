@@ -9,10 +9,10 @@ import Testing
 struct HostLinkTests {
     private static func fakeChild(in directory: URL, received: URL) throws -> URL {
         let script = directory.appendingPathComponent("fake-host")
-        // HelloAck(1) = [0 0 0 3][0x81][0 1]
+        // HelloAck(2) = [0 0 0 3][0x81][0 2]
         try """
             #!/bin/sh
-            printf '\\000\\000\\000\\003\\201\\000\\001'
+            printf '\\000\\000\\000\\003\\201\\000\\002'
             exec cat > '\(received.path)'
             """.write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
@@ -41,11 +41,12 @@ struct HostLinkTests {
         let link = HostLink(executable: try Self.fakeChild(in: directory, received: received))
         try link.start()
         // Frames before HelloAck are not sent; wait for the acknowledgement.
-        for _ in 0..<100 where !link.acknowledgedForTesting { try await Task.sleep(nanoseconds: 10_000_000) }
-        #expect(link.acknowledgedForTesting)
+        // Generous: the shell child can start slowly while other tests load the machine.
+        for _ in 0..<1000 where !link.acknowledgedForTesting { try await Task.sleep(nanoseconds: 10_000_000) }
+        try #require(link.acknowledgedForTesting)
 
         let (width, height) = (320, 240)
-        let encoder = try VideoEncoder(width: width, height: height, colorPolicy: .sRGB,
+        let encoder = try VideoEncoder(width: width, height: height,
             sampleConsumer: { link.submit($0) })
         var buffer: CVPixelBuffer?
         #expect(CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA,
@@ -67,7 +68,7 @@ struct HostLinkTests {
         let messages = try Self.frames(try Data(contentsOf: received))
         try #require(messages.count >= 3)
         #expect(messages.first?.0 == 0x01)
-        #expect(messages.first?.1 == Data([0, 1]))
+        #expect(messages.first?.1 == Data([0, 2]))
         let units = messages.filter { $0.0 == 0x02 }
         #expect(units.count == 20)
         #expect(link.snapshot().accessUnits == 20)
@@ -95,8 +96,8 @@ struct HostLinkTests {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let script = directory.appendingPathComponent("fake-host")
-        // HelloAck(2): a version this app does not speak.
-        try "#!/bin/sh\nprintf '\\000\\000\\000\\003\\201\\000\\002'\nexec cat > /dev/null\n"
+        // HelloAck(1): a version this app no longer speaks.
+        try "#!/bin/sh\nprintf '\\000\\000\\000\\003\\201\\000\\001'\nexec cat > /dev/null\n"
             .write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
         let link = HostLink(executable: script)

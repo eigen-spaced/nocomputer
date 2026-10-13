@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import CoreMedia
 
 // Remote access: runs the bundled nocomputer-host child and captures/encodes the
@@ -15,11 +16,19 @@ final class RemoteHost {
     private weak var window: NSWindow?
     private var link: HostLink?
     private let capture = CaptureSession()
-    private let sleep = SleepAssertion(kind: .system)
+    private let sleep = SleepAssertion()
     private var streamWanted = false
     private var starting = false
     private var restartTask: Task<Void, Never>?
     private var prompt: (alert: NSAlert, requestID: UInt64)?
+    // Input is injected on its own queue, never behind UI work. The injector
+    // and the fields below are only touched on this queue.
+    private let inputQueue = DispatchQueue(label: "dev.nocomputer.input", qos: .userInteractive)
+    nonisolated(unsafe) private var injector: InputInjector?
+    nonisolated(unsafe) private var inputDisplay = CGMainDisplayID()
+    nonisolated(unsafe) private var trustCheckedAt: TimeInterval = -.infinity
+    nonisolated(unsafe) private var trusted = false
+    nonisolated(unsafe) private var untrustedDrops = 0
 
     var running: Bool { link != nil }
 
@@ -37,11 +46,12 @@ final class RemoteHost {
                 "\(Self.executableName) is not in the app bundle; build with scripts/build-macos.sh"])
         }
         let link = HostLink(executable: executable)
-        link.onStartStream = { [weak self] in self?.startStream() }
+        link.onStartStream = { [weak self] in self?.sessionStarted() }
         link.onStopStream = { [weak self] in self?.stopStream(reason: "no controlling session") }
         link.onRequestKeyframe = { [weak self] in self?.capture.output?.encoder?.requestKeyframe() }
         link.onEvent = { [weak self] in self?.event($0) }
         link.onExit = { [weak self] in self?.exited($0) }
+        link.onInput = { [weak self] input in self?.inputQueue.async { self?.inject(input) } }
         try sleep.enable()
         do { try link.start() } catch { sleep.disable(); throw error }
         self.link = link
@@ -50,6 +60,8 @@ final class RemoteHost {
 
     func disable() {
         guard let link else { return }
+        // Synchronous: this also runs at app termination.
+        inputQueue.sync { injector?.releaseAll() }
         stopStream(reason: "remote access disabled")
         link.stop()
     }
@@ -58,8 +70,19 @@ final class RemoteHost {
         guard let link else { return "Remote access off" }
         let state = link.snapshot()
         let encoder = capture.output?.encoder?.snapshot()
+        let input = inputQueue.sync { (injector?.state ?? InputSnapshot(), untrustedDrops) }
         return "Remote access on; streaming=\(capture.stream != nil ? "yes" : "no"); sent=\(state.accessUnits) (keyframes \(state.keyframes), \(state.bytes) bytes); pipe drops=\(state.pressureDrops)+\(state.dependentDrops) dependent; peak queued=\(state.peakQueued)"
             + (encoder.map { "; encoder raw drops=\($0.rawDrops)" } ?? "")
+            // Counts only; no key identities.
+            + "\nInput: pointer=\(input.0.pointerEvents) buttons=\(input.0.buttonEvents) scroll=\(input.0.scrollEvents) keys=\(input.0.keyEvents) unmapped=\(input.0.unmappedKeys) releaseAll=\(input.0.releaseAlls)"
+            + (input.1 > 0 ? " dropped without Accessibility=\(input.1)" : "")
+    }
+
+    private func sessionStarted() {
+        // Every session gets the notice: a viewer that connects later never
+        // saw an earlier one.
+        if !AXIsProcessTrusted() { link?.inputUnavailable(reason: "Accessibility is not granted to the host app") }
+        startStream()
     }
 
     private func startStream() {
@@ -71,12 +94,10 @@ final class RemoteHost {
         Task {
             defer { starting = false }
             do {
-                // The whole display, including this app: the remote user sees
-                // exactly what is on screen.
-                try await capture.start(mode: .wholeDisplay, encodeVideo: true, colorPolicy: .sRGB,
-                    maximumWidth: 1600, keyframeSeconds: VideoEncoder.remoteKeyframeSeconds, sampleConsumer: { [weak link] in link?.submit($0) },
+                try await capture.start(sampleConsumer: { [weak link] in link?.submit($0) },
                     onStop: { reason in DispatchQueue.main.async { [weak self] in self?.captureEnded(reason) } })
                 if !streamWanted { await stopCapture() }
+                if let display = capture.displayID { inputQueue.async { self.inputDisplay = display } }
                 log("Streaming: \(capture.displayDescription)")
             } catch {
                 captureEnded(error.localizedDescription)
@@ -85,6 +106,7 @@ final class RemoteHost {
     }
 
     private func stopStream(reason: String) {
+        releaseInput()
         streamWanted = false
         restartTask?.cancel()
         Task { await stopCapture() }
@@ -162,6 +184,7 @@ final class RemoteHost {
     }
 
     private func exited(_ reason: String) {
+        releaseInput()
         dismissPrompt()
         streamWanted = false
         restartTask?.cancel()
@@ -170,6 +193,22 @@ final class RemoteHost {
         sleep.disable()
         log("Remote access off: \(reason); sleep assertion released")
         onExit?()
+    }
+
+    private func releaseInput() { inputQueue.async { self.injector?.releaseAll() } }
+
+    // On inputQueue. Without Accessibility, posted events are silently
+    // discarded by the system, so drop and count them instead.
+    nonisolated private func inject(_ input: RemoteInput) {
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - trustCheckedAt > 1 {
+            trustCheckedAt = now
+            trusted = AXIsProcessTrusted()
+        }
+        guard trusted else { untrustedDrops += 1; return }
+        let bounds = CGDisplayBounds(inputDisplay)
+        if let injector { injector.update(displayBounds: bounds) } else { injector = InputInjector(displayBounds: bounds) }
+        injector?.handle(input)
     }
 
     private func log(_ message: String) { onLog?(message) }

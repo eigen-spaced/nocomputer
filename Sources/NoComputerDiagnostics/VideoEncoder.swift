@@ -1,5 +1,4 @@
 import Foundation
-import CoreImage
 import VideoToolbox
 
 struct EncoderSnapshot {
@@ -18,34 +17,10 @@ struct EncoderSnapshot {
     var parameterSetCount = 0
     var nalLengthBytes = 0
     var error: String?
-    var sourceColor: [String: String] = [:]
-    var encodedColor: [String: String] = [:]
-    var colorPolicy = VideoColorPolicy.systemDefault.rawValue
-
-    var metadata: [String: Any] {
-        ["submitted": submitted, "encoded": encoded, "bytes": bytes,
-         "keyframes": keyframes, "rawDrops": rawDrops, "encoderDrops": encoderDrops,
-         "inFlight": inFlight, "peakInFlight": peakInFlight,
-         "meanEncodeMilliseconds": encoded > 0 ? totalMilliseconds / Double(encoded) : 0.0,
-         "maxEncodeMilliseconds": maxMilliseconds, "hardware": hardware,
-         "error": error ?? "none", "requestedBitrate": VideoEncoder.bitrate,
-         "maximumInFlight": VideoEncoder.maximumInFlight,
-         "frameDelayLimitSupported": frameDelayLimitSupported,
-         "parameterSetCount": parameterSetCount, "nalLengthBytes": nalLengthBytes,
-         "sourceColor": sourceColor, "encodedColor": encodedColor, "colorPolicy": colorPolicy,
-         "sampleFraming": "AVCC length-prefixed"]
-    }
-
-    var summary: String {
-        let mean = encoded > 0 ? totalMilliseconds / Double(encoded) : 0
-        return String(format: "H.264 hardware=%@; encoded=%d; bytes=%d; keyframes=%d; rawDrops=%d; encoderDrops=%d; pending=%d (peak %d); encode mean/max=%.2f/%.2f ms",
-                      hardware ? "yes" : "no", encoded, bytes, keyframes, rawDrops,
-                      encoderDrops, inFlight, peakInFlight, mean, maxMilliseconds)
-            + (error.map { "; error=\($0)" } ?? "")
-    }
 }
 
-// Samples are measured then optionally decoded locally. No video file or network.
+// Hardware H.264 in explicit SDR sRGB / BT.709. Encoded samples go to the
+// consumer only; nothing is written to disk.
 // Submission and invalidation serialize separately from callback statistics:
 // VideoToolbox may deliver a callback before encodeFrame returns.
 final class VideoEncoder {
@@ -57,9 +32,6 @@ final class VideoEncoder {
     private var state = EncoderSnapshot()
     private var pending: [Int: TimeInterval] = [:]
     private var completing: Set<Int> = []
-    private var sourcePreviews: [Int: CGImage] = [:]
-    private var lastPreview: TimeInterval = 0
-    private let context = CIContext(options: [.cacheIntermediates: false])
     private var nextID = 0
     private var lastPTS: CMTime?
     // Set by requestKeyframe(); consumed by the next frame actually submitted,
@@ -67,16 +39,13 @@ final class VideoEncoder {
     private var keyframeRequested = false
     private let width: Int
     private let height: Int
-    let decoder: VideoDecoder?
     private let sampleConsumer: ((CMSampleBuffer) -> Void)?
 
-    // The diagnostics keep the Milestone 1 two-second interval. Remote access asks
-    // for keyframes on demand, so it uses a long interval only as a safety net.
-    static let diagnosticKeyframeSeconds = 2
+    // Remote access asks for keyframes on demand, so the periodic interval is
+    // only a safety net (docs/macos-feasibility.md has the measurement).
     static let remoteKeyframeSeconds = 20
 
-    init(width: Int, height: Int, decodePreview: Bool = false, colorPolicy: VideoColorPolicy = .systemDefault,
-         keyframeSeconds: Int = VideoEncoder.diagnosticKeyframeSeconds,
+    init(width: Int, height: Int, keyframeSeconds: Int = VideoEncoder.remoteKeyframeSeconds,
          sampleConsumer: ((CMSampleBuffer) -> Void)? = nil) throws {
         guard width > 0, height > 0, width <= 8192, height <= 8192, (1...60).contains(keyframeSeconds) else {
             throw NSError(domain: "NoComputer.Encoder", code: -1,
@@ -84,9 +53,7 @@ final class VideoEncoder {
         }
         self.width = width
         self.height = height
-        self.decoder = decodePreview ? VideoDecoder() : nil
         self.sampleConsumer = sampleConsumer
-        state.colorPolicy = colorPolicy.rawValue
         let spec = [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true] as CFDictionary
         try Self.check(VTCompressionSessionCreate(allocator: nil, width: Int32(width), height: Int32(height),
             codecType: kCMVideoCodecType_H264, encoderSpecification: spec,
@@ -94,14 +61,12 @@ final class VideoEncoder {
             outputCallback: nil, refcon: nil, compressionSessionOut: &session), "create hardware encoder")
         guard let session else { throw NSError(domain: "NoComputer.Encoder", code: -2) }
         do {
-            if colorPolicy == .sRGB {
-                for (key, value) in [
-                    (kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2),
-                    (kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_sRGB),
-                    (kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2)
-                ] {
-                    try Self.check(VTSessionSetProperty(session, key: key, value: value), "set \(key)")
-                }
+            for (key, value) in [
+                (kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2),
+                (kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_sRGB),
+                (kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2)
+            ] {
+                try Self.check(VTSessionSetProperty(session, key: key, value: value), "set \(key)")
             }
             for (key, value) in [
                 (kVTCompressionPropertyKey_RealTime, kCFBooleanTrue!),
@@ -177,16 +142,6 @@ final class VideoEncoder {
         }
         nextID += 1
         let id = nextID
-        state.sourceColor = VideoColor.bufferMetadata(buffer)
-        // A matched raw/decoded pair, not two independently sampled previews.
-        // Diagnostic copies happen before the encode timing starts.
-        if decoder != nil, ProcessInfo.processInfo.systemUptime - lastPreview >= 0.5 {
-            lastPreview = ProcessInfo.processInfo.systemUptime
-            let image = CIImage(cvPixelBuffer: buffer)
-            if let preview = context.createCGImage(image, from: image.extent) {
-                sourcePreviews[id] = preview
-            } else { state.error = "Could not create source comparison image"; stateLock.unlock(); return }
-        }
         pending[id] = ProcessInfo.processInfo.systemUptime
         lastPTS = presentationTime
         state.submitted += 1
@@ -216,20 +171,16 @@ final class VideoEncoder {
             stateLock.unlock()
             return
         }
-        let sourcePreview = sourcePreviews[id]
         defer {
             stateLock.unlock()
             // Never call downstream code under the statistics lock.
             if deliver, let sample {
-                decoder?.decode(sample, sourceImage: sourcePreview)
                 // Consumers must not reenter encode/close from this callback.
-                // The synthetic interoperability test uses this output boundary.
                 sampleConsumer?(sample)
             }
             stateLock.lock()
             pending.removeValue(forKey: id)
             completing.remove(id)
-            sourcePreviews.removeValue(forKey: id)
             state.inFlight = pending.count
             stateLock.unlock()
         }
@@ -266,7 +217,6 @@ final class VideoEncoder {
             state.nalLengthBytes = Int(headerLength)
         }
         if !notSync { state.keyframes += 1 }
-        state.encodedColor = VideoColor.formatMetadata(format)
         state.encoded += 1
         state.bytes += CMSampleBufferGetTotalSampleSize(sample)
         let milliseconds = (ProcessInfo.processInfo.systemUptime - start) * 1000
@@ -283,10 +233,8 @@ final class VideoEncoder {
         stateLock.lock()
         pending.removeAll()
         completing.removeAll()
-        sourcePreviews.removeAll()
         state.inFlight = 0
         stateLock.unlock()
-        decoder?.close()
     }
 
     deinit { close() }

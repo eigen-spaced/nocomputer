@@ -38,7 +38,7 @@ struct CodecFixtureTests {
     func exportsSyntheticInteroperabilityFixture() async throws {
         let destination = try #require(ProcessInfo.processInfo.environment["NOCOMPUTER_FIXTURE_PATH"])
         let collector = FixtureCollector()
-        let encoder = try VideoEncoder(width: 320, height: 240, colorPolicy: .sRGB,
+        let encoder = try VideoEncoder(width: 320, height: 240, keyframeSeconds: 2,
             sampleConsumer: { collector.append($0) })
         defer { encoder.close() }
         var buffer: CVPixelBuffer?
@@ -85,7 +85,7 @@ struct CodecFixtureTests {
         let destination = try #require(ProcessInfo.processInfo.environment["NOCOMPUTER_MOVING_FIXTURE_PATH"])
         let (width, height, frames) = (1920, 1080, 90)
         let collector = FixtureCollector()
-        let encoder = try VideoEncoder(width: width, height: height, colorPolicy: .sRGB,
+        let encoder = try VideoEncoder(width: width, height: height, keyframeSeconds: 2,
             sampleConsumer: { collector.append($0) })
         defer { encoder.close() }
         for index in 0..<frames {

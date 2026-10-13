@@ -1,5 +1,7 @@
 # macOS diagnostic prototype
 
+> **2026-10-13:** the diagnostic controls described below (local capture and preview, decoded comparison, color and width options, display-off and wake probes, lock-input probe, local input test, metadata export) were removed from the app. It now has only the permission buttons, **Remote access**, its status line, and an in-memory log. The findings below still stand. To repeat a procedure, build `d03ac78`, the last commit with those controls. The display-wake request (`DisplayWakeRequest`) is kept for a viewer connecting while the display is off.
+
 ## Build and launch
 
 ```sh
@@ -230,7 +232,7 @@ Stable local signing (2026-10-13, user-approved): a self-signed code-signing cer
 
 ## Remote access keyframe interval
 
-The diagnostics keep the Milestone 1 interval: an IDR at least every 60 frames or 2 s. Remote access asks for IDRs on demand (stream start, viewer recovery, pipe pressure), so its encoder uses a 20 s safety interval instead (`VideoEncoder.remoteKeyframeSeconds`).
+The removed diagnostics kept the Milestone 1 interval: an IDR at least every 60 frames or 2 s. Remote access asks for IDRs on demand (stream start, viewer recovery, pipe pressure), so its encoder uses a 20 s safety interval instead (`VideoEncoder.remoteKeyframeSeconds`).
 
 Measured 2026-10-13 with `NOCOMPUTER_MEASURE_KEYFRAMES=1 scripts/test-macos.sh --filter KeyframeInterval`: 30 s at 1600x1034, 30 fps, 8 Mbit/s target, on synthetic dense terminal text with one line being typed. A live desktop will differ.
 

@@ -67,7 +67,7 @@ struct KeyframeIntervalTests {
 
     private static func measure(keyframeSeconds: Int) async throws -> SizeCollector {
         let collector = SizeCollector()
-        let encoder = try VideoEncoder(width: width, height: height, colorPolicy: .sRGB,
+        let encoder = try VideoEncoder(width: width, height: height,
             keyframeSeconds: keyframeSeconds, sampleConsumer: { collector.append($0) })
         defer { encoder.close() }
         for index in 0..<frames {
@@ -84,7 +84,7 @@ struct KeyframeIntervalTests {
     @Test(.enabled(if: ProcessInfo.processInfo.environment["NOCOMPUTER_MEASURE_KEYFRAMES"] == "1"))
     func measureKeyframeIntervals() async throws {
         let seconds = Double(Self.frames) / Double(Self.fps)
-        for interval in [VideoEncoder.diagnosticKeyframeSeconds, 10, VideoEncoder.remoteKeyframeSeconds, 30] {
+        for interval in [2, 10, VideoEncoder.remoteKeyframeSeconds, 30] {
             let result = try await Self.measure(keyframeSeconds: interval)
             let keyBytes = result.keyframes.reduce(0, +)
             let deltaBytes = result.deltas.reduce(0, +)

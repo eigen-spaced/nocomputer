@@ -141,11 +141,11 @@ struct PipeAdmissionTests {
     }
 }
 
-// crates/host owns local-v1; its golden vectors are the shared reference bytes.
+// crates/host owns local-v2; its golden vectors are the shared reference bytes.
 struct LocalLinkGoldenTests {
     private static let directory = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        .appendingPathComponent("crates/host/testdata/local-v1")
+        .appendingPathComponent("crates/host/testdata/local-v2")
 
     private static func golden(_ name: String) throws -> Data {
         try Data(contentsOf: directory.appendingPathComponent(name))
@@ -157,7 +157,7 @@ struct LocalLinkGoldenTests {
     }
 
     @Test func swiftEncodesTheGoldenOutgoingFrames() throws {
-        #expect(try LocalLink.encode(.hello(version: 1)) == Self.golden("01-hello.bin"))
+        #expect(try LocalLink.encode(.hello(version: 2)) == Self.golden("01-hello.bin"))
         #expect(try LocalLink.encode(.accessUnit(keyframe: true, captureMicroseconds: 0x0102_0304_0506_0708,
             annexB: Self.annexB("02-access-unit-key.bin"))) == Self.golden("02-access-unit-key.bin"))
         let delta = try Self.golden("02-access-unit-delta.bin")
@@ -171,6 +171,9 @@ struct LocalLinkGoldenTests {
             == Self.golden("04-pairing-decision-approve.bin"))
         #expect(try LocalLink.encode(.pairingDecision(requestID: 7, approve: false))
             == Self.golden("04-pairing-decision-deny.bin"))
+        let unavailable = try Self.golden("05-input-unavailable.bin")
+        let unavailableReason = try #require(String(data: unavailable.dropFirst(5), encoding: .utf8))
+        #expect(try LocalLink.encode(.inputUnavailable(reason: unavailableReason)) == unavailable)
     }
 
     @Test func swiftDecodesTheGoldenIncomingFrames() throws {
@@ -179,7 +182,7 @@ struct LocalLinkGoldenTests {
                      "85-event-pairing-prompt.bin", "85-event-session.bin"]
         let messages = try reader.feed(names.map { try Self.golden($0) }.reduce(Data(), +))
         try #require(messages.count == 6)
-        #expect(Array(messages[0..<4]) == [.helloAck(version: 1), .startStream, .stopStream, .requestKeyframe])
+        #expect(Array(messages[0..<4]) == [.helloAck(version: 2), .startStream, .stopStream, .requestKeyframe])
         guard case let .event(prompt) = messages[4], case let .event(session) = messages[5] else {
             Issue.record("expected two events")
             return
@@ -192,11 +195,64 @@ struct LocalLinkGoldenTests {
         #expect(LocalLink.eventType(session) == "session")
     }
 
+    @Test func swiftDecodesTheGoldenInputFrames() throws {
+        let expected: [(String, RemoteInput)] = [
+            ("86-pointer.bin", .pointer(x: 0x1234, y: 0xFFFF)),
+            ("87-button-left-down.bin", .button(.left, down: true)),
+            ("87-button-forward-up.bin", .button(.forward, down: false)),
+            ("88-scroll-pixel.bin", .scroll(dx: -3, dy: 120, unit: .pixel)),
+            ("88-scroll-line.bin", .scroll(dx: 0, dy: -100, unit: .line)),
+            ("89-key-down.bin", .key(usage: 0x04, state: .down)),
+            ("89-key-up.bin", .key(usage: 0xE3, state: .up)),
+            ("89-key-repeat.bin", .key(usage: 0x28, state: .repeated)),
+            ("8a-release-all.bin", .releaseAll),
+        ]
+        var reader = LocalLink.Reader()
+        let messages = try reader.feed(expected.map { try Self.golden($0.0) }.reduce(Data(), +))
+        #expect(messages == expected.map { .input($0.1) })
+    }
+
     // Swift→Rust frames must never be accepted coming back the other way.
     @Test func outgoingGoldenFramesAreRejectedAsIncoming() throws {
-        for name in ["01-hello.bin", "02-access-unit-key.bin", "03-capture-stopped.bin", "04-pairing-decision-deny.bin"] {
+        for name in ["01-hello.bin", "02-access-unit-key.bin", "03-capture-stopped.bin", "04-pairing-decision-deny.bin",
+                     "05-input-unavailable.bin"] {
             var reader = LocalLink.Reader()
             #expect(throws: LocalLink.ProtocolError.self, "\(name)") { try reader.feed(Self.golden(name)) }
         }
+    }
+}
+
+struct LocalLinkInputTests {
+    @Test func decodesInputFrames() throws {
+        var reader = LocalLink.Reader()
+        let stream = frame(0x86, [0xFF, 0xFF, 0x00, 0x01]) + frame(0x87, [1, 1]) + frame(0x87, [4, 0])
+            + frame(0x88, [0xFF, 0xFF, 0xFF, 0xFD, 0x00, 0x00, 0x00, 0x78, 1]) + frame(0x89, [0x00, 0xE3, 2])
+            + frame(0x8A, [])
+        #expect(try reader.feed(stream) == [
+            .input(.pointer(x: 65535, y: 1)), .input(.button(.right, down: true)), .input(.button(.forward, down: false)),
+            .input(.scroll(dx: -3, dy: 120, unit: .line)), .input(.key(usage: 0xE3, state: .repeated)),
+            .input(.releaseAll),
+        ])
+    }
+
+    @Test func malformedInputIsFatal() {
+        let cases: [(String, Data)] = [
+            ("short pointer", frame(0x86, [0, 0, 0])),
+            ("long pointer", frame(0x86, [0, 0, 0, 0, 0])),
+            ("unknown button", frame(0x87, [5, 1])),
+            ("button flag 2", frame(0x87, [0, 2])),
+            ("unknown scroll unit", frame(0x88, [0, 0, 0, 0, 0, 0, 0, 1, 2])),
+            ("unknown key state", frame(0x89, [0, 4, 3])),
+            ("payload on ReleaseAll", frame(0x8A, [0])),
+        ]
+        for (name, bytes) in cases {
+            var reader = LocalLink.Reader()
+            #expect(throws: LocalLink.ProtocolError.self, "\(name)") { try reader.feed(bytes) }
+        }
+    }
+
+    @Test func encodesInputUnavailable() throws {
+        #expect(try LocalLink.encode(.inputUnavailable(reason: "no AX")) == frame(0x05, Array("no AX".utf8)))
+        #expect(try LocalLink.encode(.hello(version: LocalLink.version)) == frame(0x01, [0, 2]))
     }
 }
