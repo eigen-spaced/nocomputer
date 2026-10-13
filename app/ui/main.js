@@ -1,4 +1,5 @@
-// Offline WebCodecs proof. All keys are local viewer controls; nothing is sent anywhere.
+// WebCodecs viewer: a local file, or live video from a paired host (--connect).
+// All keys are local viewer controls; no input is sent to the host.
 const { invoke } = window.__TAURI__.core;
 
 const ACCELERATION = { 'default': 'no-preference', 'require-hardware': 'prefer-hardware', 'software': 'prefer-software' };
@@ -85,7 +86,7 @@ async function runCheck(launch) {
 
 const view = { mode: 'fit', panX: 0, panY: 0, fullscreen: false, showStatus: true };
 let current = null; // latest VideoFrame, held at EOF
-let info = { codec: '', decode: '', decoded: 0, total: 0, ended: false, error: null };
+let info = { codec: '', decode: '', decoded: 0, total: 0, ended: false, error: null, live: false, host: null, fps: 0 };
 
 function resizeCanvas() {
   const dpr = window.devicePixelRatio || 1;
@@ -118,8 +119,14 @@ function draw() {
     ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(current, r.x, r.y, r.w, r.h);
   }
-  const state = info.error ? `error: ${info.error}` : info.ended ? 'ended (holding last frame)' : 'playing';
-  statusEl.textContent = `${info.codec} ${info.decode} | ${info.decoded}/${info.total} frames | ${view.mode} | ${state} | N native  arrows pan  R reset  F fullscreen  H hide`;
+  const keys = 'N native  arrows pan  R reset  F fullscreen  H hide';
+  if (info.live) {
+    const state = info.error ? `error: ${info.error}` : current ? `live ${info.fps} fps` : 'connecting';
+    statusEl.textContent = `${info.host ?? ''} ${info.codec} ${info.decode} | ${info.decoded} frames | ${view.mode} | ${state} | ${keys}`;
+  } else {
+    const state = info.error ? `error: ${info.error}` : info.ended ? 'ended (holding last frame)' : 'playing';
+    statusEl.textContent = `${info.codec} ${info.decode} | ${info.decoded}/${info.total} frames | ${view.mode} | ${state} | ${keys}`;
+  }
   statusEl.classList.toggle('hidden', !view.showStatus);
 }
 
@@ -181,9 +188,113 @@ window.addEventListener('keydown', e => {
 
 window.addEventListener('resize', resizeCanvas);
 
+// ---- live ----
+
+const LIVE_CHECK_FRAMES = 300;
+
+// [u8 flags][u64 LE host_us][u8 codec_len][codec][access unit]; see live.rs.
+function parseLive(buf) {
+  const v = new DataView(buf);
+  const codecLen = v.getUint8(9);
+  return {
+    key: (v.getUint8(0) & 1) === 1,
+    hostUs: Number(v.getBigUint64(1, true)),
+    codec: new TextDecoder().decode(new Uint8Array(buf, 10, codecLen)),
+    data: new Uint8Array(buf, 10 + codecLen),
+  };
+}
+
+async function live(launch) {
+  const started = performance.now();
+  const stats = {
+    tool: 'nocomputer-viewer-live', host: launch.connect, decode: launch.decode, codec: null,
+    hardwareAcceleration: ACCELERATION[launch.decode], received: 0, keyframes: 0, frames: 0,
+    pageDropped: 0, width: null, height: null, maxHostGapMs: 0, decodeErrors: [], elapsedMs: null,
+    userAgent: navigator.userAgent,
+  };
+  info.decode = ACCELERATION[launch.decode];
+  info.live = true;
+  let decoder = null, codec = null, waitingForKey = true, lastHostUs = null;
+  const shown = []; // performance.now() of recent outputs, for the frame rate
+  const requestKeyframe = () => invoke('live_request_keyframe').catch(() => {});
+
+  const makeDecoder = c => {
+    const d = new VideoDecoder({
+      output: frame => {
+        stats.frames++;
+        if (stats.width === null) { stats.width = frame.displayWidth; stats.height = frame.displayHeight; }
+        const now = performance.now();
+        shown.push(now);
+        while (shown.length && now - shown[0] > 1000) shown.shift();
+        if (launch.check) { frame.close(); return; }
+        current?.close();
+        current = frame;
+        info.decoded = stats.frames;
+        info.fps = shown.length;
+        draw();
+      },
+      error: e => {
+        // The decoder closes itself; restart at the next keyframe.
+        stats.decodeErrors.push(`${e.name}: ${e.message}`);
+        info.error = null;
+        decoder = null;
+        waitingForKey = true;
+        requestKeyframe();
+      },
+    });
+    d.configure(decoderConfig(c, launch.decode));
+    return d;
+  };
+
+  for (;;) {
+    if (launch.check && stats.frames >= LIVE_CHECK_FRAMES) break;
+    let buf;
+    try {
+      buf = await invoke('live_next');
+    } catch (e) {
+      info.error = String(e);
+      if (!launch.check) { draw(); return; }
+      stats.decodeErrors.push(`connection: ${e}`);
+      break;
+    }
+    const f = parseLive(buf);
+    stats.received++;
+    if (lastHostUs !== null) stats.maxHostGapMs = Math.max(stats.maxHostGapMs, (f.hostUs - lastHostUs) / 1000);
+    lastHostUs = f.hostUs;
+    if (f.key) {
+      stats.keyframes++;
+      if (!decoder || f.codec !== codec) {
+        decoder?.close();
+        codec = stats.codec = info.codec = f.codec;
+        decoder = makeDecoder(codec);
+        if (!info.host) invoke('live_info').then(i => { info.host = i.host_name; draw(); });
+      }
+      waitingForKey = false;
+    }
+    if (waitingForKey || !decoder) continue;
+    if (decoder.decodeQueueSize >= MAX_DECODE_QUEUE) {
+      // Behind: skip to the next keyframe rather than build latency.
+      stats.pageDropped++;
+      waitingForKey = true;
+      requestKeyframe();
+      continue;
+    }
+    decoder.decode(new EncodedVideoChunk({ type: f.key ? 'key' : 'delta', timestamp: f.hostUs, data: f.data }));
+  }
+  if (decoder) await decoder.flush().catch(() => {});
+  const i = await invoke('live_info').catch(() => ({}));
+  stats.hostName = i.host_name ?? null;
+  stats.hostFingerprint = i.host_fingerprint ?? null;
+  stats.viewerDropped = i.dropped ?? null;
+  stats.elapsedMs = Math.round(performance.now() - started);
+  const pass = stats.frames >= LIVE_CHECK_FRAMES && stats.decodeErrors.length === 0;
+  await invoke('finish_check', { summary: stats, pass });
+}
+
 (async () => {
   resizeCanvas();
   const launch = await invoke('launch_options');
-  if (launch.check) await runCheck(launch);
+  if (launch.connect) await live(launch);
+  else if (launch.check) await runCheck(launch);
   else await play(launch);
 })();

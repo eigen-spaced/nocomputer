@@ -1,6 +1,6 @@
-# Tauri viewer (WebCodecs proof)
+# Tauri viewer
 
-Offline proof for the Rust + Tauri viewer direction: plays one local Annex B `.h264` file through WebCodecs in the system web view (WebView2 on Windows, WKWebView on macOS). No networking, pairing, input forwarding or clipboard. The C++ viewer in `viewer/` stays as the fallback comparison until this proof passes on native Windows.
+The Rust + Tauri viewer. It plays one local Annex B `.h264` file, or live video from a paired host (`--connect`), through WebCodecs in the system web view (WebView2 on Windows, WKWebView on macOS). There is no input forwarding or clipboard yet. The C++ viewer in `viewer/` stays as the fallback comparison until this proof passes on native Windows.
 
 - `src-tauri/src/annexb.rs` splits the stream into access units (SPS/PPS/SEI kept with their picture) and derives the codec string from the first SPS. Limits: 8 MiB file, 1 MiB per access unit, 10,000 units. The first unit must be an IDR.
 - `src-tauri/src/main.rs` reads only the file named on the command line and sends it to the page as raw bytes.
@@ -26,6 +26,25 @@ target\debug\nocomputer-viewer.exe ..\..\build\synthetic-srgb.h264
 | `build/moving-1080p.h264` (sha256 `05f8e07a…ca33a7`) | Mac host's VideoToolbox encoder: Main, level 4.0, 8 Mbit/s, real-time, no B-frames, 60-frame GOP, IDRs at 0 and 60 each preceded by SPS/PPS/SEI | `avc1.4D0028`, 90 frames, 1920x1080; each frame shows its number 000-089 and a white bar moving left to right |
 
 Recorded 2026-10-13 on the Windows target client: both fixtures pass in all three modes, with `outputInOrder` true. Visible playback of `moving-1080p.h264` (user-confirmed): the counter runs 000-089 in order with the bar moving; in native view the frame overflows the 1366x768 window, the arrows pan and **R** resets; frame 089 is held at EOF.
+
+## Live video
+
+```
+nocomputer-pair pair HOST            # once: compare fingerprints, approve on the host
+nocomputer-viewer.exe --connect HOST[:PORT]
+nocomputer-viewer.exe --check [--require-hardware] --connect HOST
+```
+
+- **Identity:** the viewer uses the same identity and known-hosts file as `nocomputer-pair` (`%APPDATA%\nocomputer`, or `NOCOMPUTER_STATE_DIR`), and connects only to a pinned host. Pairing in the app comes later.
+- **Delivery:** `live.rs` connects when the page asks for its first frame. The page pulls frames with a long-poll invoke (the pull path from the IPC bench) as raw bytes.
+- **Dropping:** if the page or decoder falls behind, frames are dropped up to the next keyframe and one is requested. After a decoder error the page waits for a keyframe.
+- **Timestamps:** decoder timestamps are the host's `host_us`.
+- **Exit:** the session is closed on exit, so the host frees its single-controller slot at once.
+- **Check mode:** `--check` decodes the first 300 frames and prints a JSON summary: frames, keyframes, drops on each side, size, and the largest gap between host timestamps.
+
+Loopback check on the target client, 2026-10-13:
+- **Setup:** `nocomputer-host --from-file build/moving-1080p.h264`, paired via `nocomputer-pair`.
+- **Default and `--require-hardware`:** 305 frames received and decoded at 1920x1080, `avc1.4D0028`, with no decode errors and no drops on either side. 300 frames took 5.1–5.2 s, which is 60 fps pacing. The largest host gap was 32 ms (the replay timer's granularity on Windows).
 
 ## What counts as hardware-decode evidence
 

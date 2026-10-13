@@ -188,9 +188,10 @@ Paired across machines over the tailnet (2026-10-13), with `nocomputer-pair`:
 
 Video path, Mac side (2026-10-13): the Swift app spawns `crates/host` (`nocomputer-host`) as a child process, and they talk over stdin/stdout using local-v1 (specified in `crates/host/src/local.rs`, golden vectors in `crates/host/testdata/local-v1`). The app captures and encodes; the Rust process does pairing, sessions and transport. Pairing approvals reach the app as prompts with request ids, and the pipe is the only approval path. On Windows, the host binary replaying the fixture streamed to a viewer on loopback; 13 host tests pass, including that end-to-end run.
 
+The Tauri viewer plays live video with `--connect` (see `app/README.md`). On loopback from the replay host, it decoded 1080p at 60 fps with no drops, in both default and hardware-required modes.
+
 Still pending:
 - the end-to-end run with the Mac app
-- decoding and display in the Tauri viewer
 - input and clipboard streams
 
 Deliverable: authenticated connections by hostname/IP with a documented pairing flow and bounded video transport.

@@ -9,6 +9,7 @@
 mod host;
 mod identity;
 mod keystore;
+pub mod paths;
 mod tls;
 mod trust;
 mod video;

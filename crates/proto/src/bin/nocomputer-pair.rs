@@ -12,7 +12,7 @@
 
 use nocomputer_proto::{
     load_or_create_identity, platform_keystore, Approver, Fingerprint, Host, HostConfig, HostEvent, Identity, KnownHosts, Outcome, PairedClients,
-    Viewer, DEFAULT_PORT,
+    paths, Viewer, DEFAULT_PORT,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -23,16 +23,7 @@ use tokio::sync::oneshot;
 type BoxError = Box<dyn std::error::Error>;
 
 fn state_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("NOCOMPUTER_STATE_DIR") {
-        return dir.into();
-    }
-    #[cfg(windows)]
-    let base = std::env::var_os("APPDATA").map(PathBuf::from);
-    #[cfg(target_os = "macos")]
-    let base = std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"));
-    #[cfg(not(any(windows, target_os = "macos")))]
-    let base = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
-    base.unwrap_or_else(|| PathBuf::from(".")).join("nocomputer")
+    paths::default_state_dir()
 }
 
 fn identity() -> Result<Identity, BoxError> {
@@ -50,18 +41,11 @@ fn option(args: &[String], flag: &str) -> Option<String> {
 }
 
 fn with_port(address: &str) -> String {
-    let has_port = address.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) && !address.ends_with(']');
-    if has_port {
-        address.to_string()
-    } else {
-        format!("{address}:{DEFAULT_PORT}")
-    }
+    paths::with_default_port(address)
 }
 
-/// Prefers IPv4: tailnet and LAN hosts are reliably reachable on it.
 async fn resolve(address: &str) -> Result<SocketAddr, BoxError> {
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(address).await?.collect();
-    addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()).copied().ok_or_else(|| format!("{address} did not resolve").into())
+    Ok(paths::resolve(address).await?)
 }
 
 async fn read_line(lines: &mut tokio::io::Lines<BufReader<tokio::io::Stdin>>) -> String {
