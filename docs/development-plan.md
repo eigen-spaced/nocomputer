@@ -163,6 +163,26 @@ Define a small versioned protocol covering capability negotiation, display geome
 
 Implement locally approved pairing with verified peer identities, OS-protected credential storage, and revocation. Verify rejection of unknown/revoked clients and host impersonation. Encrypt and authenticate every channel. Do not introduce remotely injectable input until authorization works.
 
+First slice implemented (2026-10-13): `crates/proto` (see its README).
+- Transport: QUIC (quinn) with TLS 1.3 (rustls), mutually authenticated with self-signed certificates pinned by full SHA-256 fingerprint. The custom verifiers still check handshake signatures. Session resumption and 0-RTT are disabled, and the host authorizes every connection against its paired-device list.
+- Pairing: SSH-style, comparing full fingerprints on both screens with local approval on the host. One request may be pending at a time, with an approval timeout and a cooldown after a denial. Revocation is sticky and closes live connections.
+- Storage: private identities in DPAPI on Windows and the Keychain on macOS. Other platforms refuse rather than fall back to a plain file.
+
+On Windows, 17 loopback tests pass, covering:
+- pairing, reconnecting and denial
+- revocation
+- impersonation by a different key
+- stolen host and client certificates without their keys (these tests fail if signature verification is removed)
+- unpaired devices limited to pairing, version mismatch, message size limits, name spoofing
+- DPAPI storage
+
+The `nocomputer-pair` tool paired and pinged locally. Still pending:
+- the macOS build and Keychain check
+- pairing between machines over the tailnet
+- the single-controller rule
+- video, input and clipboard streams
+- integration into the viewer and host
+
 Deliverable: authenticated connections by hostname/IP with a documented pairing flow and bounded video transport.
 
 ## Milestone 3: desktop interaction

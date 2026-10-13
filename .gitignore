@@ -8,3 +8,4 @@ diagnostics-*.json
 app/src-tauri/target/
 app/src-tauri/gen/
 /tailnet-agents/
+/crates/*/target/
