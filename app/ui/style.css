@@ -6,3 +6,5 @@ canvas { display: block; width: 100vw; height: 100vh; }
   background: rgba(0, 0, 0, 0.6); border-radius: 4px; pointer-events: none;
 }
 #status.hidden { display: none; }
+#status.interactive { pointer-events: auto; }
+#status select { font: inherit; color: inherit; background: #222; border: 1px solid #555; border-radius: 3px; }

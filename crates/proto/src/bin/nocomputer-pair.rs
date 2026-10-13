@@ -221,14 +221,25 @@ async fn watch(args: &[String]) -> Result<(), BoxError> {
         unreachable!("pinned connections return a session or an error")
     };
     println!("connected to \"{}\" {}", session.host_name, session.host_fingerprint);
-    let mut video = session.video();
+    // Read in a task of its own: VideoReceiver::next is not cancel-safe.
+    let (video_tx, mut video) = tokio::sync::mpsc::channel(1);
+    let mut receiver = session.video();
+    tokio::spawn(async move {
+        loop {
+            let frame = receiver.next().await;
+            let failed = frame.is_err();
+            if video_tx.send(frame).await.is_err() || failed {
+                return;
+            }
+        }
+    });
     let end = tokio::time::Instant::now() + std::time::Duration::from_secs(seconds);
     let mut second = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
     let (mut frames, mut keyframes, mut bytes, mut largest, mut max_gap_us, mut last_us) = (0u32, 0u32, 0usize, 0usize, 0u64, None::<u64>);
     let mut codec = String::new();
     loop {
         tokio::select! {
-            frame = video.next() => {
+            Some(frame) = video.recv() => {
                 let f = frame?;
                 frames += 1;
                 keyframes += f.keyframe as u32;

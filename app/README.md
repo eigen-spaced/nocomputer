@@ -1,6 +1,6 @@
 # Tauri viewer
 
-The Rust + Tauri viewer. It plays one local Annex B `.h264` file, or live video from a paired host (`--connect`), through WebCodecs in the system web view (WebView2 on Windows, WKWebView on macOS). There is no input forwarding or clipboard yet. The C++ viewer in `viewer/` stays as the fallback comparison until this proof passes on native Windows.
+The Rust + Tauri viewer. It plays one local Annex B `.h264` file, or live video from a paired host (`--connect`), through WebCodecs in the system web view (WebView2 on Windows, WKWebView on macOS). Live mode forwards pointer, wheel and keyboard input (see Remote input); there is no clipboard yet. The C++ viewer in `viewer/` stays as the fallback comparison until this proof passes on native Windows.
 
 - `src-tauri/src/annexb.rs` splits the stream into access units (SPS/PPS/SEI kept with their picture) and derives the codec string from the first SPS. Limits: 8 MiB file, 1 MiB per access unit, 10,000 units. The first unit must be an IDR.
 - `src-tauri/src/main.rs` reads only the file named on the command line and sends it to the page as raw bytes.
@@ -32,10 +32,12 @@ Recorded 2026-10-13 on the Windows target client: both fixtures pass in all thre
 ```
 nocomputer-pair pair HOST            # once: compare fingerprints, approve on the host
 nocomputer-viewer.exe --connect HOST[:PORT]
+nocomputer-viewer.exe --connect HOST --via ADDR[:PORT]
 nocomputer-viewer.exe --check [--require-hardware] --connect HOST
 ```
 
 - **Identity:** the viewer uses the same identity and known-hosts file as `nocomputer-pair` (`%APPDATA%\nocomputer`, or `NOCOMPUTER_STATE_DIR`), and connects only to a pinned host. Pairing in the app comes later.
+- **`--via`:** dials another address for the same paired host, for example its LAN address when Tailscale is relaying. The pin still comes from HOST's known-hosts entry, so the host at ADDR must present that same identity or the connection is refused.
 - **Delivery:** `live.rs` connects when the page asks for its first frame. The page pulls frames with a long-poll invoke (the pull path from the IPC bench) as raw bytes.
 - **Dropping:** if the page or decoder falls behind, frames are dropped up to the next keyframe and one is requested. After a decoder error the page waits for a keyframe.
 - **Timestamps:** decoder timestamps are the host's `host_us`.
@@ -45,6 +47,22 @@ nocomputer-viewer.exe --check [--require-hardware] --connect HOST
 Loopback check on the target client, 2026-10-13:
 - **Setup:** `nocomputer-host --from-file build/moving-1080p.h264`, paired via `nocomputer-pair`.
 - **Default and `--require-hardware`:** 305 frames received and decoded at 1920x1080, `avc1.4D0028`, with no decode errors and no drops on either side. 300 frames took 5.1–5.2 s, which is 60 fps pacing. The largest host gap was 32 ms (the replay timer's granularity on Windows).
+
+## Remote input
+
+Live mode sends input on the authenticated control stream. Nothing typed is logged; the status bar shows only a count of keys sent.
+
+- **Pointer, buttons and wheel** come from the page. Positions are sent only inside the picture (not over the letterbox), at most once per animation frame. The right-click menu, middle-click autoscroll and back/forward navigation are suppressed so those buttons reach the host.
+- **Keyboard (Windows):** keys are read with a low-level keyboard hook (`WH_KEYBOARD_LL`), which sees every key typed on this PC while it is installed. It is installed only while the viewer window is in the foreground in live mode, and removed otherwise. Windows does not call a low-level hook owned by the process whose WebView2 window is in the foreground, so the hook runs in a helper copy of the viewer (`nocomputer-viewer --keyboard-helper`). The viewer starts it, tells it when the window gains or loses the foreground (a WinEvent hook) and receives key events from it over pipes. The helper exits with the viewer.
+- **Keys are physical:** scan codes become USB HID usages, so the host's keyboard layout decides the characters. Keys with no mapping (media keys) stay local.
+- **Command key:** the status bar selects which key sends Command: Win (default) or right Alt. The choice is saved in the page's local storage.
+- **Windowed:** Ctrl, Shift and Alt combinations go to the host, except Alt+Tab, Alt+Esc, Ctrl+Esc and Alt+F4, which stay with Windows. **Fullscreen:** every mapped key goes to the host.
+- **Viewer shortcuts:** Ctrl+Alt+Shift with F (fullscreen), N (native), H (status), R (reset) or the arrows (pan). These never reach the host.
+- **Release:** held keys and buttons are released when the window loses the foreground, on disconnect, and by the host at every session start and end.
+- **Not capturable:** Ctrl+Alt+Del and Win+L are handled by Windows before any hook and always act locally.
+- **Status bar:** drops, decode errors, keyframe age, arrival jitter (the worst difference over 2 s between an arrival gap on this PC and the matching capture gap on the host; each gap is on one clock), the deepest decode queue over 2 s, and the keyboard state.
+
+Recorded 2026-10-13 against the Mac host (user-confirmed): pointer, clicks, dragging and typing work, and video keeps updating while dragging. Over Tailscale the path was relayed through DERP (Dubai, about 30 ms) although both machines were on the same Wi-Fi, and typing visibly lagged. With `--via` to the Mac's LAN address the user found it "definitely" snappier. The direct-path failure is not yet diagnosed.
 
 ## What counts as hardware-decode evidence
 

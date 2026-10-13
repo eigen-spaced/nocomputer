@@ -266,7 +266,9 @@ impl VideoReceiver {
         Ok(())
     }
 
-    /// The next decodable frame. Fails only when the connection ends.
+    /// The next decodable frame. Fails only when the connection ends. Not cancel-safe:
+    /// a call dropped mid-frame loses the rest of that GOP, so don't race it in a
+    /// `select!`; read from a task of its own.
     pub async fn next(&mut self) -> Result<VideoFrame, Error> {
         enum Next {
             Newer(Result<quinn::RecvStream, quinn::ConnectionError>),

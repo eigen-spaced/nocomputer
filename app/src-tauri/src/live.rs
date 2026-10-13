@@ -10,9 +10,14 @@
 //! differences between frames, never against this machine's clock. If the page falls
 //! behind, frames are dropped up to the next keyframe and one is requested, so the
 //! decoder never gets a frame whose keyframe it lacks.
+//!
+//! Input goes the other way: the page sends pointer and wheel input with `live_input`,
+//! and on Windows the keyboard hook (`hook.rs`) sends keys. Neither is logged. Notices
+//! from the host (input unavailable, capture stopped) appear in `live_info`.
 
-use nocomputer_proto::{load_or_create_identity, paths, platform_keystore, Error, KnownHosts, Outcome, Viewer};
+use nocomputer_proto::{load_or_create_identity, paths, platform_keystore, Error, Input, KnownHosts, NoticeKind, Outcome, Viewer};
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::ipc::Response;
 use tokio::sync::mpsc;
@@ -27,16 +32,25 @@ pub struct LiveInfo {
     pub host_fingerprint: Option<String>,
     /// Frames dropped here because the page fell behind.
     pub dropped: u64,
+    /// The latest notice from the host, for display.
+    pub notice: Option<String>,
+    /// The keyboard hook is on (the window is in front), and keys sent so far.
+    pub keyboard_active: bool,
+    pub keys_sent: u64,
 }
 
 type Frames = mpsc::Receiver<Result<Vec<u8>, String>>;
 
 pub struct Live {
     address: String,
+    via: Option<String>,
     info: Arc<Mutex<LiveInfo>>,
     /// Created by the first `live_next`, so nothing is dropped while the page loads.
     frames: tokio::sync::Mutex<Option<Frames>>,
     keyframe: Mutex<Option<mpsc::UnboundedSender<()>>>,
+    input: Mutex<Option<mpsc::UnboundedSender<Input>>>,
+    /// A session is up, so input has somewhere to go.
+    connected: Arc<AtomicBool>,
     /// Ends the session; the task then reports on `closed`.
     shutdown: Arc<tokio::sync::Notify>,
     closed: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
@@ -66,22 +80,56 @@ fn describe(e: Error) -> String {
 }
 
 impl Live {
-    pub fn new(address: &str) -> Self {
+    /// `via`, if given, is dialed instead of `address`; the pin still comes from `address`.
+    pub fn new(address: &str, via: Option<&str>) -> Self {
         let address = paths::with_default_port(address);
-        let info = Arc::new(Mutex::new(LiveInfo { address: address.clone(), ..Default::default() }));
-        Live { address, info, frames: Default::default(), keyframe: Default::default(), shutdown: Default::default(), closed: Default::default() }
+        let via = via.map(paths::with_default_port);
+        let shown = match &via {
+            Some(via) => format!("{address} via {via}"),
+            None => address.clone(),
+        };
+        let info = Arc::new(Mutex::new(LiveInfo { address: shown, ..Default::default() }));
+        Live {
+            address,
+            via,
+            info,
+            frames: Default::default(),
+            keyframe: Default::default(),
+            input: Default::default(),
+            connected: Default::default(),
+            shutdown: Default::default(),
+            closed: Default::default(),
+        }
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
+    }
+
+    /// Queues input for the host, in order; dropped when no session is up.
+    pub fn send_input(&self, input: Input) {
+        if self.is_connected() {
+            if let Some(tx) = self.input.lock().unwrap().as_ref() {
+                let _ = tx.send(input);
+            }
+        }
     }
 
     /// Connects in the background; failures reach the page through `live_next`.
     fn start(&self) -> Frames {
         let (tx, rx) = mpsc::channel(QUEUE_FRAMES);
         let (keyframe_tx, keyframe_rx) = mpsc::unbounded_channel();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        *self.input.lock().unwrap() = Some(input_tx);
         let (closed_tx, closed_rx) = std::sync::mpsc::channel();
         *self.keyframe.lock().unwrap() = Some(keyframe_tx);
         *self.closed.lock().unwrap() = Some(closed_rx);
-        let (address, info, shutdown) = (self.address.clone(), self.info.clone(), self.shutdown.clone());
+        let address = (self.address.clone(), self.via.clone().unwrap_or_else(|| self.address.clone()));
+        let (info, shutdown, connected) = (self.info.clone(), self.shutdown.clone(), self.connected.clone());
         tauri::async_runtime::spawn(async move {
-            if let Err(e) = run(address, info, tx.clone(), keyframe_rx, shutdown).await {
+            let result = run(address, info, tx.clone(), keyframe_rx, input_rx, connected.clone(), shutdown).await;
+            connected.store(false, Ordering::Relaxed);
+            if let Err(e) = result {
                 let _ = tx.send(Err(e)).await;
             }
             let _ = closed_tx.send(());
@@ -99,11 +147,14 @@ impl Live {
     }
 }
 
+/// `address` is (where the pin is stored, where to dial).
 async fn run(
-    address: String,
+    (address, dial): (String, String),
     info: Arc<Mutex<LiveInfo>>,
     tx: mpsc::Sender<Result<Vec<u8>, String>>,
     mut keyframe: mpsc::UnboundedReceiver<()>,
+    mut input: mpsc::UnboundedReceiver<Input>,
+    connected: Arc<AtomicBool>,
     shutdown: Arc<tokio::sync::Notify>,
 ) -> Result<(), String> {
     let state = paths::default_state_dir();
@@ -113,7 +164,7 @@ async fn run(
         .ok_or_else(|| format!("{address} is not paired; pair first with: nocomputer-pair pair {address}"))?;
     let identity = platform_keystore(&state, "device").and_then(|s| load_or_create_identity(s.as_ref())).map_err(describe)?;
     let viewer = Viewer::new(identity, device_name()).map_err(describe)?;
-    let addr = paths::resolve(&address).await.map_err(|e| e.to_string())?;
+    let addr = paths::resolve(&dial).await.map_err(|e| e.to_string())?;
     let Outcome::Ready(mut session) = viewer.connect(addr, Some(pinned.fingerprint)).await.map_err(describe)? else {
         return Err("unexpected first contact for a pinned host".into());
     };
@@ -122,11 +173,47 @@ async fn run(
         info.host_name = Some(session.host_name.clone());
         info.host_fingerprint = Some(session.host_fingerprint.to_string());
     }
-    let mut video = session.video();
+    // VideoReceiver::next is not cancel-safe: a frame cut short by another branch of the
+    // select below would desynchronize its GOP. So frames are read in their own task.
+    let (video_tx, mut video) = mpsc::channel(1);
+    let mut receiver = session.video();
+    let reader = tauri::async_runtime::spawn(async move {
+        loop {
+            let frame = receiver.next().await;
+            let failed = frame.is_err();
+            if video_tx.send(frame).await.is_err() || failed {
+                return;
+            }
+        }
+    });
+    while input.try_recv().is_ok() {} // nothing from before the session
+    connected.store(true, Ordering::Relaxed);
+    crate::hook::set_connected(true);
+    let result = session_loop(&mut session, &mut video, &info, &tx, &mut keyframe, &mut input, &shutdown).await;
+    reader.abort();
+    connected.store(false, Ordering::Relaxed);
+    crate::hook::set_connected(false);
+    if result.is_ok() {
+        // Shut down, or the page went away: leave nothing held, and free the host at once.
+        let _ = session.input(Input::ReleaseAll).await;
+        session.close().await;
+    }
+    result
+}
+
+async fn session_loop(
+    session: &mut nocomputer_proto::Session,
+    video: &mut mpsc::Receiver<Result<nocomputer_proto::VideoFrame, Error>>,
+    info: &Mutex<LiveInfo>,
+    tx: &mpsc::Sender<Result<Vec<u8>, String>>,
+    keyframe: &mut mpsc::UnboundedReceiver<()>,
+    input: &mut mpsc::UnboundedReceiver<Input>,
+    shutdown: &tokio::sync::Notify,
+) -> Result<(), String> {
     let mut gap = false;
     loop {
         tokio::select! {
-            frame = video.next() => {
+            Some(frame) = video.recv() => {
                 let frame = frame.map_err(describe)?;
                 if gap && !frame.keyframe {
                     continue;
@@ -144,10 +231,16 @@ async fn run(
                 }
             }
             Some(()) = keyframe.recv() => session.request_keyframe().await.map_err(describe)?,
-            _ = shutdown.notified() => {
-                session.close().await;
-                return Ok(());
+            Some(i) = input.recv() => session.input(i).await.map_err(describe)?,
+            Some(notice) = session.notice() => {
+                let what = match notice.kind {
+                    NoticeKind::InputUnavailable => "input unavailable",
+                    NoticeKind::CaptureStopped => "capture stopped",
+                    NoticeKind::Unknown => "host",
+                };
+                info.lock().unwrap().notice = Some(format!("{what}: {}", notice.message));
             }
+            _ = shutdown.notified() => return Ok(()),
         }
     }
 }
@@ -170,7 +263,22 @@ pub fn live_request_keyframe(live: tauri::State<'_, Live>) {
     }
 }
 
+/// Pointer and wheel input from the page, in order. The page keeps one call in flight.
+#[tauri::command]
+pub fn live_input(live: tauri::State<'_, Live>, events: Vec<Input>) {
+    for event in events {
+        live.send_input(event);
+    }
+}
+
+#[tauri::command]
+pub fn live_settings(command_key: crate::keys::CommandKey) {
+    crate::hook::set_command(command_key);
+}
+
 #[tauri::command]
 pub fn live_info(live: tauri::State<'_, Live>) -> LiveInfo {
-    live.info.lock().unwrap().clone()
+    let mut info = live.info.lock().unwrap().clone();
+    (info.keyboard_active, info.keys_sent) = crate::hook::status();
+    info
 }
