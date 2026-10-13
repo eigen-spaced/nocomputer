@@ -1,0 +1,10 @@
+.build/
+build/*
+!build/synthetic-srgb.h264
+!build/moving-1080p.h264
+.DS_Store
+*.xcuserstate
+diagnostics-*.json
+app/src-tauri/target/
+app/src-tauri/gen/
+/tailnet-agents/

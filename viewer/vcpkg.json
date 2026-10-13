@@ -1,0 +1,9 @@
+{
+  "name": "nocomputer-viewer-poc",
+  "version-string": "0.1.0",
+  "builtin-baseline": "2200159cd465157f20133e363e4604ac4d68181b",
+  "dependencies": [
+    "sdl3",
+    { "name": "ffmpeg", "default-features": false, "features": ["avcodec", "avformat", "swscale"] }
+  ]
+}
