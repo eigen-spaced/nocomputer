@@ -9,8 +9,8 @@ use crate::Error;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// 2 added input and notices.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// 2 added input and notices; 3 added clipboard side streams (`clipboard.rs`).
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_CONTROL_MESSAGE: usize = 64 * 1024;
 pub const MAX_DEVICE_NAME_CHARS: usize = 64;
 

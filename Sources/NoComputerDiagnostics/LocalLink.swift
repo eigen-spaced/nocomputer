@@ -1,14 +1,30 @@
 import Foundation
 
-// local-v2: the private pipe contract between this app and its bundled
+// local-v3: the private pipe contract between this app and its bundled
 // `nocomputer-host` child. crates/host/src/local.rs is the source of truth;
-// crates/host/testdata/local-v2/ holds golden vectors both sides test against.
-// v2 adds remote input (0x86–0x8A) and InputUnavailable (0x05).
+// crates/host/testdata/local-v3/ holds golden vectors both sides test against.
+// v2 adds remote input (0x86–0x8A) and InputUnavailable (0x05); v3 adds
+// clipboard text (0x06, 0x8B).
 // Frame: [u32 BE len = 1 + payload][u8 type][payload], 1 <= len <= 4 MiB.
 enum LocalLink {
-    static let version: UInt16 = 2
+    static let version: UInt16 = 3
     static let maximumLength = 4 * 1024 * 1024
     static let maximumReason = 1024
+    static let maximumClipboard = 1 << 20
+
+    // Clipboard text as the contract allows it: 1 byte to 1 MiB of UTF-8, no NUL.
+    // Descriptions show only the length, so the text never reaches a log.
+    struct ClipboardText: Equatable, CustomStringConvertible, CustomDebugStringConvertible {
+        let text: String
+
+        init?(_ text: String) {
+            guard !text.isEmpty, text.utf8.count <= LocalLink.maximumClipboard, !text.contains("\0") else { return nil }
+            self.text = text
+        }
+
+        var description: String { "ClipboardText(\(text.utf8.count) bytes)" }
+        var debugDescription: String { description }
+    }
 
     enum ProtocolError: Error, Equatable { case invalid(String) }
 
@@ -19,6 +35,7 @@ enum LocalLink {
         case captureStopped(reason: String)
         case pairingDecision(requestID: UInt64, approve: Bool)
         case inputUnavailable(reason: String)
+        case clipboard(ClipboardText)
     }
 
     // Rust → Swift
@@ -29,6 +46,7 @@ enum LocalLink {
         case requestKeyframe
         case event(Data)
         case input(RemoteInput)
+        case clipboard(ClipboardText)
     }
 
     static func encode(_ message: Outgoing) throws -> Data {
@@ -54,6 +72,9 @@ enum LocalLink {
         case let .inputUnavailable(reason):
             type = 0x05
             payload.append(truncated(reason))
+        case let .clipboard(text):
+            type = 0x06
+            payload.append(Data(text.text.utf8))
         }
         let length = 1 + payload.count
         guard length <= maximumLength else { throw ProtocolError.invalid("frame of \(length) bytes exceeds 4 MiB") }
@@ -116,6 +137,11 @@ enum LocalLink {
             return .input(.key(usage: u16(0), state: state))
         case 0x8A:
             return try empty(.input(.releaseAll))
+        case 0x8B:
+            guard let string = String(bytes: payload, encoding: .utf8), let text = ClipboardText(string) else {
+                throw ProtocolError.invalid("Clipboard is not 1 byte to 1 MiB of UTF-8 without NUL")
+            }
+            return .clipboard(text)
         default:
             throw ProtocolError.invalid(String(format: "unknown frame type 0x%02x", type))
         }

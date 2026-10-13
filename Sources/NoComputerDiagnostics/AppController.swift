@@ -7,6 +7,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var window: NSWindow!
     private let permissionLabel = NSTextField(wrappingLabelWithString: "")
     private let remoteAccess = NSButton(checkboxWithTitle: "Remote access (paired viewers only)", target: nil, action: nil)
+    private let shareClipboard = NSButton(checkboxWithTitle: "Share clipboard text with the viewer", target: nil, action: nil)
     private let remoteStatus = NSTextField(wrappingLabelWithString: "Remote access off")
     private let logView = NSTextView()
     private var log: [String] = []
@@ -38,6 +39,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         remoteAccess.target = self
         remoteAccess.action = #selector(toggleRemoteAccess)
         root.addArrangedSubview(remoteAccess)
+        shareClipboard.state = .on
+        shareClipboard.target = self
+        shareClipboard.action = #selector(toggleShareClipboard)
+        root.addArrangedSubview(shareClipboard)
         root.addArrangedSubview(remoteStatus)
         logView.isEditable = false
         logView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
@@ -99,6 +104,7 @@ final class AppController: NSObject, NSApplicationDelegate {
                 self?.remoteAccess.state = .off
                 self?.remoteStatus.stringValue = "Remote access off"
             }
+            host.clipboardEnabled = shareClipboard.state == .on
             remoteHost = host
             do { try host.enable() } catch {
                 record("Remote access failed: \(error.localizedDescription)")
@@ -107,6 +113,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         } else {
             remoteHost?.disable()
         }
+    }
+
+    @objc private func toggleShareClipboard() {
+        remoteHost?.clipboardEnabled = shareClipboard.state == .on
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }

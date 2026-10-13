@@ -1,5 +1,6 @@
 //! Viewer side: connects to a pinned host, or makes first contact to pair.
 
+use crate::clipboard::{self, ClipboardText};
 use crate::identity::{Fingerprint, Identity, SERVER_NAME};
 use crate::input::{Input, Notice};
 use crate::tls;
@@ -95,6 +96,8 @@ pub struct Session {
     /// Replies from the host, read by a task so that reading is never cut short.
     replies: mpsc::Receiver<Message>,
     notices: mpsc::Receiver<Notice>,
+    clipboard_out: tokio::sync::watch::Sender<Option<ClipboardText>>,
+    clipboard_in: tokio::sync::watch::Receiver<Option<ClipboardText>>,
     seq: u64,
 }
 
@@ -114,7 +117,19 @@ impl Session {
                 }
             }
         });
-        Session { host_fingerprint, host_name, endpoint, conn, send, replies, notices, seq: 0 }
+        let clipboard_out = clipboard::start_sender(conn.clone());
+        let (clipboard_tx, clipboard_in) = tokio::sync::watch::channel(None);
+        let side_streams = conn.clone();
+        tokio::spawn(async move {
+            // Ends with the connection, or when the session is dropped.
+            tokio::select! {
+                _ = clipboard::receive_loop(side_streams, |text| {
+                    clipboard_tx.send_replace(Some(text));
+                }) => {}
+                _ = clipboard_tx.closed() => {}
+            }
+        });
+        Session { host_fingerprint, host_name, endpoint, conn, send, replies, notices, clipboard_out, clipboard_in, seq: 0 }
     }
 
     pub async fn ping(&mut self) -> Result<Duration, Error> {
@@ -156,6 +171,24 @@ impl Session {
     /// The next notice from the host; `None` once the session has ended. Cancel-safe.
     pub async fn notice(&mut self) -> Option<Notice> {
         self.notices.recv().await
+    }
+
+    /// Sends clipboard text to the host. Never blocks; if earlier text is still on its
+    /// way, only the newest is kept.
+    pub fn send_clipboard(&self, text: ClipboardText) {
+        self.clipboard_out.send_replace(Some(text));
+    }
+
+    /// The host's newest clipboard text since the last call; `None` once the session
+    /// has ended. Cancel-safe. Updates that arrive while the caller is busy are
+    /// replaced, never queued.
+    pub async fn clipboard(&mut self) -> Option<ClipboardText> {
+        loop {
+            self.clipboard_in.changed().await.ok()?;
+            if let Some(text) = self.clipboard_in.borrow_and_update().clone() {
+                return Some(text);
+            }
+        }
     }
 
     /// The host's video. Use it from a separate task; it shares the connection.

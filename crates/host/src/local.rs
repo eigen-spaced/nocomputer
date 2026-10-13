@@ -1,17 +1,20 @@
-//! local-v2: the pipe contract between the capture app (parent) and this host process
+//! local-v3: the pipe contract between the capture app (parent) and this host process
 //! (child), over the child's stdin and stdout. v2 added input (0x86-0x8A) and
-//! InputUnavailable (0x05); there is no v1 compatibility.
+//! InputUnavailable (0x05); v3 added Clipboard (0x06, 0x8B). Only the current version
+//! is spoken.
 //!
 //! ```text
 //! frame: [u32 BE len][u8 type][payload]    len = 1 + payload length, 1..=4 MiB
 //!
 //! app -> host
-//!   0x01 Hello            u16 BE version (= 2); must be the first frame
+//!   0x01 Hello            u16 BE version (= 3); must be the first frame
 //!   0x02 AccessUnit       u8 flags (bit0 keyframe, others 0), u64 BE capture_us,
 //!                         Annex B bytes (at least 1); a keyframe is an IDR with SPS+PPS
 //!   0x03 CaptureStopped   UTF-8 reason, at most 1024 bytes
 //!   0x04 PairingDecision  u64 BE request_id, u8 approve (0 or 1); exactly 9 bytes
 //!   0x05 InputUnavailable UTF-8 reason, at most 1024 bytes: input can't be injected
+//!   0x06 Clipboard        UTF-8 text for the controlling viewer: 1 byte to 1 MiB, no
+//!                         U+0000; dropped when no session is running
 //! host -> app
 //!   0x81 HelloAck         u16 BE version
 //!   0x82 StartStream      empty: a controlling session began; start capture, IDR first
@@ -28,23 +31,25 @@
 //!   0x89 Key              u16 BE USB HID usage (keyboard page 0x07), u8 state
 //!                         (0 up, 1 down, 2 repeat); unknown usages are the app's to drop
 //!   0x8A ReleaseAll       empty: release every key and button the remote holds
+//!   0x8B Clipboard        UTF-8 text from the controlling viewer, as 0x06; only the
+//!                         newest is kept while the app is busy
 //! ```
 //!
 //! Input comes only from the controlling session, in order. Pointer moves may be
 //! coalesced; buttons, keys and scrolls never are. The host sends ReleaseAll when a
 //! controlling session starts or ends (before StopStream) and when it discards an input
-//! backlog. Neither side logs input contents.
+//! backlog. Neither side logs input or clipboard contents.
 //!
 //! Anything else is fatal: lengths out of range (checked before allocating), unknown
 //! frame types, a payload on an empty type, wrong fixed sizes, invalid UTF-8. The
-//! payloads of `testdata/local-v2/*.bin` are the reference encoding for both sides.
+//! payloads of `testdata/local-v3/*.bin` are the reference encoding for both sides.
 //! `capture_us` is the app's monotonic clock and only meaningful within the app.
 
-use nocomputer_proto::{Button, Input, KeyState, ScrollUnit, MAX_SCROLL_LINES, MAX_SCROLL_PIXELS};
+use nocomputer_proto::{Button, ClipboardText, Input, KeyState, ScrollUnit, MAX_SCROLL_LINES, MAX_SCROLL_PIXELS};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 pub const MAX_REASON: usize = 1024;
 
@@ -53,6 +58,7 @@ const ACCESS_UNIT: u8 = 0x02;
 const CAPTURE_STOPPED: u8 = 0x03;
 const PAIRING_DECISION: u8 = 0x04;
 const INPUT_UNAVAILABLE: u8 = 0x05;
+const CLIPBOARD: u8 = 0x06;
 const HELLO_ACK: u8 = 0x81;
 const START_STREAM: u8 = 0x82;
 const STOP_STREAM: u8 = 0x83;
@@ -63,6 +69,7 @@ const BUTTON: u8 = 0x87;
 const SCROLL: u8 = 0x88;
 const KEY: u8 = 0x89;
 const RELEASE_ALL: u8 = 0x8A;
+const CLIPBOARD_TO_APP: u8 = 0x8B;
 const FLAG_KEYFRAME: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +79,8 @@ pub enum FromApp {
     CaptureStopped { reason: String },
     PairingDecision { request_id: u64, approve: bool },
     InputUnavailable { reason: String },
+    /// `Debug` shows only the length.
+    Clipboard(ClipboardText),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +95,7 @@ pub enum ToApp {
     Scroll { dx: i32, dy: i32, unit: u8 },
     Key { usage: u16, state: u8 },
     ReleaseAll,
+    Clipboard(ClipboardText),
 }
 
 /// Display-only notices for the app. Fingerprints are full, grouped hex strings.
@@ -116,7 +126,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "local pipe: {e}"),
             Error::Eof => write!(f, "local pipe closed"),
-            Error::Protocol(m) => write!(f, "local-v2: {m}"),
+            Error::Protocol(m) => write!(f, "local-v3: {m}"),
         }
     }
 }
@@ -155,6 +165,7 @@ impl ToApp {
             ToApp::Scroll { dx, dy, unit } => frame(SCROLL, &[&dx.to_be_bytes()[..], &dy.to_be_bytes(), &[*unit]].concat()),
             ToApp::Key { usage, state } => frame(KEY, &[&usage.to_be_bytes()[..], &[*state]].concat()),
             ToApp::ReleaseAll => frame(RELEASE_ALL, &[]),
+            ToApp::Clipboard(text) => frame(CLIPBOARD_TO_APP, text.as_str().as_bytes()),
         }
     }
 
@@ -212,6 +223,7 @@ impl FromApp {
             }
             FromApp::CaptureStopped { reason } => frame(CAPTURE_STOPPED, reason.as_bytes()),
             FromApp::InputUnavailable { reason } => frame(INPUT_UNAVAILABLE, reason.as_bytes()),
+            FromApp::Clipboard(text) => frame(CLIPBOARD, text.as_str().as_bytes()),
             FromApp::PairingDecision { request_id, approve } => {
                 let mut payload = request_id.to_be_bytes().to_vec();
                 payload.push(*approve as u8);
@@ -238,6 +250,10 @@ impl FromApp {
             }
             CAPTURE_STOPPED => Ok(FromApp::CaptureStopped { reason: reason("CaptureStopped", payload)? }),
             INPUT_UNAVAILABLE => Ok(FromApp::InputUnavailable { reason: reason("InputUnavailable", payload)? }),
+            CLIPBOARD => {
+                let text = String::from_utf8(payload).map_err(|_| bad("Clipboard is not UTF-8"))?;
+                Ok(FromApp::Clipboard(ClipboardText::new(text).ok_or_else(|| bad("Clipboard is empty, over 1 MiB or contains NUL"))?))
+            }
             PAIRING_DECISION => {
                 if payload.len() != 9 {
                     return Err(bad("PairingDecision must be 9 bytes"));
@@ -292,19 +308,20 @@ mod tests {
 
     fn from_app() -> Vec<(&'static str, FromApp)> {
         vec![
-            ("01-hello", FromApp::Hello { version: 2 }),
+            ("01-hello", FromApp::Hello { version: 3 }),
             ("02-access-unit-key", FromApp::AccessUnit { keyframe: true, capture_us: 0x0102030405060708, data: SPS_PPS_IDR.to_vec() }),
             ("02-access-unit-delta", FromApp::AccessUnit { keyframe: false, capture_us: 0x0102030405064E20, data: DELTA.to_vec() }),
             ("03-capture-stopped", FromApp::CaptureStopped { reason: "display disconnected – ü".into() }),
             ("04-pairing-decision-approve", FromApp::PairingDecision { request_id: 0x0A0B0C0D0E0F1011, approve: true }),
             ("04-pairing-decision-deny", FromApp::PairingDecision { request_id: 7, approve: false }),
             ("05-input-unavailable", FromApp::InputUnavailable { reason: "Accessibility not granted – ü".into() }),
+            ("06-clipboard", FromApp::Clipboard(ClipboardText::new("line one\nzwei – ü 🙂".into()).unwrap())),
         ]
     }
 
     fn to_app() -> Vec<(&'static str, ToApp)> {
         vec![
-            ("81-hello-ack", ToApp::HelloAck { version: 2 }),
+            ("81-hello-ack", ToApp::HelloAck { version: 3 }),
             ("82-start-stream", ToApp::StartStream),
             ("83-stop-stream", ToApp::StopStream),
             ("84-request-keyframe", ToApp::RequestKeyframe),
@@ -327,11 +344,12 @@ mod tests {
             ("89-key-up", ToApp::Key { usage: 0x00E3, state: 0 }),
             ("89-key-repeat", ToApp::Key { usage: 0x0028, state: 2 }),
             ("8a-release-all", ToApp::ReleaseAll),
+            ("8b-clipboard", ToApp::Clipboard(ClipboardText::new("from the viewer\n– ü 🙂".into()).unwrap())),
         ]
     }
 
     fn golden(name: &str) -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/local-v2").join(format!("{name}.bin"))
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/local-v3").join(format!("{name}.bin"))
     }
 
     /// Compares against the checked-in vectors; NOCOMPUTER_WRITE_GOLDEN=1 rewrites them.
@@ -395,5 +413,16 @@ mod tests {
         long[4] = 0x05;
         assert!(matches!(read(&long).await, Err(Error::Protocol(_))), "InputUnavailable reason over 1024 bytes");
         assert!(matches!(read(&[0, 0, 0, 1, 0x86]).await, Err(Error::Protocol(_))), "app-bound input type");
+        assert!(matches!(read(&[0, 0, 0, 1, 0x06]).await, Err(Error::Protocol(_))), "empty clipboard");
+        assert!(matches!(read(&[0, 0, 0, 4, 0x06, b'a', 0, b'b']).await, Err(Error::Protocol(_))), "clipboard with NUL");
+        assert!(matches!(read(&[0, 0, 0, 3, 0x06, 0xC3, 0x28]).await, Err(Error::Protocol(_))), "clipboard not UTF-8");
+        let mut big = ((nocomputer_proto::MAX_CLIPBOARD + 2) as u32).to_be_bytes().to_vec();
+        big.push(0x06);
+        big.extend(std::iter::repeat_n(b'a', nocomputer_proto::MAX_CLIPBOARD + 1));
+        assert!(matches!(read(&big).await, Err(Error::Protocol(_))), "clipboard over 1 MiB");
+        big.truncate(big.len() - 1);
+        big[..4].copy_from_slice(&((nocomputer_proto::MAX_CLIPBOARD + 1) as u32).to_be_bytes());
+        assert!(matches!(read(&big).await, Ok(FromApp::Clipboard(_))), "clipboard of exactly 1 MiB");
+        assert_eq!(format!("{:?}", read(&big).await.unwrap()), "Clipboard(ClipboardText(1048576 bytes))");
     }
 }

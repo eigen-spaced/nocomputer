@@ -124,8 +124,9 @@ async fn host(args: &[String]) -> Result<(), BoxError> {
                 HostEvent::PairingDenied { device } => println!("pairing denied or timed out: {device}"),
                 HostEvent::Rejected { device: Some(d), reason } => println!("rejected {d}: {reason}"),
                 HostEvent::Rejected { device: None, reason } => println!("rejected: {reason}"),
-                // This host has no capture or input injection; input is never printed.
-                HostEvent::KeyframeNeeded | HostEvent::Input(_) => {}
+                // This host has no capture, input injection or clipboard; input and
+                // clipboard text are never printed.
+                HostEvent::KeyframeNeeded | HostEvent::Input(_) | HostEvent::Clipboard(_) => {}
             }
         }
     });

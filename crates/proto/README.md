@@ -1,6 +1,6 @@
 # nocomputer-proto
 
-Transport, device identity, pairing and video for nocomputer, shared by the viewer and host. QUIC (quinn) with TLS 1.3 (rustls, ring provider), mutually authenticated. Input goes from the controlling viewer to the host; there is no clipboard yet.
+Transport, device identity, pairing and video for nocomputer, shared by the viewer and host. QUIC (quinn) with TLS 1.3 (rustls, ring provider), mutually authenticated. Input goes from the controlling viewer to the host; plain-text clipboard goes both ways.
 
 ## Security model
 
@@ -32,7 +32,7 @@ On macOS, Keychain access control is bound to the code signature of the program 
 
 ## Wire format
 
-The viewer opens one bidirectional control stream. Each message is a 4-byte big-endian length, then one JSON object tagged by `type` (see `src/wire.rs`). Messages are capped at 64 KiB, checked before allocating. Unknown fields are ignored, for forward compatibility; unknown message types are errors. `Hello` carries `min_version`/`max_version`, and the host refuses ranges that exclude its version with `version_unsupported`; the protocol version is 2. Video has its own streams. Input and notices are messages on this channel, so they stay ordered with the session. ALPN is `nocomputer/1`, and the default port is 47900/UDP.
+The viewer opens one bidirectional control stream. Each message is a 4-byte big-endian length, then one JSON object tagged by `type` (see `src/wire.rs`). Messages are capped at 64 KiB, checked before allocating. Unknown fields are ignored, for forward compatibility; unknown message types are errors. `Hello` carries `min_version`/`max_version`, and the host refuses ranges that exclude its version with `version_unsupported`; the protocol version is 3. Video and clipboard text have their own streams. Input and notices are messages on this channel, so they stay ordered with the session. ALPN is `nocomputer/1`, and the default port is 47900/UDP.
 
 ## Video
 
@@ -51,6 +51,14 @@ The controlling viewer sends `{"type":"input","kind":...}` messages (see `src/in
 - `release_all`.
 
 The host drops unknown buttons, clamps scrolls to ±10000 px or ±100 lines, and emits each one as `HostEvent::Input`. Only one session exists at a time, so input comes only from the controller. The host's capture side reports problems through `Host::notice`, which reaches the viewer as `{"type":"notice","kind":"input_unavailable"|"capture_stopped","message":...}` (`Session::notice`). Neither side logs input contents.
+
+## Clipboard
+
+Plain text only, in both directions, between the controlling session and the host (see `src/clipboard.rs`). Each update goes on its own QUIC bidirectional side stream, so a large paste never waits in front of input. The viewer's first bidirectional stream is the control stream; any later one, and any the host opens, is a side stream: `[u8 kind = 1][u32 BE len][UTF-8 text]`, then FIN.
+- **Limits:** 1 byte to 1 MiB (`MAX_CLIPBOARD`), no U+0000, `\n` line endings. The receiver checks the length before allocating. A malformed side stream is stopped and dropped without ending the session.
+- **Newest wins:** `Session::send_clipboard` and `Host::send_clipboard` never block; while a stream waits for credit or is being written, only the latest text is kept, and an unfinished older stream is reset. The receiver ignores a stream older than the last one it delivered. `Session::clipboard` is cancel-safe and returns only the newest unread text.
+- **Never shown:** `ClipboardText`'s `Debug` prints only its length, and so does `HostEvent::Clipboard`.
+- **Policy is the apps':** when to send, what to skip (password-manager markers), echo suppression and the on/off switch live in the host app and the viewer, not here.
 
 ## Manual test tool
 
@@ -77,5 +85,5 @@ Not yet verified:
 - Linux key storage.
 - Video between machines (the loopback path is tested here and in `crates/host`).
 - Input between machines.
-- Clipboard.
+- Clipboard between machines.
 - Linking into the Tauri viewer and the Swift host.

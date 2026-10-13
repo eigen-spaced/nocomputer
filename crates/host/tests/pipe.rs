@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
 fn golden(name: &str) -> Vec<u8> {
-    std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/local-v2").join(format!("{name}.bin"))).unwrap()
+    std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/local-v3").join(format!("{name}.bin"))).unwrap()
 }
 
 /// Feeds `input`, closes stdin, and returns (exit code, stdout).
@@ -37,7 +37,8 @@ fn closed_pipe_exits_cleanly() {
 #[test]
 fn version_mismatch_exits_2_without_output() {
     assert_eq!(run(&FromApp::Hello { version: 1 }.encode()), (2, vec![]));
-    assert_eq!(run(&FromApp::Hello { version: 3 }.encode()), (2, vec![]));
+    assert_eq!(run(&FromApp::Hello { version: 2 }.encode()), (2, vec![]));
+    assert_eq!(run(&FromApp::Hello { version: 4 }.encode()), (2, vec![]));
 }
 
 #[test]

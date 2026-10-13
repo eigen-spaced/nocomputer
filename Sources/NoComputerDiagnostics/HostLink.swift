@@ -46,7 +46,7 @@ struct PipeAdmission {
     mutating func written() { queued -= 1 }
 }
 
-// Owns the bundled `nocomputer-host` child and the local-v1 pipe to it. The pipe is
+// Owns the bundled `nocomputer-host` child and the local-v3 pipe to it. The pipe is
 // inherited, never a socket, so no other local process can reach this channel.
 // Network, pairing state and keys live entirely in the child.
 final class HostLink {
@@ -57,6 +57,7 @@ final class HostLink {
     var onStopStream: (() -> Void)?
     var onRequestKeyframe: (() -> Void)?
     var onEvent: ((Data) -> Void)?
+    var onClipboard: ((LocalLink.ClipboardText) -> Void)?
     var onExit: ((String) -> Void)?
     // Not on the main queue: called in order on the pipe reader's queue, so
     // input never waits behind UI work. The receiver must not block.
@@ -127,6 +128,13 @@ final class HostLink {
     func inputUnavailable(reason: String) { send(.inputUnavailable(reason: reason)) }
 
     func decide(requestID: UInt64, approve: Bool) { send(.pairingDecision(requestID: requestID, approve: approve)) }
+
+    func sendClipboard(_ text: LocalLink.ClipboardText) {
+        lock.lock()
+        let ready = acknowledged && failed == nil
+        lock.unlock()
+        if ready { send(.clipboard(text)) }
+    }
 
     // The next frame must be an IDR, e.g. at stream start or after a request.
     func expectKeyframe() {
@@ -229,6 +237,7 @@ final class HostLink {
                 case .stopStream: self.onStopStream?()
                 case .requestKeyframe: self.expectKeyframe(); self.onRequestKeyframe?()
                 case let .event(json): self.onEvent?(json)
+                case let .clipboard(text): self.onClipboard?(text)
                 case .input: break
                 }
             }

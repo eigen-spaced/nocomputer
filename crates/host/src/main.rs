@@ -1,6 +1,6 @@
 //! nocomputer-host: serves paired viewers. Normally spawned by the capture app with no
-//! arguments and fed over stdin/stdout (local-v2, see `local.rs`); stdout carries only
-//! local-v2 frames and all logging goes to stderr.
+//! arguments and fed over stdin/stdout (local-v3, see `local.rs`); stdout carries only
+//! local-v3 frames and all logging goes to stderr.
 //!
 //!   nocomputer-host [--listen ADDR] [--name NAME] [--state-dir DIR] [--from-file X.h264]
 //!
@@ -8,14 +8,14 @@
 //! stdin into a y/N console for pairing approvals, for testing without the app. Input
 //! from the viewer is then only counted.
 //!
-//! Exit codes: 0 when stdin closes, 1 on startup errors, 2 on a local-v2 version
-//! mismatch, 3 on any other local-v2 violation.
+//! Exit codes: 0 when stdin closes, 1 on startup errors, 2 on a local-v3 version
+//! mismatch, 3 on any other local-v3 violation.
 
 use nocomputer_host::h264::{self, Kind};
 use nocomputer_host::input::InputQueue;
 use nocomputer_host::local::{self, Event, FromApp, ToApp};
 use nocomputer_proto::{
-    load_or_create_identity, platform_keystore, wire::valid_device_name, AccessUnit, Approver, Host, HostConfig, HostEvent, Notice, NoticeKind,
+    load_or_create_identity, platform_keystore, wire::valid_device_name, AccessUnit, Approver, ClipboardText, Host, HostConfig, HostEvent, Notice, NoticeKind,
     PairedClients, DEFAULT_PORT,
 };
 use std::net::SocketAddr;
@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 /// At most one keyframe request to the capture side per this interval.
@@ -128,13 +128,14 @@ fn fp(f: &nocomputer_proto::Fingerprint) -> String {
     f.to_string()
 }
 
-/// Turns host events into capture commands (with keyframe requests rate-limited), input
-/// and display events. Input held by a session is released when any session starts or
-/// ends.
+/// Turns host events into capture commands (with keyframe requests rate-limited), input,
+/// clipboard text and display events. Input held by a session is released when any
+/// session starts or ends.
 async fn route_events(
     mut events: mpsc::UnboundedReceiver<HostEvent>,
     capture: mpsc::UnboundedSender<Capture>,
     input: Arc<InputQueue>,
+    clipboard: watch::Sender<Option<ClipboardText>>,
     notices: mpsc::UnboundedSender<Event>,
 ) {
     let release = || {
@@ -200,6 +201,10 @@ async fn route_events(
                 }
             }
             HostEvent::Input(_) => {}
+            HostEvent::Clipboard(text) if sessions > 0 => {
+                clipboard.send_replace(Some(text));
+            }
+            HostEvent::Clipboard(_) => {}
             HostEvent::Paired { device, name } => {
                 let _ = notices.send(Event::Paired { name, device_fingerprint: fp(&device) });
             }
@@ -278,6 +283,7 @@ async fn run() -> Result<(), Exit> {
     let (capture_tx, capture) = mpsc::unbounded_channel();
     let (notices_tx, notices) = mpsc::unbounded_channel();
     let input = Arc::new(InputQueue::default());
+    let (clipboard_tx, clipboard) = watch::channel(None);
     let pending: Pending = Arc::default();
     let approver = match o.replay {
         Some(_) => console_approver(pending.clone()),
@@ -289,13 +295,13 @@ async fn run() -> Result<(), Exit> {
     let host = Arc::new(Host::bind(o.listen, &identity, config, clients, approver).map_err(Exit::startup)?);
     eprintln!("nocomputer-host: \"{}\" listening on {}", o.name, host.local_addr().map_err(Exit::startup)?);
     eprintln!("nocomputer-host: this host is {}", host.fingerprint());
-    tokio::spawn(route_events(events, capture_tx, input.clone(), notices_tx));
+    tokio::spawn(route_events(events, capture_tx, input.clone(), clipboard_tx, notices_tx));
     let runner = host.clone();
     tokio::spawn(async move { runner.run().await });
 
     let result = match o.replay {
         Some(path) => replay(&host, &path, capture, input, notices, pending).await,
-        None => serve_app(&host, stdin, capture, input, notices, pending).await,
+        None => serve_app(&host, stdin, capture, input, clipboard, notices, pending).await,
     };
     host.close();
     result
@@ -307,12 +313,14 @@ async fn serve_app(
     mut stdin: tokio::io::Stdin,
     mut capture: mpsc::UnboundedReceiver<Capture>,
     input: Arc<InputQueue>,
+    mut clipboard: watch::Receiver<Option<ClipboardText>>,
     mut notices: mpsc::UnboundedReceiver<Event>,
     pending: Pending,
 ) -> Result<(), Exit> {
     // One writer owns stdout, so frames never interleave. Control frames go first; input
-    // is ordered among itself. On shutdown it writes the control frames already queued,
-    // then stops.
+    // is ordered among itself; clipboard text waits behind both, and only the newest is
+    // kept while it waits. On shutdown it writes the control frames already queued, then
+    // stops.
     let (out_tx, mut out) = mpsc::unbounded_channel::<ToApp>();
     let (stop_tx, mut stop) = oneshot::channel::<()>();
     let writer = tokio::spawn(async move {
@@ -322,6 +330,10 @@ async fn serve_app(
                 biased;
                 Some(m) = out.recv() => m,
                 m = input.pop() => m,
+                Ok(()) = clipboard.changed() => match clipboard.borrow_and_update().clone() {
+                    Some(text) => ToApp::Clipboard(text),
+                    None => continue,
+                },
                 _ = &mut stop => {
                     while let Ok(m) = out.try_recv() {
                         if stdout.write_all(&m.encode()).await.is_err() {
@@ -372,6 +384,7 @@ async fn serve_app(
                 eprintln!("nocomputer-host: input unavailable: {reason}");
                 host.notice(Notice { kind: NoticeKind::InputUnavailable, message: reason });
             }
+            Ok(FromApp::Clipboard(text)) => host.send_clipboard(text),
             Ok(FromApp::PairingDecision { request_id, approve }) => {
                 let mut slot = pending.lock().unwrap();
                 if slot.as_ref().is_some_and(|(id, _)| *id == request_id) {
@@ -494,7 +507,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    /// stdout belongs to local-v2 frames.
+    /// stdout belongs to local-v3 frames.
     #[test]
     fn nothing_prints_to_stdout() {
         for (name, source) in [("main.rs", include_str!("main.rs")), ("local.rs", include_str!("local.rs")), ("h264.rs", include_str!("h264.rs")), ("input.rs", include_str!("input.rs"))] {

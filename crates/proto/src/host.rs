@@ -1,6 +1,7 @@
 //! Host side: accepts connections, authorizes each one against the paired-device list,
 //! and runs locally approved pairing for unknown devices.
 
+use crate::clipboard::{self, ClipboardText};
 use crate::identity::{Fingerprint, Identity};
 use crate::input::{Input, Notice, MAX_NOTICE};
 use crate::tls;
@@ -47,6 +48,8 @@ pub enum HostEvent {
     /// From the controlling session, sanitized (see [`Input::sanitized`]). Inject it
     /// promptly, and release everything held when the session ends.
     Input(Input),
+    /// Clipboard text from the controlling session. Never log it.
+    Clipboard(ClipboardText),
 }
 
 pub struct HostConfig {
@@ -86,6 +89,7 @@ struct Outputs {
     id: usize,
     video: Arc<VideoQueue>,
     notices: tokio::sync::mpsc::UnboundedSender<Notice>,
+    clipboard: tokio::sync::watch::Sender<Option<ClipboardText>>,
 }
 
 pub struct Host {
@@ -173,6 +177,14 @@ impl Host {
             let _ = o.notices.send(notice);
         }
     }
+
+    /// Sends clipboard text to the controlling session, if any. Never blocks; if earlier
+    /// text is still on its way, only the newest is kept.
+    pub fn send_clipboard(&self, text: ClipboardText) {
+        if let Some(o) = self.inner.outputs.lock().unwrap().as_ref() {
+            o.clipboard.send_replace(Some(text));
+        }
+    }
 }
 
 impl Inner {
@@ -227,10 +239,18 @@ impl Inner {
                     write_msg(&mut send, &Message::Welcome { version: PROTOCOL_VERSION, host_name: self.config.name.clone(), paired: true }).await?;
                     self.live.lock().unwrap().entry(device).or_default().push(conn.clone());
                     self.emit(HostEvent::Session { device, name, reported_name: device_name });
-                    *self.outputs.lock().unwrap() = Some(Outputs { id: conn.stable_id(), video: queue.clone(), notices: notices_tx });
+                    let clipboard = clipboard::start_sender(conn.clone());
+                    *self.outputs.lock().unwrap() = Some(Outputs { id: conn.stable_id(), video: queue.clone(), notices: notices_tx, clipboard });
                     tokio::spawn(video::send_loop(conn.clone(), queue.clone()));
+                    let events = self.config.events.clone();
+                    let side_streams = tokio::spawn(clipboard::receive_loop(conn.clone(), move |text| {
+                        if let Some(tx) = &events {
+                            let _ = tx.send(HostEvent::Clipboard(text));
+                        }
+                    }));
                     self.emit(HostEvent::KeyframeNeeded);
                     let result = self.session(&mut send, recv, notices).await;
+                    side_streams.abort();
                     if let Some(conns) = self.live.lock().unwrap().get_mut(&device) {
                         conns.retain(|c| c.stable_id() != conn.stable_id());
                     }

@@ -659,3 +659,143 @@ async fn input_reaches_the_host_in_order_and_notices_reach_the_viewer() {
     assert_eq!(session.notice().await.unwrap().kind, NoticeKind::CaptureStopped);
     session.close().await;
 }
+
+#[test]
+fn clipboard_text_is_bounded_and_never_shown() {
+    use crate::{ClipboardText, MAX_CLIPBOARD};
+    assert!(ClipboardText::new(String::new()).is_none());
+    assert!(ClipboardText::new("a\0b".into()).is_none());
+    assert!(ClipboardText::new("x".repeat(MAX_CLIPBOARD + 1)).is_none());
+    let max = ClipboardText::new("x".repeat(MAX_CLIPBOARD)).unwrap();
+    assert_eq!(max.as_str().len(), MAX_CLIPBOARD);
+    let secret = ClipboardText::new("hunter2".into()).unwrap();
+    assert_eq!(format!("{secret:?}"), "ClipboardText(7 bytes)");
+    assert_eq!(format!("{:?}", crate::HostEvent::Clipboard(secret)), "Clipboard(ClipboardText(7 bytes))");
+}
+
+#[tokio::test]
+async fn clipboard_crosses_both_ways_beside_input() {
+    use crate::{ClipboardText, HostEvent, Input, KeyState, MAX_CLIPBOARD};
+    use std::time::Duration;
+    let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
+    let mut config = HostConfig::new("test-host");
+    config.events = Some(events);
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let host = start(Host::bind(LOOPBACK.into(), &Identity::generate().unwrap(), config, PairedClients::in_memory(), approver(true, prompts.clone())).unwrap(), prompts);
+    let viewer = viewer();
+    let host_fp = pair(&viewer, &host).await;
+    // No session yet: dropped.
+    host.host.send_clipboard(ClipboardText::new("nobody".into()).unwrap());
+    let Outcome::Ready(mut session) = viewer.connect(host.addr, Some(host_fp)).await.unwrap() else { panic!() };
+    session.ping().await.unwrap();
+
+    // A full-size paste does not hold up a key behind it.
+    let big = ClipboardText::new("é".repeat(MAX_CLIPBOARD / 2)).unwrap();
+    session.send_clipboard(big.clone());
+    session.input(Input::Key { usage: 0x04, state: KeyState::Down }).await.unwrap();
+    session.ping().await.unwrap();
+    let mut got = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while got.is_none() && tokio::time::Instant::now() < deadline {
+        for event in drain(&mut seen) {
+            if let HostEvent::Clipboard(text) = event {
+                got = Some(text);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(got, Some(big));
+
+    // Back to back: the last one is what the viewer ends up with.
+    for n in 0..20 {
+        host.host.send_clipboard(ClipboardText::new(format!("update {n}")).unwrap());
+    }
+    let mut last = None;
+    while let Ok(Some(text)) = tokio::time::timeout(Duration::from_millis(500), session.clipboard()).await {
+        last = Some(text);
+    }
+    assert_eq!(last.map(ClipboardText::into_string).as_deref(), Some("update 19"));
+    session.close().await;
+}
+
+#[tokio::test]
+async fn malformed_or_stale_clipboard_streams_are_dropped() {
+    use std::time::Duration;
+    let (host_conn, viewer_conn, _server, _client) = raw_pair().await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(crate::clipboard::receive_loop(host_conn.clone(), move |text| {
+        let _ = tx.send(text.into_string());
+    }));
+    async fn side(conn: &quinn::Connection, bytes: &[u8], finish: bool) -> quinn::SendStream {
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        send.write_all(bytes).await.unwrap();
+        if finish {
+            send.finish().unwrap();
+        }
+        send
+    }
+    fn clip(text: &[u8]) -> Vec<u8> {
+        let mut v = vec![1];
+        v.extend((text.len() as u32).to_be_bytes());
+        v.extend(text);
+        v
+    }
+    let mut bad = vec![
+        [vec![2], (2u32).to_be_bytes().to_vec(), b"hi".to_vec()].concat(), // unknown kind
+        [vec![1], ((crate::MAX_CLIPBOARD + 1) as u32).to_be_bytes().to_vec()].concat(), // too long
+        clip(b"a\0b"),
+        clip(b""),
+        clip(&[0xff, 0xfe]),
+        [clip(b"ok"), b"trailing".to_vec()].concat(),
+    ];
+    bad.push(clip(b"short")[..6].to_vec()); // truncated
+    for bytes in &bad {
+        side(&viewer_conn, bytes, true).await;
+    }
+    // An older stream that finishes after a newer one is stale.
+    let mut older = side(&viewer_conn, &clip(b"older")[..3], false).await;
+    side(&viewer_conn, &clip(b"newer"), true).await;
+    assert_eq!(tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().as_deref(), Some("newer"));
+    older.write_all(&clip(b"older")[3..]).await.unwrap();
+    older.finish().unwrap();
+    side(&viewer_conn, &clip(b"latest"), true).await;
+    assert_eq!(tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().as_deref(), Some("latest"));
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn clipboard_sent_while_an_earlier_one_waits_still_arrives() {
+    use std::time::Duration;
+    let (host_conn, viewer_conn, _server, _client) = raw_pair().await;
+    fn clip(text: &[u8]) -> Vec<u8> {
+        let mut v = vec![1];
+        v.extend((text.len() as u32).to_be_bytes());
+        v.extend(text);
+        v
+    }
+    // Take all four streams of credit, so the sender's first open has to wait.
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        let (mut send, recv) = viewer_conn.open_bi().await.unwrap();
+        send.write_all(&clip(b"held")[..1]).await.unwrap();
+        held.push((send, recv));
+    }
+    let updates = crate::clipboard::start_sender(viewer_conn.clone());
+    updates.send_replace(crate::ClipboardText::new("A".into()));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    updates.send_replace(crate::ClipboardText::new("B".into()));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(crate::clipboard::receive_loop(host_conn.clone(), move |text| {
+        let _ = tx.send(text.into_string());
+    }));
+    for (send, _) in &mut held {
+        send.write_all(&clip(b"held")[1..]).await.unwrap();
+        send.finish().unwrap();
+    }
+    let mut last = None;
+    while let Ok(Some(text)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+        last = Some(text);
+    }
+    assert_eq!(last.as_deref(), Some("B"));
+}

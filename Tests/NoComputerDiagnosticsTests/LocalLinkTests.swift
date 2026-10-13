@@ -141,11 +141,11 @@ struct PipeAdmissionTests {
     }
 }
 
-// crates/host owns local-v2; its golden vectors are the shared reference bytes.
+// crates/host owns local-v3; its golden vectors are the shared reference bytes.
 struct LocalLinkGoldenTests {
     private static let directory = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        .appendingPathComponent("crates/host/testdata/local-v2")
+        .appendingPathComponent("crates/host/testdata/local-v3")
 
     private static func golden(_ name: String) throws -> Data {
         try Data(contentsOf: directory.appendingPathComponent(name))
@@ -157,7 +157,7 @@ struct LocalLinkGoldenTests {
     }
 
     @Test func swiftEncodesTheGoldenOutgoingFrames() throws {
-        #expect(try LocalLink.encode(.hello(version: 2)) == Self.golden("01-hello.bin"))
+        #expect(try LocalLink.encode(.hello(version: 3)) == Self.golden("01-hello.bin"))
         #expect(try LocalLink.encode(.accessUnit(keyframe: true, captureMicroseconds: 0x0102_0304_0506_0708,
             annexB: Self.annexB("02-access-unit-key.bin"))) == Self.golden("02-access-unit-key.bin"))
         let delta = try Self.golden("02-access-unit-delta.bin")
@@ -174,6 +174,16 @@ struct LocalLinkGoldenTests {
         let unavailable = try Self.golden("05-input-unavailable.bin")
         let unavailableReason = try #require(String(data: unavailable.dropFirst(5), encoding: .utf8))
         #expect(try LocalLink.encode(.inputUnavailable(reason: unavailableReason)) == unavailable)
+        let clipboard = try Self.golden("06-clipboard.bin")
+        let string = try #require(String(data: clipboard.dropFirst(5), encoding: .utf8))
+        let text = try #require(LocalLink.ClipboardText(string))
+        #expect(try LocalLink.encode(.clipboard(text)) == clipboard)
+    }
+
+    @Test func swiftDecodesTheGoldenClipboardFrame() throws {
+        var reader = LocalLink.Reader()
+        let messages = try reader.feed(Self.golden("8b-clipboard.bin"))
+        #expect(messages == [.clipboard(try #require(LocalLink.ClipboardText("from the viewer\n– ü 🙂")))])
     }
 
     @Test func swiftDecodesTheGoldenIncomingFrames() throws {
@@ -182,7 +192,7 @@ struct LocalLinkGoldenTests {
                      "85-event-pairing-prompt.bin", "85-event-session.bin"]
         let messages = try reader.feed(names.map { try Self.golden($0) }.reduce(Data(), +))
         try #require(messages.count == 6)
-        #expect(Array(messages[0..<4]) == [.helloAck(version: 2), .startStream, .stopStream, .requestKeyframe])
+        #expect(Array(messages[0..<4]) == [.helloAck(version: 3), .startStream, .stopStream, .requestKeyframe])
         guard case let .event(prompt) = messages[4], case let .event(session) = messages[5] else {
             Issue.record("expected two events")
             return
@@ -215,7 +225,7 @@ struct LocalLinkGoldenTests {
     // Swift→Rust frames must never be accepted coming back the other way.
     @Test func outgoingGoldenFramesAreRejectedAsIncoming() throws {
         for name in ["01-hello.bin", "02-access-unit-key.bin", "03-capture-stopped.bin", "04-pairing-decision-deny.bin",
-                     "05-input-unavailable.bin"] {
+                     "05-input-unavailable.bin", "06-clipboard.bin"] {
             var reader = LocalLink.Reader()
             #expect(throws: LocalLink.ProtocolError.self, "\(name)") { try reader.feed(Self.golden(name)) }
         }
@@ -244,6 +254,10 @@ struct LocalLinkInputTests {
             ("unknown scroll unit", frame(0x88, [0, 0, 0, 0, 0, 0, 0, 1, 2])),
             ("unknown key state", frame(0x89, [0, 4, 3])),
             ("payload on ReleaseAll", frame(0x8A, [0])),
+            ("empty clipboard", frame(0x8B, [])),
+            ("clipboard with NUL", frame(0x8B, [0x61, 0, 0x62])),
+            ("clipboard not UTF-8", frame(0x8B, [0xC3, 0x28])),
+            ("clipboard over 1 MiB", frame(0x8B, [UInt8](repeating: 0x61, count: LocalLink.maximumClipboard + 1))),
         ]
         for (name, bytes) in cases {
             var reader = LocalLink.Reader()
@@ -253,6 +267,19 @@ struct LocalLinkInputTests {
 
     @Test func encodesInputUnavailable() throws {
         #expect(try LocalLink.encode(.inputUnavailable(reason: "no AX")) == frame(0x05, Array("no AX".utf8)))
-        #expect(try LocalLink.encode(.hello(version: LocalLink.version)) == frame(0x01, [0, 2]))
+        #expect(try LocalLink.encode(.hello(version: LocalLink.version)) == frame(0x01, [0, 3]))
+    }
+
+    @Test func clipboardTextIsBoundedAndNeverDescribed() throws {
+        #expect(LocalLink.ClipboardText("") == nil)
+        #expect(LocalLink.ClipboardText("a\0b") == nil)
+        #expect(LocalLink.ClipboardText(String(repeating: "a", count: LocalLink.maximumClipboard + 1)) == nil)
+        #expect(LocalLink.ClipboardText(String(repeating: "a", count: LocalLink.maximumClipboard)) != nil)
+        let secret = try #require(LocalLink.ClipboardText("hunter2"))
+        let message = LocalLink.Incoming.clipboard(secret)
+        #expect(!"\(message)".contains("hunter2"))
+        #expect(!String(reflecting: message).contains("hunter2"))
+        var reader = LocalLink.Reader()
+        #expect(try reader.feed(frame(0x8B, [UInt8](repeating: 0x61, count: LocalLink.maximumClipboard))).count == 1)
     }
 }

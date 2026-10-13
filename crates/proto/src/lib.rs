@@ -6,6 +6,7 @@
 //! host's user approves locally. Afterwards the host authorizes every connection against
 //! its paired-device list, which supports revocation. See `README.md` for the flow.
 
+mod clipboard;
 mod host;
 mod identity;
 mod input;
@@ -20,6 +21,7 @@ pub mod wire;
 #[cfg(test)]
 mod tests;
 
+pub use clipboard::{ClipboardText, MAX_CLIPBOARD};
 pub use host::{Approver, Host, HostConfig, HostEvent, PairingPrompt};
 pub use identity::{Fingerprint, Identity, SERVER_NAME};
 pub use input::{Button, Input, KeyState, Notice, NoticeKind, ScrollUnit, MAX_NOTICE, MAX_SCROLL_LINES, MAX_SCROLL_PIXELS};

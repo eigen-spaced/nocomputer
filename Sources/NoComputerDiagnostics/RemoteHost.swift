@@ -17,6 +17,11 @@ final class RemoteHost {
     private var link: HostLink?
     private let capture = CaptureSession()
     private let sleep = SleepAssertion()
+    private let clipboard = ClipboardSync()
+    // Plain-text clipboard sharing with the controlling viewer; takes effect at once.
+    var clipboardEnabled = true {
+        didSet { if clipboardEnabled { if streamWanted { clipboard.start() } } else { clipboard.stop() } }
+    }
     private var streamWanted = false
     private var starting = false
     private var restartTask: Task<Void, Never>?
@@ -51,6 +56,8 @@ final class RemoteHost {
         link.onStopStream = { [weak self] in self?.stopStream(reason: "no controlling session") }
         link.onRequestKeyframe = { [weak self] in self?.capture.requestKeyframe() }
         link.onEvent = { [weak self] in self?.event($0) }
+        link.onClipboard = { [weak self] in self?.clipboard.apply($0) }
+        clipboard.onLocalText = { [weak link] in link?.sendClipboard($0) }
         link.onExit = { [weak self] in self?.exited($0) }
         link.onInput = { [weak self] input in self?.inputQueue.async { self?.inject(input) } }
         try sleep.enable()
@@ -83,6 +90,9 @@ final class RemoteHost {
         // Counts only; no key identities.
         line += "\nInput: pointer=\(input.0.pointerEvents) buttons=\(input.0.buttonEvents) scroll=\(input.0.scrollEvents) keys=\(input.0.keyEvents) unmapped=\(input.0.unmappedKeys) releaseAll=\(input.0.releaseAlls)"
         if input.1 > 0 { line += " dropped without Accessibility=\(input.1)" }
+        // Counts only; never the text.
+        let c = clipboard.state
+        line += "\nClipboard: \(clipboardEnabled ? "on" : "off"); sent=\(c.sent) received=\(c.applied) skipped secret=\(c.skippedSecret) over 1 MiB=\(c.skippedLarge) not text=\(c.skippedNonText)"
         return line
     }
 
@@ -90,6 +100,7 @@ final class RemoteHost {
         // Every session gets the notice: a viewer that connects later never
         // saw an earlier one.
         if !AXIsProcessTrusted() { link?.inputUnavailable(reason: "Accessibility is not granted to the host app") }
+        if clipboardEnabled { clipboard.start() }
         startStream()
     }
 
@@ -116,6 +127,7 @@ final class RemoteHost {
 
     private func stopStream(reason: String) {
         releaseInput()
+        clipboard.stop()
         streamWanted = false
         restartTask?.cancel()
         Task { await stopCapture() }
@@ -194,6 +206,7 @@ final class RemoteHost {
 
     private func exited(_ reason: String) {
         releaseInput()
+        clipboard.stop()
         dismissPrompt()
         streamWanted = false
         restartTask?.cancel()

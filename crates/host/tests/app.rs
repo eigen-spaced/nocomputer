@@ -1,10 +1,11 @@
 //! End to end on loopback, as the app sees it: the real host binary over its pipes, a
-//! viewer pairing through an app-side approval, and input arriving on stdout in order.
+//! viewer pairing through an app-side approval, input arriving on stdout in order, and
+//! clipboard text in both directions.
 
 #![cfg(not(target_os = "macos"))] // the host identity would be the app's Keychain item
 
 use nocomputer_host::local::{FromApp, ToApp};
-use nocomputer_proto::{Button, Identity, Input, KeyState, NoticeKind, Outcome, ScrollUnit, Viewer};
+use nocomputer_proto::{Button, ClipboardText, Identity, Input, KeyState, NoticeKind, Outcome, ScrollUnit, Viewer};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Receiver;
@@ -69,8 +70,8 @@ async fn input_reaches_the_app_in_order_and_is_released_at_session_end() {
     let mut app = child.0.stdin.take().unwrap();
     let frames = read_frames(child.0.stdout.take().unwrap());
     let stderr = BufReader::new(child.0.stderr.take().unwrap());
-    app.write_all(&FromApp::Hello { version: 2 }.encode()).unwrap();
-    assert_eq!(next(&frames), (0x81, vec![0, 2]));
+    app.write_all(&FromApp::Hello { version: 3 }.encode()).unwrap();
+    assert_eq!(next(&frames), (0x81, vec![0, 3]));
     // Keep draining stderr: the host must never block or fail on its logging.
     let (addr_tx, addr) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -134,6 +135,14 @@ async fn input_reaches_the_app_in_order_and_is_released_at_session_end() {
     app.write_all(&FromApp::InputUnavailable { reason: "Accessibility is off".into() }.encode()).unwrap();
     let notice = tokio::time::timeout(Duration::from_secs(5), session.notice()).await.unwrap().unwrap();
     assert_eq!((notice.kind, notice.message.as_str()), (NoticeKind::InputUnavailable, "Accessibility is off"));
+
+    // Clipboard text crosses both ways.
+    let text = ClipboardText::new("from the viewer\n– ü".into()).unwrap();
+    session.send_clipboard(text.clone());
+    assert_eq!(next_command(&frames), ToApp::Clipboard(text).encode());
+    let text = ClipboardText::new("from the app".into()).unwrap();
+    app.write_all(&FromApp::Clipboard(text.clone()).encode()).unwrap();
+    assert_eq!(tokio::time::timeout(Duration::from_secs(5), session.clipboard()).await.unwrap(), Some(text));
 
     // Held input is released before the stream stops, even if the viewer never let go.
     session.input(Input::Key { usage: 0xE1, state: KeyState::Down }).await.unwrap();
