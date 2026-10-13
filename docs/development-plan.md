@@ -181,10 +181,10 @@ Paired across machines over the tailnet (2026-10-13), with `nocomputer-pair`:
 - **Devices:** the Windows client (Dell Latitude 5400, paired as "latitude", `1111 2222 3333 4444 5555 6666 7777 8888 9999 AAAA BBBB CCCC DDDD EEEE FFFF 0000`) and the MacBook Air host (`0102 0304 0506 0708 090A 0B0C 0D0E 0F10 1112 1314 1516 1718 191A 1B1C 1D1E 1F20`).
 - **Pairing:** both screens showed the same two fingerprints, and the user approved on the Mac. The Mac's paired list holds exactly that device fingerprint, and the Windows pin matches the host fingerprint on its screen.
 - **Reconnect:** pinned connects opened sessions with no prompt and closed cleanly. Control-channel ping round trip was 26–28 ms, with one 56 ms outlier in 5.
-- **Bug found and fixed:** the host showed session names from the device's `Hello` ("DESKTOP-V89P2R0") rather than the approved name. Sessions now carry the stored name, and the self-reported one is shown only as unverified.
+- **Bug found and fixed:** the host showed session names from the device's `Hello` ("DESKTOP-V89P2R0") rather than the approved name. Sessions now carry the stored name, and the self-reported one is shown only as unverified. After a host restart on the fixed build, the session showed as "latitude".
+- **Revocation:** with a session open from Windows (98 pings, mostly 28–40 ms, with spikes to 226 ms), the user revoked the device on the Mac. The host closed the live connection at once, and a fresh connect was refused with `Revoked`. The viewer had reported the live drop only as "connection lost"; it now reports the host's revocation close code as `Revoked`.
 
 Still pending:
-- revocation between machines
 - the single-controller rule
 - video, input and clipboard streams
 - integration into the viewer and host

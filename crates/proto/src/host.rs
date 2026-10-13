@@ -17,7 +17,6 @@ use tokio::time::timeout;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const PAIR_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
-const CLOSE_REVOKED: u32 = 0x10;
 
 /// What the host's user is asked to approve. The device fingerprint is the one that
 /// authenticated the connection, never a value the device sent in a message.
@@ -122,7 +121,7 @@ impl Host {
     pub fn revoke(&self, device: &Fingerprint) -> Result<bool, Error> {
         let listed = self.inner.clients.lock().unwrap().revoke(device)?;
         for conn in self.inner.live.lock().unwrap().remove(device).unwrap_or_default() {
-            conn.close(CLOSE_REVOKED.into(), b"revoked");
+            conn.close(crate::CLOSE_REVOKED.into(), b"revoked");
         }
         Ok(listed)
     }

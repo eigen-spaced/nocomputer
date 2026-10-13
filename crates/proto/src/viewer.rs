@@ -91,11 +91,25 @@ impl Session {
     pub async fn ping(&mut self) -> Result<Duration, Error> {
         self.seq += 1;
         let started = Instant::now();
-        write_msg(&mut self.channel.send, &Message::Ping { seq: self.seq }).await?;
-        match timeout(REPLY_TIMEOUT, read_msg(&mut self.channel.recv)).await.map_err(|_| Error::Timeout("pong"))?? {
+        let reply = async {
+            write_msg(&mut self.channel.send, &Message::Ping { seq: self.seq }).await?;
+            timeout(REPLY_TIMEOUT, read_msg(&mut self.channel.recv)).await.map_err(|_| Error::Timeout("pong"))?
+        };
+        match reply.await.map_err(|e| self.explain_close(e))? {
             Message::Pong { seq } if seq == self.seq => Ok(started.elapsed()),
             Message::Error { code, message } => Err(Error::Remote { code, message }),
             other => Err(Error::Protocol(format!("unexpected reply to ping: {other:?}"))),
+        }
+    }
+
+    /// A stream error after the host closed the connection says only "connection lost";
+    /// report a revocation as such.
+    fn explain_close(&self, error: Error) -> Error {
+        match self.channel.conn.close_reason() {
+            Some(quinn::ConnectionError::ApplicationClosed(c)) if c.error_code == crate::CLOSE_REVOKED.into() => {
+                Error::Remote { code: ErrorCode::Revoked, message: "the host revoked this device's access".into() }
+            }
+            _ => error,
         }
     }
 

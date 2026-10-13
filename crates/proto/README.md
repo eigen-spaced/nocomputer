@@ -49,12 +49,11 @@ nocomputer-pair clients | revoke FINGERPRINT | forget HOST[:PORT]
 
 Verified on Windows, 2026-10-13, on the target client: all 18 tests pass (`cargo test`, including the DPAPI store); `cargo clippy --all-targets` is clean; and a local `host`/`pair`/`connect` run with separate state folders works.
 
-Verified between machines, 2026-10-13: the Windows client paired with the MacBook Air host over the tailnet, with matching full fingerprints on both screens and approval on the Mac. Pinned reconnects then worked without prompting, with control-channel pings of 26–28 ms. The Mac side (build, Keychain store, tests) was run by the Mac session. Details are in `docs/development-plan.md`, Milestone 2.
+Verified between machines, 2026-10-13: the Windows client paired with the MacBook Air host over the tailnet, with matching full fingerprints on both screens and approval on the Mac. Pinned reconnects then worked without prompting, with control-channel pings of 26–28 ms. Revoking the device on the Mac closed a live session from Windows, and the next connection was refused as revoked. The Mac side (build, Keychain store, tests) was run by the Mac session. Details are in `docs/development-plan.md`, Milestone 2.
 
 Session names come from the pairing record. The name a device sends in `Hello` is reported separately (`HostEvent::Session::reported_name`) and is unverified.
 
 Not yet verified:
-- Revocation between machines.
 - Linux key storage.
 - One controlling viewer at a time.
 - Video, input and clipboard streams.

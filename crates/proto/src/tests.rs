@@ -166,7 +166,10 @@ async fn revocation_closes_live_session_and_blocks_reconnect_and_repair() {
     session.ping().await.unwrap();
 
     assert!(host.host.revoke(&viewer.fingerprint()).unwrap());
-    assert!(session.ping().await.is_err(), "live session must end on revocation");
+    match session.ping().await {
+        Err(Error::Remote { code: ErrorCode::Revoked, .. }) => {}
+        other => panic!("live session must end as revoked, got {other:?}"),
+    }
 
     assert_eq!(remote_code(viewer.connect(host.addr, Some(host_fp)).await), ErrorCode::Revoked);
     assert_eq!(remote_code(viewer.connect(host.addr, None).await), ErrorCode::Revoked);

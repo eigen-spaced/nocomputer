@@ -27,6 +27,9 @@ pub use wire::{ErrorCode, PROTOCOL_VERSION};
 
 pub const DEFAULT_PORT: u16 = 47900;
 
+/// QUIC application close code the host uses when it revokes a live session.
+pub(crate) const CLOSE_REVOKED: u32 = 0x10;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("TLS: {0}")]
