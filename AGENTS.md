@@ -31,7 +31,7 @@ Read `docs/development-plan.md` before implementation. Update it when evidence c
 4. Measure desktop readability and latency on the actual Windows client and internet path.
 5. Add convenience and reliability, then reverse-direction support.
 
-Swift is the preferred Mac platform language. ScreenCaptureKit and VideoToolbox are candidates pending feasibility. The Windows language, decoder/renderer, transport, and shared-code implementation are not settled. Rust is available locally; availability alone is not a decision.
+Swift is the preferred Mac platform language. ScreenCaptureKit and VideoToolbox are candidates pending feasibility. The viewer is Rust + Tauri 2 (user decision, 2026-10-13). It decodes H.264 with WebCodecs in the system web view (WebView2 on Windows, WKWebView on macOS). Networking, pairing and protocol code are Rust, independent of the UI, so the video surface can move to a native renderer if measured latency requires it. The C++/FFmpeg/SDL3 viewer in `viewer/` is a fallback and comparison, not the main line. Transport and Swift↔Rust integration are not settled. Linux viewer and host support is a later goal; see `docs/development-plan.md`.
 
 Model host and viewer as roles. Define versioned wire contracts independently of language and VPN provider. Keep capture/input and decode/render behind small platform boundaries. Avoid building unused abstractions for future platforms.
 

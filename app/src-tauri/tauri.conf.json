@@ -1,0 +1,20 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "nocomputer-viewer",
+  "version": "0.1.0",
+  "identifier": "dev.nocomputer.viewer",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["icons/icon.png", "icons/icon.ico"]
+  }
+}

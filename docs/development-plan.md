@@ -133,6 +133,22 @@ Next sequence:
 3. Prove a mutually authenticated paired connection, credential storage and revocation on both platforms. Then carry bounded live video with explicit framing and keyframe recovery.
 4. Add authenticated input/clipboard and test the locked-host internet scenario. Revisit colour/readability and bitrate on that real end-to-end path.
 
+## Windows viewer checkpoint: Rust + Tauri (2026-10-13)
+
+The user chose Rust + Tauri 2 for the viewer instead of the C++/FFmpeg/SDL3 prototype, with the goal of a NoMachine alternative. The offline prototype in `app/` (see `app/README.md`) plays one bounded local Annex B file through WebCodecs. It has no networking, input or clipboard.
+
+On the actual client (Dell Latitude 5400, i5-8265U, UHD 620 driver 31.0.101.2137, 1366×768, Windows 11 Pro build 26300, WebView2/Chromium 154), both fixtures decode completely and in order in default, hardware-required and software modes: `build/synthetic-srgb.h264` (30 frames, 320×240), and `build/moving-1080p.h264` (90 frames, 1920×1080, produced by the Mac host's VideoToolbox encoder with an IDR in mid-stream). The per-process GPU VideoDecode engine counter shows hardware decode, with a software-mode control at zero. The user confirmed colour and orientation, letterboxing, the moving frame counter, native view with panning, borderless fullscreen without a mode change, and the held last frame.
+
+The Mac agent reports the same `--check` results in WKWebView on the M3, where the viewer's GPU process opens an AppleAVD decoder client. WebKit ignores the software preference, so macOS has no software control.
+
+Rust-to-page IPC on the client, measured with monotonic clocks and a calibrated offset, adds about 3 ms (p50) for a 32 KiB frame when the page is fetching frames while decoding and drawing 1080p at 60 fps. Keyframe-sized messages (512 KiB) have p99 tails up to 42 ms. Pull (one long-poll invoke per frame) beats a Tauri Channel at every size. Tauri passes this pre-transport gate; on the live path, watch IDR sizes at 2560 width and cap or chunk keyframes before blaming decode.
+
+This completes next-sequence steps 1–2 for the fixtures. It does not complete Milestone 1: live desktop readability and end-to-end delay on the Windows client need transport.
+
+Before remote input, the viewer must disable WebView2 browser accelerator keys, hook Win and Alt+Tab natively, and release held keys on blur.
+
+Next is step 3: a Rust protocol crate (QUIC via quinn, and rustls with pinned mutual certificates that still verify handshake signatures), SSH-style full-fingerprint approval on the host, DPAPI/Keychain storage, and revocation. Then comes live video over pull IPC with keyframe recovery. Linking Rust into the Swift host changes code signing and can drop TCC grants, so plan stable signing first.
+
 ## Milestone 2: paired secure connection
 
 Offline viewer prototype implemented (2026-10-02): C++17 with FFmpeg and SDL3, provisionally chosen to exercise a common decode/render path on the Mac while keeping Windows hardware negotiation behind FFmpeg's D3D11VA interface. This is not a final language/renderer choice. CMake and a baseline-pinned vcpkg manifest support a Windows x64 build; `scripts/build-windows.ps1` and [the Windows checklist](windows-viewer.md) document prerequisites and verification. No Windows toolchain, executable, GPU/driver or runtime is available/verified in this workspace.
@@ -183,6 +199,11 @@ Record subjective usability as well as measurements. A fast stream with unreadab
 ## Later extension
 
 Add Windows capture/input hosting and Mac decode/render viewing while reusing protocol and security contracts. Keep platform code separate without forcing it into a single language.
+
+Linux, both viewer and host (user goal, 2026-10-13): start only after the Windows viewer and Mac host work end to end. The Rust core (transport, pairing, protocol) is intended to be shared unchanged. Each Linux side needs its own platform proof first:
+
+- Viewer: Tauri on Linux uses WebKitGTK, not Chromium. Its WebCodecs H.264 decoding depends on GStreamer and its installed plugins, and is unproven for this project. First run the existing `app/` decode checks on both fixtures. WSLg can show whether decoding works at all; hardware decoding needs a real Linux machine with a GPU. If WebKitGTK fails, keep Tauri for the UI and replace only the Linux video surface with a native one (for example wgpu with GStreamer/VA-API decode).
+- Host: under Wayland, capture and input injection go through the xdg-desktop-portal ScreenCast and RemoteDesktop portals, which need user consent, with frames delivered over PipeWire. Encoding uses VA-API. Prove consent persistence, locked-session behaviour and input before claiming support. Do not assume X11.
 
 Investigate real sleep/wake support using the available home network and confirmed hardware. Investigate logout/reboot access separately, including VPN availability before user login. Neither is implied by successful locked-session access.
 
