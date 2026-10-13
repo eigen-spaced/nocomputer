@@ -168,7 +168,7 @@ First slice implemented (2026-10-13): `crates/proto` (see its README).
 - Pairing: SSH-style, comparing full fingerprints on both screens with local approval on the host. One request may be pending at a time, with an approval timeout and a cooldown after a denial. Revocation is sticky and closes live connections.
 - Storage: private identities in DPAPI on Windows and the Keychain on macOS. Other platforms refuse rather than fall back to a plain file.
 
-On Windows, 20 loopback tests pass, covering:
+On Windows, 24 loopback tests pass, covering:
 - pairing, reconnecting and denial
 - revocation
 - impersonation by a different key
@@ -176,6 +176,7 @@ On Windows, 20 loopback tests pass, covering:
 - unpaired devices limited to pairing, version mismatch, message size limits, name spoofing
 - sessions named from the pairing record, not the device's self-reported name
 - one controller at a time: another device is refused as busy, and the same device reconnecting replaces its old session
+- video: one QUIC stream per GOP, in order; a slow viewer drops to the next keyframe; a reset, orphaned or superseded GOP never reaches the decoder
 - DPAPI storage
 
 Paired across machines over the tailnet (2026-10-13), with `nocomputer-pair`:
@@ -185,9 +186,12 @@ Paired across machines over the tailnet (2026-10-13), with `nocomputer-pair`:
 - **Bug found and fixed:** the host showed session names from the device's `Hello` ("DESKTOP-V89P2R0") rather than the approved name. Sessions now carry the stored name, and the self-reported one is shown only as unverified. After a host restart on the fixed build, the session showed as "latitude".
 - **Revocation:** with a session open from Windows (98 pings, mostly 28–40 ms, with spikes to 226 ms), the user revoked the device on the Mac. The host closed the live connection at once, and a fresh connect was refused with `Revoked`. The viewer had reported the live drop only as "connection lost"; it now reports the host's revocation close code as `Revoked`.
 
+Video path, Mac side (2026-10-13): the Swift app spawns `crates/host` (`nocomputer-host`) as a child process, and they talk over stdin/stdout using local-v1 (specified in `crates/host/src/local.rs`, golden vectors in `crates/host/testdata/local-v1`). The app captures and encodes; the Rust process does pairing, sessions and transport. Pairing approvals reach the app as prompts with request ids, and the pipe is the only approval path. On Windows, the host binary replaying the fixture streamed to a viewer on loopback; 13 host tests pass, including that end-to-end run.
+
 Still pending:
-- video, input and clipboard streams
-- integration into the viewer and host
+- the end-to-end run with the Mac app
+- decoding and display in the Tauri viewer
+- input and clipboard streams
 
 Deliverable: authenticated connections by hostname/IP with a documented pairing flow and bounded video transport.
 

@@ -4,6 +4,7 @@
 //!   nocomputer-pair host [--listen ADDR] [--name NAME]     (stdin: clients, revoke FP)
 //!   nocomputer-pair pair HOST[:PORT] [--name NAME]
 //!   nocomputer-pair connect HOST[:PORT] [--count N] [--name NAME]
+//!   nocomputer-pair watch HOST[:PORT] [--seconds N] [--name NAME]   (video statistics)
 //!   nocomputer-pair clients | revoke FINGERPRINT | forget HOST[:PORT]
 //!
 //! State lives in NOCOMPUTER_STATE_DIR, or the per-user app data folder. The private
@@ -35,7 +36,7 @@ fn state_dir() -> PathBuf {
 }
 
 fn identity() -> Result<Identity, BoxError> {
-    let store = platform_keystore(&state_dir())?;
+    let store = platform_keystore(&state_dir(), "device")?;
     Ok(load_or_create_identity(store.as_ref())?)
 }
 
@@ -79,10 +80,11 @@ async fn main() {
         Some("host") => host(&args).await,
         Some("pair") if args.len() >= 2 => pair(&args).await,
         Some("connect") if args.len() >= 2 => connect(&args).await,
+        Some("watch") if args.len() >= 2 => watch(&args).await,
         Some("clients") => clients(),
         Some("revoke") if args.len() >= 2 => revoke(&args[1..].join("")),
         Some("forget") if args.len() >= 2 => forget(&args[1]),
-        _ => Err("usage: nocomputer-pair whoami | host [--listen ADDR] [--name NAME] | pair HOST[:PORT] [--name NAME] | connect HOST[:PORT] [--count N] [--name NAME] | clients | revoke FINGERPRINT | forget HOST[:PORT]".into()),
+        _ => Err("usage: nocomputer-pair whoami | host [--listen ADDR] [--name NAME] | pair HOST[:PORT] [--name NAME] | connect HOST[:PORT] [--count N] [--name NAME] | watch HOST[:PORT] [--seconds N] [--name NAME] | clients | revoke FINGERPRINT | forget HOST[:PORT]".into()),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -107,13 +109,13 @@ async fn host(args: &[String]) -> Result<(), BoxError> {
         let pending = pending.clone();
         Arc::new(move |p| {
             let (tx, rx) = oneshot::channel();
+            *pending.lock().unwrap() = Some(tx);
             println!();
             println!("Pairing request from device \"{}\"", p.device_name);
             println!("  device fingerprint: {}", p.device_fingerprint);
             println!("  this host:          {}", p.host_fingerprint);
             println!("Check that the device shows exactly these two fingerprints.");
             println!("Approve? [y/N]");
-            *pending.lock().unwrap() = Some(tx);
             Box::pin(async move { rx.await.unwrap_or(false) })
         })
     };
@@ -138,6 +140,7 @@ async fn host(args: &[String]) -> Result<(), BoxError> {
                 HostEvent::PairingDenied { device } => println!("pairing denied or timed out: {device}"),
                 HostEvent::Rejected { device: Some(d), reason } => println!("rejected {d}: {reason}"),
                 HostEvent::Rejected { device: None, reason } => println!("rejected: {reason}"),
+                HostEvent::KeyframeNeeded => {}
             }
         }
     });
@@ -216,6 +219,54 @@ async fn connect(args: &[String]) -> Result<(), BoxError> {
     for _ in 0..count {
         println!("ping {:.2} ms", session.ping().await?.as_secs_f64() * 1000.0);
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    session.close().await;
+    Ok(())
+}
+
+/// Receives video and prints per-second statistics; frames are counted, never decoded
+/// or stored.
+async fn watch(args: &[String]) -> Result<(), BoxError> {
+    let address = with_port(&args[1]);
+    let seconds: u64 = option(args, "--seconds").map(|c| c.parse()).transpose()?.unwrap_or(10);
+    let known = KnownHosts::at(state_dir().join("known-hosts.json"));
+    let pinned = known.get(&address)?.ok_or_else(|| format!("{address} is not paired; run `pair {address}` first"))?;
+    let viewer = Viewer::new(identity()?, option(args, "--name").unwrap_or_else(default_name))?;
+    let Outcome::Ready(session) = viewer.connect(resolve(&address).await?, Some(pinned.fingerprint)).await? else {
+        unreachable!("pinned connections return a session or an error")
+    };
+    println!("connected to \"{}\" {}", session.host_name, session.host_fingerprint);
+    let mut video = session.video();
+    let end = tokio::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let mut second = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    let (mut frames, mut keyframes, mut bytes, mut largest, mut max_gap_us, mut last_us) = (0u32, 0u32, 0usize, 0usize, 0u64, None::<u64>);
+    let mut codec = String::new();
+    loop {
+        tokio::select! {
+            frame = video.next() => {
+                let f = frame?;
+                frames += 1;
+                keyframes += f.keyframe as u32;
+                bytes += f.data.len();
+                largest = largest.max(f.data.len());
+                // Host clock differences only, never compared with this clock.
+                if let Some(last) = last_us {
+                    max_gap_us = max_gap_us.max(f.host_us.saturating_sub(last));
+                }
+                last_us = Some(f.host_us);
+                if *f.codec != codec {
+                    codec = f.codec.to_string();
+                }
+            }
+            _ = tokio::time::sleep_until(second) => {
+                println!("{frames:3} frames ({keyframes} key), {:6.1} kB/s, largest {:5.1} kB, max host gap {:5.1} ms, {codec}", bytes as f64 / 1000.0, largest as f64 / 1000.0, max_gap_us as f64 / 1000.0);
+                (frames, keyframes, bytes, largest, max_gap_us) = (0, 0, 0, 0, 0);
+                second += std::time::Duration::from_secs(1);
+                if second > end {
+                    break;
+                }
+            }
+        }
     }
     session.close().await;
     Ok(())

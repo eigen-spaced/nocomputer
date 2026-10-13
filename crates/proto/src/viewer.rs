@@ -2,6 +2,7 @@
 
 use crate::identity::{Fingerprint, Identity, SERVER_NAME};
 use crate::tls;
+use crate::video::VideoReceiver;
 use crate::wire::{read_msg, valid_device_name, write_msg, Message, PROTOCOL_VERSION};
 use crate::{Error, ErrorCode};
 use std::net::SocketAddr;
@@ -102,21 +103,35 @@ impl Session {
         }
     }
 
-    /// A stream error after the host closed the connection says only "connection lost";
-    /// report a revocation or takeover as such.
     fn explain_close(&self, error: Error) -> Error {
-        let Some(quinn::ConnectionError::ApplicationClosed(close)) = self.channel.conn.close_reason() else { return error };
-        let (code, message) = match u32::try_from(close.error_code.into_inner()) {
-            Ok(crate::CLOSE_REVOKED) => (ErrorCode::Revoked, "the host revoked this device's access"),
-            Ok(crate::CLOSE_REPLACED) => (ErrorCode::Replaced, "a newer session from this device took over"),
-            _ => return error,
-        };
-        Error::Remote { code, message: message.into() }
+        explain_close(&self.channel.conn, error)
+    }
+
+    /// Asks the host for a keyframe, for example after a decoder error. No reply.
+    pub async fn request_keyframe(&mut self) -> Result<(), Error> {
+        write_msg(&mut self.channel.send, &Message::RequestKeyframe).await.map_err(|e| self.explain_close(e))
+    }
+
+    /// The host's video. Use it from a separate task; it shares the connection.
+    pub fn video(&self) -> VideoReceiver {
+        VideoReceiver::new(self.channel.conn.clone())
     }
 
     pub async fn close(self) {
         self.channel.close().await;
     }
+}
+
+/// A stream error after the host closed the connection says only "connection lost";
+/// report a revocation or takeover as such.
+pub(crate) fn explain_close(conn: &quinn::Connection, error: Error) -> Error {
+    let Some(quinn::ConnectionError::ApplicationClosed(close)) = conn.close_reason() else { return error };
+    let (code, message) = match u32::try_from(close.error_code.into_inner()) {
+        Ok(crate::CLOSE_REVOKED) => (ErrorCode::Revoked, "the host revoked this device's access"),
+        Ok(crate::CLOSE_REPLACED) => (ErrorCode::Replaced, "a newer session from this device took over"),
+        _ => return error,
+    };
+    Error::Remote { code, message: message.into() }
 }
 
 impl Viewer {

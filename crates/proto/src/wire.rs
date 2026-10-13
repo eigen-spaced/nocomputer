@@ -23,6 +23,8 @@ pub enum Message {
     PairRequest,
     PairResult { approved: bool },
     Ping { seq: u64 },
+    /// Viewer -> host, in a session: the decoder needs a keyframe. No reply.
+    RequestKeyframe,
     Pong { seq: u64 },
     Error { code: ErrorCode, message: String },
 }

@@ -1,6 +1,6 @@
 # nocomputer-proto
 
-Transport, device identity and pairing for nocomputer, shared by the viewer and host. QUIC (quinn) with TLS 1.3 (rustls, ring provider), mutually authenticated. There is no video, input or clipboard yet: an authorized session carries only keepalive pings.
+Transport, device identity, pairing and video for nocomputer, shared by the viewer and host. QUIC (quinn) with TLS 1.3 (rustls, ring provider), mutually authenticated. There is no input or clipboard yet.
 
 ## Security model
 
@@ -34,6 +34,13 @@ On macOS, Keychain access control is bound to the code signature of the program 
 
 The viewer opens one bidirectional control stream. Each message is a 4-byte big-endian length, then one JSON object tagged by `type` (see `src/wire.rs`). Messages are capped at 64 KiB, checked before allocating. Unknown fields are ignored, for forward compatibility; unknown message types are errors. `Hello` carries `min_version`/`max_version`, and the host refuses ranges that exclude its version with `version_unsupported`. Video and input will use separate binary streams or datagrams, not this channel. ALPN is `nocomputer/1`, and the default port is 47900/UDP.
 
+## Video
+
+The host sends H.264 to the controlling session on QUIC unidirectional streams, one per GOP. Each stream starts with a header carrying the codec string, then frames of the form `[u32 len][u8 flags][u64 host_us][Annex B]` (see `src/video.rs`). Only the first frame on a stream is a keyframe.
+- **Host:** `Host::send_access_unit` never blocks. Up to 8 frames queue for the viewer. On overflow the host resets the current stream, drops everything up to the next keyframe, and emits `HostEvent::KeyframeNeeded`. It also emits that event when a session starts and when the viewer calls `Session::request_keyframe`.
+- **Viewer:** `Session::video()` yields only frames whose GOP keyframe it has delivered. A reset or truncated stream is discarded, partial frame included. A stream that doesn't start at a keyframe is ignored. A newer GOP that has already arrived supersedes unread frames of the current one.
+- **Timestamps:** `host_us` is the host's monotonic clock, for differences between frames only.
+
 ## Manual test tool
 
 `nocomputer-pair` (in `src/bin`) runs either side. State lives in `NOCOMPUTER_STATE_DIR`, or by default `%APPDATA%\nocomputer`, `~/Library/Application Support/nocomputer` or `~/.config/nocomputer`.
@@ -43,12 +50,13 @@ nocomputer-pair whoami
 nocomputer-pair host [--listen 0.0.0.0:47900] [--name NAME]   # then type: clients | revoke FP | quit
 nocomputer-pair pair macbook-air[:47900] [--name NAME]
 nocomputer-pair connect macbook-air[:47900] [--count N] [--name NAME]
+nocomputer-pair watch macbook-air[:47900] [--seconds N]           # video statistics
 nocomputer-pair clients | revoke FINGERPRINT | forget HOST[:PORT]
 ```
 
 ## Status
 
-Verified on Windows, 2026-10-13, on the target client: all 20 tests pass (`cargo test`, including the DPAPI store); `cargo clippy --all-targets` is clean; and a local `host`/`pair`/`connect` run with separate state folders works.
+Verified on Windows, 2026-10-13, on the target client: all 24 tests pass (`cargo test`, including the DPAPI store); `cargo clippy --all-targets` is clean; and a local `host`/`pair`/`connect` run with separate state folders works.
 
 Verified between machines, 2026-10-13: the Windows client paired with the MacBook Air host over the tailnet, with matching full fingerprints on both screens and approval on the Mac. Pinned reconnects then worked without prompting, with control-channel pings of 26–28 ms. Revoking the device on the Mac closed a live session from Windows, and the next connection was refused as revoked. The Mac side (build, Keychain store, tests) was run by the Mac session. Details are in `docs/development-plan.md`, Milestone 2.
 
@@ -56,5 +64,6 @@ Session names come from the pairing record. The name a device sends in `Hello` i
 
 Not yet verified:
 - Linux key storage.
-- Video, input and clipboard streams.
+- Video between machines (the loopback path is tested here and in `crates/host`).
+- Input and clipboard streams.
 - Linking into the Tauri viewer and the Swift host.

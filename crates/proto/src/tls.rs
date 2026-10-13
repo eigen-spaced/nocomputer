@@ -136,12 +136,14 @@ pub(crate) fn client_builder(
         .with_custom_certificate_verifier(Arc::new(HostVerifier { pinned, presented, algs })))
 }
 
-fn transport() -> Arc<quinn::TransportConfig> {
+/// `incoming_uni`: unidirectional streams the peer may open at once (video GOPs, host to
+/// viewer only).
+fn transport(incoming_uni: u32) -> Arc<quinn::TransportConfig> {
     let mut t = quinn::TransportConfig::default();
     t.max_idle_timeout(Some(Duration::from_secs(30).try_into().expect("valid idle timeout")));
     t.keep_alive_interval(Some(Duration::from_secs(10)));
     t.max_concurrent_bidi_streams(4u32.into());
-    t.max_concurrent_uni_streams(0u32.into());
+    t.max_concurrent_uni_streams(incoming_uni.into());
     Arc::new(t)
 }
 
@@ -152,7 +154,7 @@ pub(crate) fn finish_server(mut tls: rustls::ServerConfig) -> Result<quinn::Serv
     tls.max_early_data_size = 0;
     let quic = QuicServerConfig::try_from(tls).map_err(|e| Error::Protocol(e.to_string()))?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic));
-    config.transport_config(transport());
+    config.transport_config(transport(0));
     Ok(config)
 }
 
@@ -162,7 +164,7 @@ pub(crate) fn finish_client(mut tls: rustls::ClientConfig) -> Result<quinn::Clie
     tls.enable_early_data = false;
     let quic = QuicClientConfig::try_from(tls).map_err(|e| Error::Protocol(e.to_string()))?;
     let mut config = quinn::ClientConfig::new(Arc::new(quic));
-    config.transport_config(transport());
+    config.transport_config(transport(4));
     Ok(config)
 }
 

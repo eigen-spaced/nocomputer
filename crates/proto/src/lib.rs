@@ -11,6 +11,7 @@ mod identity;
 mod keystore;
 mod tls;
 mod trust;
+mod video;
 mod viewer;
 pub mod wire;
 
@@ -22,6 +23,7 @@ pub use identity::{Fingerprint, Identity, SERVER_NAME};
 pub use keystore::{load_or_create_identity, platform_keystore, KeyStore, MemoryKeyStore};
 pub use tls::ALPN;
 pub use trust::{ClientStatus, KnownHost, KnownHosts, PairedClient, PairedClients};
+pub use video::{AccessUnit, VideoFrame, VideoReceiver, MAX_ACCESS_UNIT, VIDEO_STREAM_VERSION};
 pub use viewer::{FirstContact, Outcome, Session, Viewer};
 pub use wire::{ErrorCode, PROTOCOL_VERSION};
 

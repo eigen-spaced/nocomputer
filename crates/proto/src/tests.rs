@@ -438,3 +438,148 @@ fn dpapi_store_round_trips_and_does_not_store_plaintext() {
     assert_eq!(Identity::from_bytes(&store.load().unwrap().unwrap()).unwrap().fingerprint(), id.fingerprint());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::HostEvent>) -> Vec<crate::HostEvent> {
+    let mut events = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        events.push(e);
+    }
+    events
+}
+
+#[tokio::test]
+async fn video_reaches_the_controller_in_order() {
+    let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
+    let mut config = HostConfig::new("test-host");
+    config.events = Some(events);
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let host = start(Host::bind(LOOPBACK.into(), &Identity::generate().unwrap(), config, PairedClients::in_memory(), approver(true, prompts.clone())).unwrap(), prompts);
+    let viewer = viewer();
+    let host_fp = pair(&viewer, &host).await;
+    let Outcome::Ready(mut session) = viewer.connect(host.addr, Some(host_fp)).await.unwrap() else { panic!() };
+    session.ping().await.unwrap(); // the session loop, and so its video queue, is running
+    assert!(drain(&mut seen).contains(&crate::HostEvent::KeyframeNeeded), "a new session needs a keyframe");
+
+    // Deltas before the first keyframe can't be decoded and are never sent.
+    host.host.send_access_unit(crate::AccessUnit::delta(vec![9]));
+    host.host.send_access_unit(crate::AccessUnit::keyframe("avc1.4D0028", vec![1, 1]));
+    for i in 2..5u8 {
+        host.host.send_access_unit(crate::AccessUnit::delta(vec![i]));
+    }
+
+    let mut video = session.video();
+    let mut got = Vec::new();
+    let mut last_us = 0;
+    for i in 0..6 {
+        if i == 4 {
+            // Sent once the first GOP is read: a newer GOP that has already arrived
+            // supersedes unread frames of the current one.
+            host.host.send_access_unit(crate::AccessUnit::keyframe("avc1.640028", vec![5, 5]));
+            host.host.send_access_unit(crate::AccessUnit::delta(vec![6]));
+        }
+        let f = tokio::time::timeout(std::time::Duration::from_secs(5), video.next()).await.unwrap().unwrap();
+        assert!(f.host_us >= last_us);
+        last_us = f.host_us;
+        got.push((f.codec.to_string(), f.keyframe, f.data));
+    }
+    let expected = vec![
+        ("avc1.4D0028".to_string(), true, vec![1, 1]),
+        ("avc1.4D0028".to_string(), false, vec![2]),
+        ("avc1.4D0028".to_string(), false, vec![3]),
+        ("avc1.4D0028".to_string(), false, vec![4]),
+        ("avc1.640028".to_string(), true, vec![5, 5]),
+        ("avc1.640028".to_string(), false, vec![6]),
+    ];
+    assert_eq!(got, expected);
+
+    session.request_keyframe().await.unwrap();
+    session.ping().await.unwrap();
+    assert!(drain(&mut seen).contains(&crate::HostEvent::KeyframeNeeded), "viewer request must reach the capture side");
+}
+
+#[test]
+fn slow_viewer_drops_to_the_next_keyframe() {
+    use crate::video::{Pushed, VideoQueue, QUEUE_FRAMES};
+    let queue = VideoQueue::new();
+    assert_eq!(queue.push(crate::AccessUnit::delta(vec![0])), Pushed::Dropped, "nothing before the first keyframe");
+    assert_eq!(queue.push(crate::AccessUnit::keyframe("avc1.4D0028", vec![1])), Pushed::Queued);
+    for _ in 1..QUEUE_FRAMES {
+        assert_eq!(queue.push(crate::AccessUnit::delta(vec![2])), Pushed::Queued);
+    }
+    // Full: the GOP is abandoned and a keyframe requested once.
+    assert_eq!(queue.push(crate::AccessUnit::delta(vec![3])), Pushed::NeedKeyframe);
+    assert_eq!(queue.push(crate::AccessUnit::delta(vec![4])), Pushed::Dropped);
+    assert_eq!(queue.push(crate::AccessUnit::keyframe("avc1.4D0028", vec![5])), Pushed::Queued);
+    assert_eq!(queue.push(crate::AccessUnit::delta(vec![6])), Pushed::Queued);
+}
+
+/// A raw host and viewer connection, so a test can write malformed or partial streams.
+async fn raw_pair() -> (quinn::Connection, quinn::Connection, quinn::Endpoint, quinn::Endpoint) {
+    let host_id = Identity::generate().unwrap();
+    let tls = tls::server_builder().unwrap().with_single_cert(vec![host_id.cert()], host_id.key()).unwrap();
+    let server = quinn::Endpoint::server(tls::finish_server(tls).unwrap(), LOOPBACK.into()).unwrap();
+    let viewer_id = Identity::generate().unwrap();
+    let tls = tls::client_builder(Some(host_id.fingerprint()), Arc::default()).unwrap().with_client_auth_cert(vec![viewer_id.cert()], viewer_id.key()).unwrap();
+    let client = quinn::Endpoint::client(LOOPBACK.into()).unwrap();
+    let connecting = client.connect_with(tls::finish_client(tls).unwrap(), server.local_addr().unwrap(), crate::SERVER_NAME).unwrap();
+    let (accepted, connected) = tokio::join!(async { server.accept().await.unwrap().await.unwrap() }, connecting);
+    (accepted, connected.unwrap(), server, client)
+}
+
+#[tokio::test]
+async fn a_newer_gop_supersedes_unread_frames() {
+    use crate::video::{write_frame, write_gop_header};
+    let (host, viewer, _s, _c) = raw_pair().await;
+    let mut video = crate::VideoReceiver::new(viewer);
+    for (n, codec) in [(1u8, "avc1.4D0028"), (5, "avc1.640028")] {
+        let mut gop = host.open_uni().await.unwrap();
+        write_gop_header(&mut gop, codec).await.unwrap();
+        write_frame(&mut gop, &crate::AccessUnit::keyframe(codec, vec![n]), 0).await.unwrap();
+        write_frame(&mut gop, &crate::AccessUnit::delta(vec![n + 1]), 0).await.unwrap();
+        gop.finish().unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Both GOPs are waiting; the viewer jumps to the newest keyframe.
+    let first = video.next().await.unwrap();
+    assert_eq!((first.keyframe, first.data, &*first.codec), (true, vec![5], "avc1.640028"));
+    assert_eq!(video.next().await.unwrap().data, vec![6]);
+}
+
+#[tokio::test]
+async fn reset_gop_never_reaches_the_decoder_without_its_keyframe() {
+    use crate::video::{write_frame, write_gop_header};
+    let (host, viewer, _s, _c) = raw_pair().await;
+    let mut video = crate::VideoReceiver::new(viewer);
+    let at = |n: u64| n * 1000;
+
+    let mut gop = host.open_uni().await.unwrap();
+    write_gop_header(&mut gop, "avc1.4D0028").await.unwrap();
+    write_frame(&mut gop, &crate::AccessUnit::keyframe("avc1.4D0028", vec![1]), at(1)).await.unwrap();
+    write_frame(&mut gop, &crate::AccessUnit::delta(vec![2]), at(2)).await.unwrap();
+    assert_eq!(video.next().await.unwrap().data, vec![1]);
+    assert_eq!(video.next().await.unwrap().data, vec![2]);
+
+    // Half a frame, then the host abandons the GOP.
+    let mut partial = 100u32.to_be_bytes().to_vec();
+    partial.push(0);
+    partial.extend_from_slice(&at(3).to_be_bytes());
+    partial.extend_from_slice(&[3; 10]);
+    gop.write_all(&partial).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    gop.reset(crate::video::RESET_GOP.into()).unwrap();
+
+    // A stream that doesn't start at a keyframe is ignored whole.
+    let mut orphan = host.open_uni().await.unwrap();
+    write_gop_header(&mut orphan, "avc1.4D0028").await.unwrap();
+    write_frame(&mut orphan, &crate::AccessUnit::delta(vec![4]), at(4)).await.unwrap();
+    orphan.finish().unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut next = host.open_uni().await.unwrap();
+    write_gop_header(&mut next, "avc1.4D0028").await.unwrap();
+    write_frame(&mut next, &crate::AccessUnit::keyframe("avc1.4D0028", vec![5]), at(5)).await.unwrap();
+    write_frame(&mut next, &crate::AccessUnit::delta(vec![6]), at(6)).await.unwrap();
+
+    let after: Vec<_> = [video.next().await.unwrap(), video.next().await.unwrap()].into_iter().map(|f| (f.keyframe, f.data)).collect();
+    assert_eq!(after, vec![(true, vec![5]), (false, vec![6])]);
+}

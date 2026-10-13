@@ -36,19 +36,22 @@ impl KeyStore for MemoryKeyStore {
 }
 
 /// The platform's store. `state_dir` holds the encrypted blob where the store is a file.
-pub fn platform_keystore(state_dir: &std::path::Path) -> Result<Box<dyn KeyStore>, Error> {
+/// `name` tells identities apart in shared stores (the macOS Keychain account), so the
+/// pairing tool and the host app never read each other's key.
+pub fn platform_keystore(state_dir: &std::path::Path, name: &str) -> Result<Box<dyn KeyStore>, Error> {
     #[cfg(windows)]
     {
+        let _ = name;
         Ok(Box::new(dpapi::DpapiKeyStore::new(state_dir.join("identity.dpapi"))))
     }
     #[cfg(target_os = "macos")]
     {
         let _ = state_dir;
-        Ok(Box::new(keychain::KeychainKeyStore))
+        Ok(Box::new(keychain::KeychainKeyStore { account: name.to_string() }))
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let _ = state_dir;
+        let _ = (state_dir, name);
         Err(Error::KeyStore("no OS-protected key storage is implemented for this platform yet".into()))
     }
 }
@@ -131,16 +134,17 @@ pub mod keychain {
     use security_framework::passwords::{get_generic_password, set_generic_password};
 
     const SERVICE: &str = "dev.nocomputer.identity";
-    const ACCOUNT: &str = "device";
     const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 
     /// A generic-password item in the login Keychain. Its access control is bound to the
     /// code signature of the program that created it.
-    pub struct KeychainKeyStore;
+    pub struct KeychainKeyStore {
+        pub account: String,
+    }
 
     impl KeyStore for KeychainKeyStore {
         fn load(&self) -> Result<Option<Vec<u8>>, Error> {
-            match get_generic_password(SERVICE, ACCOUNT) {
+            match get_generic_password(SERVICE, &self.account) {
                 Ok(data) => Ok(Some(data)),
                 Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
                 Err(e) => Err(Error::KeyStore(format!("Keychain read: {e}"))),
@@ -148,7 +152,7 @@ pub mod keychain {
         }
 
         fn store(&self, data: &[u8]) -> Result<(), Error> {
-            set_generic_password(SERVICE, ACCOUNT, data).map_err(|e| Error::KeyStore(format!("Keychain write: {e}")))
+            set_generic_password(SERVICE, &self.account, data).map_err(|e| Error::KeyStore(format!("Keychain write: {e}")))
         }
     }
 }

@@ -4,6 +4,7 @@
 use crate::identity::{Fingerprint, Identity};
 use crate::tls;
 use crate::trust::{ClientStatus, PairedClients};
+use crate::video::{self, AccessUnit, Pushed, VideoQueue};
 use crate::wire::{read_msg, valid_device_name, write_msg, ErrorCode, Message, PROTOCOL_VERSION};
 use crate::Error;
 use std::collections::HashMap;
@@ -39,6 +40,9 @@ pub enum HostEvent {
     Paired { device: Fingerprint, name: String },
     PairingDenied { device: Fingerprint },
     Rejected { device: Option<Fingerprint>, reason: String },
+    /// The capture side should encode a keyframe soon: a session started, the viewer
+    /// asked, or the host dropped frames for a slow viewer. Rate-limit before acting.
+    KeyframeNeeded,
 }
 
 pub struct HostConfig {
@@ -70,6 +74,8 @@ struct Inner {
     live: Mutex<HashMap<Fingerprint, Vec<quinn::Connection>>>,
     /// The one controlling session.
     controller: Mutex<Option<(Fingerprint, quinn::Connection)>>,
+    /// Video for the controlling session, keyed by its connection's stable id.
+    video: Mutex<Option<(usize, Arc<VideoQueue>)>>,
 }
 
 pub struct Host {
@@ -95,7 +101,7 @@ impl Host {
             return Err(Error::Protocol("invalid host name".into()));
         }
         let endpoint = quinn::Endpoint::server(tls::finish_server(tls)?, addr)?;
-        let inner = Inner { fingerprint, config, clients: Mutex::new(clients), approver, gate: Mutex::default(), live: Mutex::default(), controller: Mutex::default() };
+        let inner = Inner { fingerprint, config, clients: Mutex::new(clients), approver, gate: Mutex::default(), live: Mutex::default(), controller: Mutex::default(), video: Mutex::default() };
         Ok(Host { endpoint, inner: Arc::new(inner) })
     }
 
@@ -130,6 +136,18 @@ impl Host {
 
     pub fn close(&self) {
         self.endpoint.close(0u32.into(), b"host closing");
+    }
+
+    /// Queues a frame for the controlling session, if any. Never blocks: when the viewer
+    /// falls behind, frames are dropped up to the next keyframe and
+    /// [`HostEvent::KeyframeNeeded`] is emitted.
+    pub fn send_access_unit(&self, au: AccessUnit) {
+        let queue = self.inner.video.lock().unwrap().as_ref().map(|(_, q)| q.clone());
+        if let Some(queue) = queue {
+            if let Pushed::NeedKeyframe = queue.push(au) {
+                self.inner.emit(HostEvent::KeyframeNeeded);
+            }
+        }
     }
 }
 
@@ -179,11 +197,15 @@ impl Inner {
                 if !self.claim_control(device, conn) {
                     return refuse(&mut send, ErrorCode::Busy, "another device is connected to this host").await;
                 }
+                let queue = VideoQueue::new();
                 let result = async {
                     write_msg(&mut send, &Message::Welcome { version: PROTOCOL_VERSION, host_name: self.config.name.clone(), paired: true }).await?;
                     self.live.lock().unwrap().entry(device).or_default().push(conn.clone());
                     self.emit(HostEvent::Session { device, name, reported_name: device_name });
-                    let result = session(&mut send, &mut recv).await;
+                    *self.video.lock().unwrap() = Some((conn.stable_id(), queue.clone()));
+                    tokio::spawn(video::send_loop(conn.clone(), queue.clone()));
+                    self.emit(HostEvent::KeyframeNeeded);
+                    let result = session(&mut send, &mut recv, || self.emit(HostEvent::KeyframeNeeded)).await;
                     if let Some(conns) = self.live.lock().unwrap().get_mut(&device) {
                         conns.retain(|c| c.stable_id() != conn.stable_id());
                     }
@@ -191,6 +213,13 @@ impl Inner {
                     result
                 }
                 .await;
+                queue.close();
+                {
+                    let mut video = self.video.lock().unwrap();
+                    if video.as_ref().is_some_and(|(id, _)| *id == conn.stable_id()) {
+                        *video = None;
+                    }
+                }
                 self.release_control(conn);
                 result
             }
@@ -266,11 +295,12 @@ async fn refuse(send: &mut quinn::SendStream, code: ErrorCode, message: &str) ->
     Err(Error::Remote { code, message: message.to_string() })
 }
 
-/// Authorized control loop. Only keepalive pings exist so far.
-async fn session(send: &mut quinn::SendStream, recv: &mut quinn::RecvStream) -> Result<(), Error> {
+/// Authorized control loop: keepalive pings and keyframe requests.
+async fn session(send: &mut quinn::SendStream, recv: &mut quinn::RecvStream, keyframe_needed: impl Fn()) -> Result<(), Error> {
     loop {
         match read_msg(recv).await {
             Ok(Message::Ping { seq }) => write_msg(send, &Message::Pong { seq }).await?,
+            Ok(Message::RequestKeyframe) => keyframe_needed(),
             Ok(_) => return refuse(send, ErrorCode::BadRequest, "unexpected message").await,
             // The viewer finished its stream or closed the connection.
             Err(_) => return Ok(()),
