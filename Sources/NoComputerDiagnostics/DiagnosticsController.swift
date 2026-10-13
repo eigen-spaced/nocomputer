@@ -7,6 +7,9 @@ final class DiagnosticsController: NSObject, NSApplicationDelegate {
     private let sleep = SleepAssertion()
     private let displaySleep = SleepAssertion(kind: .display)
     private let displayWake = DisplayWakeRequest()
+    private var remoteHost: RemoteHost?
+    private let remoteAccess = NSButton(checkboxWithTitle: "Remote access (paired viewers only; runs nocomputer-host)", target: nil, action: nil)
+    private let remoteStatus = NSTextField(wrappingLabelWithString: "Remote access off")
     private var wakeProbeTask: Task<Void, Never>?
     private var wakeProbeFrame: CGImage?
     private var wakeProbeFrameTime: TimeInterval?
@@ -59,7 +62,7 @@ final class DiagnosticsController: NSObject, NSApplicationDelegate {
         root.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
         window.contentView = root
         root.addArrangedSubview(NSTextField(wrappingLabelWithString:
-            "Local diagnostics only. No networking or saved video. Lock-screen capture and basic input demonstrated on this Mac; remote unlock is not yet tested. Export contains metadata only."))
+            "Diagnostics run locally; only the opt-in Remote access below uses the network, through the bundled nocomputer-host. No saved video. Lock-screen capture and basic input demonstrated on this Mac; remote unlock is not yet tested. Export contains metadata only."))
         root.addArrangedSubview(permissionLabel)
         addRow(to: root, buttons: [
             ("Request Screen Recording", #selector(requestScreen)),
@@ -94,6 +97,10 @@ final class DiagnosticsController: NSObject, NSApplicationDelegate {
         ])
         root.addArrangedSubview(NSTextField(wrappingLabelWithString:
             "Wake test: lock and let the display turn off. After automatic wake, stay locked for 20 seconds. Before/after frames stay in memory for review; export contains no pixels."))
+        remoteAccess.target = self
+        remoteAccess.action = #selector(toggleRemoteAccess)
+        root.addArrangedSubview(remoteAccess)
+        root.addArrangedSubview(remoteStatus)
         root.addArrangedSubview(statusLabel)
         preview.imageScaling = .scaleProportionallyUpOrDown
         preview.wantsLayer = true
@@ -162,6 +169,7 @@ final class DiagnosticsController: NSObject, NSApplicationDelegate {
             MainActor.assumeIsolated {
                 self?.expireDisplayAssertion()
                 self?.refreshCapture()
+                if let host = self?.remoteHost { self?.remoteStatus.stringValue = host.statusLine() }
             }
         }
     }
@@ -385,6 +393,24 @@ final class DiagnosticsController: NSObject, NSApplicationDelegate {
             report["source"] = sourceSelector.selectedSegment == 1 ? "raw source" : "decoded"
             report["backingScale"] = decodedWindow?.backingScaleFactor ?? 1
             lastViewedComparison = report
+        }
+    }
+
+    @objc private func toggleRemoteAccess() {
+        if remoteAccess.state == .on {
+            let host = remoteHost ?? RemoteHost(window: window)
+            host.onLog = { [weak self] in self?.record($0) }
+            host.onExit = { [weak self] in
+                self?.remoteAccess.state = .off
+                self?.remoteStatus.stringValue = "Remote access off"
+            }
+            remoteHost = host
+            do { try host.enable() } catch {
+                record("Remote access failed: \(error.localizedDescription)")
+                remoteAccess.state = .off
+            }
+        } else {
+            remoteHost?.disable()
         }
     }
 
@@ -696,6 +722,7 @@ final class DiagnosticsController: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         capture.output?.encoder?.close()
+        remoteHost?.disable()
         eraseProbeMarker()
         pending?.cancel()
         displayOffTask?.cancel()

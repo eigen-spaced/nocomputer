@@ -33,10 +33,13 @@ final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate {
     private let context = CIContext(options: [.cacheIntermediates: false])
     private let previewEnabled: Bool
     let encoder: VideoEncoder?
+    // Called once, on the capture queue, when the system ends the stream.
+    private let onStop: ((String) -> Void)?
 
-    init(previewEnabled: Bool = true, encoder: VideoEncoder? = nil) {
+    init(previewEnabled: Bool = true, encoder: VideoEncoder? = nil, onStop: ((String) -> Void)? = nil) {
         self.previewEnabled = previewEnabled
         self.encoder = encoder
+        self.onStop = onStop
         super.init()
     }
 
@@ -58,6 +61,7 @@ final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate {
         state.sourceVisible = false
         lock.unlock()
         encoder?.close()
+        onStop?(error.localizedDescription)
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
@@ -155,7 +159,8 @@ final class CaptureSession {
     }
 
     func start(mode: FilterMode = .excludeApplication, encodeVideo: Bool = false, decodePreview: Bool = false,
-               colorPolicy: VideoColorPolicy = .systemDefault, maximumWidth: Int = 1600) async throws {
+               colorPolicy: VideoColorPolicy = .systemDefault, maximumWidth: Int = 1600,
+               sampleConsumer: ((CMSampleBuffer) -> Void)? = nil, onStop: ((String) -> Void)? = nil) async throws {
         retireStoppedStream()
         guard stream == nil else { return }
         // Do not use an interactive content picker: this experiment must also
@@ -191,9 +196,10 @@ final class CaptureSession {
         // A whole-display preview would recursively capture itself. This mode
         // collects frame metadata only, without converting pixels for the UI.
         let encoder = encodeVideo ? try VideoEncoder(width: configuration.width, height: configuration.height,
-            decodePreview: decodePreview, colorPolicy: colorPolicy) : nil
+            decodePreview: decodePreview, colorPolicy: colorPolicy, sampleConsumer: sampleConsumer) : nil
         // Disable preview copies during the encoder experiment to isolate its timing.
-        let receiver = CaptureOutput(previewEnabled: mode != .wholeDisplay && !encodeVideo, encoder: encoder)
+        let receiver = CaptureOutput(previewEnabled: mode != .wholeDisplay && !encodeVideo, encoder: encoder,
+            onStop: onStop)
         let candidate = SCStream(filter: filter, configuration: configuration, delegate: receiver)
         try candidate.addStreamOutput(receiver, type: .screen, sampleHandlerQueue: queue)
         // Hold references during asynchronous startup, including error callbacks.

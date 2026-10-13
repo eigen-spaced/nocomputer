@@ -20,6 +20,20 @@ elif security find-identity -p codesigning | grep -q "\"$default_identity\""; th
 else
     signing_identity="-"
 fi
+# Remote access runs the Rust host as a child of the app. Nested code must be
+# signed before the bundle; its own identifier keeps its Keychain item separate.
+host_manifest="$PWD/crates/host/Cargo.toml"
+if [ -f "$host_manifest" ]; then
+    cargo build --release --manifest-path "$host_manifest" --bin nocomputer-host
+    host_target="$(cargo metadata --format-version 1 --no-deps --manifest-path "$host_manifest" \
+        | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+    cp "$host_target/release/nocomputer-host" "$app_path/Contents/MacOS/nocomputer-host"
+    codesign --force --sign "$signing_identity" --identifier dev.nocomputer.host \
+        "$app_path/Contents/MacOS/nocomputer-host"
+else
+    rm -f "$app_path/Contents/MacOS/nocomputer-host"
+    printf '%s\n' 'crates/host not found: built without nocomputer-host; Remote access will be unavailable.'
+fi
 codesign --force --sign "$signing_identity" "$app_path"
 codesign --verify --strict "$app_path"
 if [ "$signing_identity" = "-" ]; then

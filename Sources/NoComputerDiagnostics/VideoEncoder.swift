@@ -62,6 +62,9 @@ final class VideoEncoder {
     private let context = CIContext(options: [.cacheIntermediates: false])
     private var nextID = 0
     private var lastPTS: CMTime?
+    // Set by requestKeyframe(); consumed by the next frame actually submitted,
+    // so repeated requests before then coalesce into one IDR.
+    private var keyframeRequested = false
     private let width: Int
     private let height: Int
     let decoder: VideoDecoder?
@@ -141,6 +144,12 @@ final class VideoEncoder {
         return state
     }
 
+    func requestKeyframe() {
+        submissionLock.lock()
+        keyframeRequested = true
+        submissionLock.unlock()
+    }
+
     func encode(_ buffer: CVPixelBuffer, presentationTime: CMTime) {
         submissionLock.lock()
         defer { submissionLock.unlock() }
@@ -178,10 +187,13 @@ final class VideoEncoder {
         state.inFlight = pending.count
         state.peakInFlight = max(state.peakInFlight, state.inFlight)
         stateLock.unlock()
+        let properties = keyframeRequested
+            ? [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue!] as CFDictionary : nil
+        keyframeRequested = false
         var flags = VTEncodeInfoFlags()
         let result = VTCompressionSessionEncodeFrame(session, imageBuffer: buffer,
             presentationTimeStamp: presentationTime, duration: .invalid,
-            frameProperties: nil, infoFlagsOut: &flags) { [weak self] status, flags, sample in
+            frameProperties: properties, infoFlagsOut: &flags) { [weak self] status, flags, sample in
                 self?.complete(id: id, status: status, flags: flags, sample: sample)
             }
         // Synchronous drops/failures may not produce a callback. Completion is

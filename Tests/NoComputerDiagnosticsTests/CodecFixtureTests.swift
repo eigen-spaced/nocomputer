@@ -16,17 +16,12 @@ private final class FixtureCollector {
         defer { lock.unlock() }
         guard failure == nil else { return }
         do {
-            let packet = try Self.annexB(sample)
+            let packet = try AnnexB.accessUnit(sample)
             guard bytes.count + packet.count <= 8_000_000 else { throw FixtureError.invalid }
             bytes.append(packet)
-            if Self.isSync(sample) { syncIndices.append(count) }
+            if AnnexB.isKeyframe(sample) { syncIndices.append(count) }
             count += 1
         } catch { failure = String(describing: error) }
-    }
-
-    private static func isSync(_ sample: CMSampleBuffer) -> Bool {
-        let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[CFString: Any]]
-        return !(attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
     }
 
     func result() -> (Data, Int, String?) {
@@ -36,50 +31,6 @@ private final class FixtureCollector {
     }
 
     private enum FixtureError: Error { case invalid }
-
-    private static func annexB(_ sample: CMSampleBuffer) throws -> Data {
-        guard let format = sample.formatDescription, let block = sample.dataBuffer else { throw FixtureError.invalid }
-        var pointer: UnsafePointer<UInt8>?
-        var size = 0
-        var count = 0
-        var header: Int32 = 0
-        guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: 0,
-            parameterSetPointerOut: &pointer, parameterSetSizeOut: &size,
-            parameterSetCountOut: &count, nalUnitHeaderLengthOut: &header) == noErr,
-            count >= 2, count <= 16, [1, 2, 4].contains(header) else { throw FixtureError.invalid }
-        var output = Data()
-        if isSync(sample) {
-            for index in 0..<count {
-                guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: index,
-                    parameterSetPointerOut: &pointer, parameterSetSizeOut: &size,
-                    parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil) == noErr,
-                    let pointer, size > 0, size <= 65_536 else { throw FixtureError.invalid }
-                output.append(contentsOf: [0, 0, 0, 1])
-                output.append(pointer, count: size)
-            }
-        }
-        let length = CMBlockBufferGetDataLength(block)
-        guard length > 0, length <= 1_000_000 else { throw FixtureError.invalid }
-        var input = [UInt8](repeating: 0, count: length)
-        let status = input.withUnsafeMutableBytes {
-            CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: $0.baseAddress!)
-        }
-        guard status == noErr else { throw FixtureError.invalid }
-        var offset = 0
-        while offset < input.count {
-            guard input.count - offset >= Int(header) else { throw FixtureError.invalid }
-            var nalSize = 0
-            for _ in 0..<Int(header) {
-                nalSize = (nalSize << 8) | Int(input[offset])
-                offset += 1
-            }
-            guard nalSize > 0, nalSize <= input.count - offset else { throw FixtureError.invalid }
-            output.append(contentsOf: [0, 0, 0, 1])
-            output.append(contentsOf: input[offset..<(offset + nalSize)])
-            offset += nalSize
-        }
-        return output
-    }
 }
 
 struct CodecFixtureTests {
