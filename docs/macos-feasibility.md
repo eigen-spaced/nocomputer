@@ -228,6 +228,21 @@ The durable development fix is to use the same certificate-backed code-signing i
 
 Stable local signing (2026-10-13, user-approved): a self-signed code-signing certificate, `nocomputer Local Development` (RSA 2048, critical `codeSigning` extended key usage, valid to 2036-10-10, certificate SHA-1 `670422BFC61AA432B9E8101BB7DBA7EE83A71EB7`), was created with `/usr/bin/openssl` and imported into the login keychain with access limited to `/usr/bin/codesign`. The temporary key and PKCS#12 files were deleted after import. It is not marked trusted; codesign does not need trust to sign, so `security find-identity -v` lists it as `CSSMERR_TP_NOT_TRUSTED`, and no system trust settings were changed. The first signing required the user to allow codesign access to the key. `scripts/build-macos.sh` uses `NOCOMPUTER_SIGN_IDENTITY` if set, otherwise this identity if present, otherwise ad-hoc. The designated requirement is now `identifier "dev.nocomputer.diagnostics" and certificate leaf = H"670422bf…1eb7"`, and it is unchanged across rebuilds. Existing Screen Recording/Accessibility grants were made against the old ad-hoc `cdhash`, so they need re-granting once for this signature. Verified 2026-10-13: after re-granting both once for the new signature, a rebuild with a changed binary (CDHash `f3129ad3…` → `91b92f59…`, same designated requirement) kept Screen Recording and Accessibility granted, as the user confirmed in the app without touching System Settings. The certificate is local to this Mac and is not a distribution identity. To recreate it elsewhere, generate an equivalent certificate; never commit the key.
 
+## Remote access keyframe interval
+
+The diagnostics keep the Milestone 1 interval: an IDR at least every 60 frames or 2 s. Remote access asks for IDRs on demand (stream start, viewer recovery, pipe pressure), so its encoder uses a 20 s safety interval instead (`VideoEncoder.remoteKeyframeSeconds`).
+
+Measured 2026-10-13 with `NOCOMPUTER_MEASURE_KEYFRAMES=1 scripts/test-macos.sh --filter KeyframeInterval`: 30 s at 1600x1034, 30 fps, 8 Mbit/s target, on synthetic dense terminal text with one line being typed. A live desktop will differ.
+
+| Interval | Keyframes | Mean keyframe | Mean delta | Rate | Keyframe share of bytes |
+| --- | --- | --- | --- | --- | --- |
+| 2 s | 15 | 883 KB | 0.66 KB | 3.69 Mbit/s | 96% |
+| 10 s | 3 | 754 KB | 0.91 KB | 0.82 Mbit/s | 73% |
+| 20 s | 2 | 659 KB | 1.28 KB | 0.66 Mbit/s | 53% |
+| 30 s | 1 | 367 KB | 1.66 KB | 0.50 Mbit/s | 20% |
+
+On mostly static text, keyframes dominate the bitrate, and each one is a burst of roughly 0.7 MB. Deltas grow a little at longer intervals as rate control spends the freed bits on refinement. The 30 s row holds only the first keyframe of the run, so it is not directly comparable. The live run before this change (2 s interval) averaged about 1.8 Mbit/s. The live rate after the change still needs measuring on a comparable session.
+
 ## API references
 
 - [Apple SCFrameStatus](https://developer.apple.com/documentation/screencapturekit/scframestatus): complete/idle/blank/suspended frame status interpretation.

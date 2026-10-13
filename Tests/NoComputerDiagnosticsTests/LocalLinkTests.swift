@@ -140,3 +140,63 @@ struct PipeAdmissionTests {
         #expect(admission.admit(keyframe: true) == .send)
     }
 }
+
+// crates/host owns local-v1; its golden vectors are the shared reference bytes.
+struct LocalLinkGoldenTests {
+    private static let directory = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        .appendingPathComponent("crates/host/testdata/local-v1")
+
+    private static func golden(_ name: String) throws -> Data {
+        try Data(contentsOf: directory.appendingPathComponent(name))
+    }
+
+    private static func annexB(_ name: String) throws -> Data {
+        // Skip length (4), type (1), flags (1) and capture_us (8).
+        try golden(name).dropFirst(14)
+    }
+
+    @Test func swiftEncodesTheGoldenOutgoingFrames() throws {
+        #expect(try LocalLink.encode(.hello(version: 1)) == Self.golden("01-hello.bin"))
+        #expect(try LocalLink.encode(.accessUnit(keyframe: true, captureMicroseconds: 0x0102_0304_0506_0708,
+            annexB: Self.annexB("02-access-unit-key.bin"))) == Self.golden("02-access-unit-key.bin"))
+        let delta = try Self.golden("02-access-unit-delta.bin")
+        let microseconds = delta[6..<14].reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
+        #expect(try LocalLink.encode(.accessUnit(keyframe: false, captureMicroseconds: microseconds,
+            annexB: Self.annexB("02-access-unit-delta.bin"))) == delta)
+        let stopped = try Self.golden("03-capture-stopped.bin")
+        let reason = try #require(String(data: stopped.dropFirst(5), encoding: .utf8))
+        #expect(try LocalLink.encode(.captureStopped(reason: reason)) == stopped)
+        #expect(try LocalLink.encode(.pairingDecision(requestID: 0x0A0B_0C0D_0E0F_1011, approve: true))
+            == Self.golden("04-pairing-decision-approve.bin"))
+        #expect(try LocalLink.encode(.pairingDecision(requestID: 7, approve: false))
+            == Self.golden("04-pairing-decision-deny.bin"))
+    }
+
+    @Test func swiftDecodesTheGoldenIncomingFrames() throws {
+        var reader = LocalLink.Reader()
+        let names = ["81-hello-ack.bin", "82-start-stream.bin", "83-stop-stream.bin", "84-request-keyframe.bin",
+                     "85-event-pairing-prompt.bin", "85-event-session.bin"]
+        let messages = try reader.feed(names.map { try Self.golden($0) }.reduce(Data(), +))
+        try #require(messages.count == 6)
+        #expect(Array(messages[0..<4]) == [.helloAck(version: 1), .startStream, .stopStream, .requestKeyframe])
+        guard case let .event(prompt) = messages[4], case let .event(session) = messages[5] else {
+            Issue.record("expected two events")
+            return
+        }
+        let request = try JSONDecoder().decode(LocalLink.PairingPrompt.self, from: prompt)
+        #expect(request.requestID == 7)
+        #expect(request.deviceName == "latitude")
+        #expect(request.deviceFingerprint.hasPrefix("1111 2222"))
+        #expect(request.hostFingerprint.hasPrefix("0102 0304"))
+        #expect(LocalLink.eventType(session) == "session")
+    }
+
+    // Swift→Rust frames must never be accepted coming back the other way.
+    @Test func outgoingGoldenFramesAreRejectedAsIncoming() throws {
+        for name in ["01-hello.bin", "02-access-unit-key.bin", "03-capture-stopped.bin", "04-pairing-decision-deny.bin"] {
+            var reader = LocalLink.Reader()
+            #expect(throws: LocalLink.ProtocolError.self, "\(name)") { try reader.feed(Self.golden(name)) }
+        }
+    }
+}

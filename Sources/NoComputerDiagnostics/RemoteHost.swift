@@ -74,7 +74,7 @@ final class RemoteHost {
                 // The whole display, including this app: the remote user sees
                 // exactly what is on screen.
                 try await capture.start(mode: .wholeDisplay, encodeVideo: true, colorPolicy: .sRGB,
-                    maximumWidth: 1600, sampleConsumer: { [weak link] in link?.submit($0) },
+                    maximumWidth: 1600, keyframeSeconds: VideoEncoder.remoteKeyframeSeconds, sampleConsumer: { [weak link] in link?.submit($0) },
                     onStop: { reason in DispatchQueue.main.async { [weak self] in self?.captureEnded(reason) } })
                 if !streamWanted { await stopCapture() }
                 log("Streaming: \(capture.displayDescription)")

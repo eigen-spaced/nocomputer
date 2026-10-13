@@ -160,6 +160,7 @@ final class CaptureSession {
 
     func start(mode: FilterMode = .excludeApplication, encodeVideo: Bool = false, decodePreview: Bool = false,
                colorPolicy: VideoColorPolicy = .systemDefault, maximumWidth: Int = 1600,
+               keyframeSeconds: Int = VideoEncoder.diagnosticKeyframeSeconds,
                sampleConsumer: ((CMSampleBuffer) -> Void)? = nil, onStop: ((String) -> Void)? = nil) async throws {
         retireStoppedStream()
         guard stream == nil else { return }
@@ -196,7 +197,8 @@ final class CaptureSession {
         // A whole-display preview would recursively capture itself. This mode
         // collects frame metadata only, without converting pixels for the UI.
         let encoder = encodeVideo ? try VideoEncoder(width: configuration.width, height: configuration.height,
-            decodePreview: decodePreview, colorPolicy: colorPolicy, sampleConsumer: sampleConsumer) : nil
+            decodePreview: decodePreview, colorPolicy: colorPolicy, keyframeSeconds: keyframeSeconds,
+            sampleConsumer: sampleConsumer) : nil
         // Disable preview copies during the encoder experiment to isolate its timing.
         let receiver = CaptureOutput(previewEnabled: mode != .wholeDisplay && !encodeVideo, encoder: encoder,
             onStop: onStop)

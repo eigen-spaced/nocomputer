@@ -70,9 +70,15 @@ final class VideoEncoder {
     let decoder: VideoDecoder?
     private let sampleConsumer: ((CMSampleBuffer) -> Void)?
 
+    // The diagnostics keep the Milestone 1 two-second interval. Remote access asks
+    // for keyframes on demand, so it uses a long interval only as a safety net.
+    static let diagnosticKeyframeSeconds = 2
+    static let remoteKeyframeSeconds = 20
+
     init(width: Int, height: Int, decodePreview: Bool = false, colorPolicy: VideoColorPolicy = .systemDefault,
+         keyframeSeconds: Int = VideoEncoder.diagnosticKeyframeSeconds,
          sampleConsumer: ((CMSampleBuffer) -> Void)? = nil) throws {
-        guard width > 0, height > 0, width <= 8192, height <= 8192 else {
+        guard width > 0, height > 0, width <= 8192, height <= 8192, (1...60).contains(keyframeSeconds) else {
             throw NSError(domain: "NoComputer.Encoder", code: -1,
                           userInfo: [NSLocalizedDescriptionKey: "Invalid encoder dimensions"])
         }
@@ -103,8 +109,8 @@ final class VideoEncoder {
                 (kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_Main_AutoLevel),
                 (kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: Self.bitrate)),
                 (kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: 30)),
-                (kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: 60)),
-                (kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: 2))
+                (kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: 30 * keyframeSeconds)),
+                (kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: keyframeSeconds))
             ] as [(CFString, CFTypeRef)] {
                 try Self.check(VTSessionSetProperty(session, key: key, value: value), "set \(key)")
             }
