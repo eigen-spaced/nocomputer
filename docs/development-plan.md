@@ -168,17 +168,23 @@ First slice implemented (2026-10-13): `crates/proto` (see its README).
 - Pairing: SSH-style, comparing full fingerprints on both screens with local approval on the host. One request may be pending at a time, with an approval timeout and a cooldown after a denial. Revocation is sticky and closes live connections.
 - Storage: private identities in DPAPI on Windows and the Keychain on macOS. Other platforms refuse rather than fall back to a plain file.
 
-On Windows, 17 loopback tests pass, covering:
+On Windows, 18 loopback tests pass, covering:
 - pairing, reconnecting and denial
 - revocation
 - impersonation by a different key
 - stolen host and client certificates without their keys (these tests fail if signature verification is removed)
 - unpaired devices limited to pairing, version mismatch, message size limits, name spoofing
+- sessions named from the pairing record, not the device's self-reported name
 - DPAPI storage
 
-The `nocomputer-pair` tool paired and pinged locally. Still pending:
-- the macOS build and Keychain check
-- pairing between machines over the tailnet
+Paired across machines over the tailnet (2026-10-13), with `nocomputer-pair`:
+- **Devices:** the Windows client (Dell Latitude 5400, paired as "latitude", `1111 2222 3333 4444 5555 6666 7777 8888 9999 AAAA BBBB CCCC DDDD EEEE FFFF 0000`) and the MacBook Air host (`0102 0304 0506 0708 090A 0B0C 0D0E 0F10 1112 1314 1516 1718 191A 1B1C 1D1E 1F20`).
+- **Pairing:** both screens showed the same two fingerprints, and the user approved on the Mac. The Mac's paired list holds exactly that device fingerprint, and the Windows pin matches the host fingerprint on its screen.
+- **Reconnect:** pinned connects opened sessions with no prompt and closed cleanly. Control-channel ping round trip was 26–28 ms, with one 56 ms outlier in 5.
+- **Bug found and fixed:** the host showed session names from the device's `Hello` ("DESKTOP-V89P2R0") rather than the approved name. Sessions now carry the stored name, and the self-reported one is shown only as unverified.
+
+Still pending:
+- revocation between machines
 - the single-controller rule
 - video, input and clipboard streams
 - integration into the viewer and host

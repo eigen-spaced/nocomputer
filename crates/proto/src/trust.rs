@@ -26,7 +26,14 @@ fn load_json<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T, E
 
 fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(dir)?;
     }
     let tmp = path.with_extension("tmp");
     let data = serde_json::to_vec_pretty(value)?;
@@ -56,9 +63,10 @@ pub struct PairedClient {
     pub revoked: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientStatus {
-    Paired,
+    /// With the name the host's user approved at pairing.
+    Paired { name: String },
     Revoked,
     Unknown,
 }
@@ -123,7 +131,7 @@ impl PairedClients {
     pub fn status(&self, fingerprint: &Fingerprint) -> ClientStatus {
         match self.read().map(|f| f.clients.into_iter().find(|c| &c.fingerprint == fingerprint)) {
             Ok(Some(c)) if c.revoked => ClientStatus::Revoked,
-            Ok(Some(_)) => ClientStatus::Paired,
+            Ok(Some(c)) => ClientStatus::Paired { name: c.name },
             _ => ClientStatus::Unknown,
         }
     }

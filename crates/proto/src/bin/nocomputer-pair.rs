@@ -3,7 +3,7 @@
 //!   nocomputer-pair whoami
 //!   nocomputer-pair host [--listen ADDR] [--name NAME]     (stdin: clients, revoke FP)
 //!   nocomputer-pair pair HOST[:PORT] [--name NAME]
-//!   nocomputer-pair connect HOST[:PORT] [--count N]
+//!   nocomputer-pair connect HOST[:PORT] [--count N] [--name NAME]
 //!   nocomputer-pair clients | revoke FINGERPRINT | forget HOST[:PORT]
 //!
 //! State lives in NOCOMPUTER_STATE_DIR, or the per-user app data folder. The private
@@ -82,7 +82,7 @@ async fn main() {
         Some("clients") => clients(),
         Some("revoke") if args.len() >= 2 => revoke(&args[1..].join("")),
         Some("forget") if args.len() >= 2 => forget(&args[1]),
-        _ => Err("usage: nocomputer-pair whoami | host [--listen ADDR] [--name NAME] | pair HOST[:PORT] [--name NAME] | connect HOST[:PORT] [--count N] | clients | revoke FINGERPRINT | forget HOST[:PORT]".into()),
+        _ => Err("usage: nocomputer-pair whoami | host [--listen ADDR] [--name NAME] | pair HOST[:PORT] [--name NAME] | connect HOST[:PORT] [--count N] [--name NAME] | clients | revoke FINGERPRINT | forget HOST[:PORT]".into()),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");
@@ -129,7 +129,10 @@ async fn host(args: &[String]) -> Result<(), BoxError> {
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
             match event {
-                HostEvent::Session { device, name } => println!("session: \"{name}\" {device}"),
+                HostEvent::Session { device, name, reported_name } if reported_name != name => {
+                    println!("session: \"{name}\" {device} (calls itself \"{reported_name}\", unverified)")
+                }
+                HostEvent::Session { device, name, .. } => println!("session: \"{name}\" {device}"),
                 HostEvent::SessionEnded { device } => println!("session ended: {device}"),
                 HostEvent::Paired { device, name } => println!("paired: \"{name}\" {device}"),
                 HostEvent::PairingDenied { device } => println!("pairing denied or timed out: {device}"),
@@ -205,7 +208,7 @@ async fn connect(args: &[String]) -> Result<(), BoxError> {
     let count: u32 = option(args, "--count").map(|c| c.parse()).transpose()?.unwrap_or(5);
     let known = KnownHosts::at(state_dir().join("known-hosts.json"));
     let pinned = known.get(&address)?.ok_or_else(|| format!("{address} is not paired; run `pair {address}` first"))?;
-    let viewer = Viewer::new(identity()?, default_name())?;
+    let viewer = Viewer::new(identity()?, option(args, "--name").unwrap_or_else(default_name))?;
     let Outcome::Ready(mut session) = viewer.connect(resolve(&address).await?, Some(pinned.fingerprint)).await? else {
         unreachable!("pinned connections return a session or an error")
     };

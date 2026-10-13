@@ -108,6 +108,30 @@ async fn pairs_once_then_reconnects_without_prompt() {
 }
 
 #[tokio::test]
+async fn sessions_are_named_from_the_pairing_not_the_hello() {
+    let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
+    let mut config = HostConfig::new("test-host");
+    config.events = Some(events);
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let host = start(Host::bind(LOOPBACK.into(), &Identity::generate().unwrap(), config, PairedClients::in_memory(), approver(true, prompts.clone())).unwrap(), prompts);
+    let identity = Identity::generate().unwrap();
+    let device = identity.fingerprint();
+    let copy = Identity::from_bytes(&identity.to_bytes()).unwrap();
+    let host_fp = pair(&Viewer::new(identity, "latitude").unwrap(), &host).await;
+
+    // The same paired device later calls itself something else.
+    let renamed = Viewer::new(copy, "someone-else").unwrap();
+    let Outcome::Ready(session) = renamed.connect(host.addr, Some(host_fp)).await.unwrap() else { panic!("expected session") };
+    session.close().await;
+    let mut events = Vec::new();
+    while let Ok(e) = seen.try_recv() {
+        events.push(e);
+    }
+    let expected = crate::HostEvent::Session { device, name: "latitude".into(), reported_name: "someone-else".into() };
+    assert!(events.contains(&expected), "{events:?}");
+}
+
+#[tokio::test]
 async fn first_contact_never_yields_a_session_even_when_paired() {
     let host = host_with(&Identity::generate().unwrap(), true);
     let viewer = viewer();
@@ -334,7 +358,7 @@ fn paired_clients_persist_and_revocation_sticks() {
         assert!(clients.add(fp, "again").is_err());
     }
     let mut reopened = PairedClients::at(&path);
-    assert_eq!(reopened.status(&fp), crate::ClientStatus::Paired);
+    assert_eq!(reopened.status(&fp), crate::ClientStatus::Paired { name: "laptop".into() });
     assert!(reopened.revoke(&fp).unwrap());
     assert_eq!(PairedClients::at(&path).status(&fp), crate::ClientStatus::Revoked);
     std::fs::remove_dir_all(&dir).unwrap();

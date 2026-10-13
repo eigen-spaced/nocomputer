@@ -33,7 +33,9 @@ pub type Approver = Arc<dyn Fn(PairingPrompt) -> Pin<Box<dyn Future<Output = boo
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostEvent {
-    Session { device: Fingerprint, name: String },
+    /// `name` is the one approved at pairing. `reported_name` is what the device calls
+    /// itself in this connection's `Hello`: unverified, so never show it as identity.
+    Session { device: Fingerprint, name: String, reported_name: String },
     SessionEnded { device: Fingerprint },
     Paired { device: Fingerprint, name: String },
     PairingDenied { device: Fingerprint },
@@ -172,10 +174,10 @@ impl Inner {
         let status = self.clients.lock().unwrap().status(&device);
         match status {
             ClientStatus::Revoked => refuse(&mut send, ErrorCode::Revoked, "this device's access was revoked").await,
-            ClientStatus::Paired => {
+            ClientStatus::Paired { name } => {
                 write_msg(&mut send, &Message::Welcome { version: PROTOCOL_VERSION, host_name: self.config.name.clone(), paired: true }).await?;
                 self.live.lock().unwrap().entry(device).or_default().push(conn.clone());
-                self.emit(HostEvent::Session { device, name: device_name });
+                self.emit(HostEvent::Session { device, name, reported_name: device_name });
                 let result = session(&mut send, &mut recv).await;
                 if let Some(conns) = self.live.lock().unwrap().get_mut(&device) {
                     conns.retain(|c| c.stable_id() != conn.stable_id());
