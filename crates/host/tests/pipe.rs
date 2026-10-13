@@ -1,6 +1,6 @@
 //! Runs the real binary over its pipes, as the app does.
 
-use nocomputer_host::local::{FromApp, ToApp};
+use nocomputer_host::local::FromApp;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
@@ -51,6 +51,7 @@ fn anything_but_hello_first_exits_3() {
 #[cfg(not(target_os = "macos"))]
 mod with_identity {
     use super::*;
+    use nocomputer_host::local::ToApp;
 
     #[test]
     fn hello_is_acknowledged_then_eof_exits_cleanly() {
