@@ -190,8 +190,19 @@ Video path, Mac side (2026-10-13): the Swift app spawns `crates/host` (`nocomput
 
 The Tauri viewer plays live video with `--connect` (see `app/README.md`). On loopback from the replay host, it decoded 1080p at 60 fps with no drops, in both default and hardware-required modes.
 
+End to end between machines (2026-10-13): the Mac app's bundled host streamed the Mac screen to the Tauri viewer on the Windows client over the tailnet.
+- **Pin:** the old pin (from the CLI host's identity) was refused with "host identity changed". The user then paired the app host (`7D40 93A5 A9A8 872D 1A31 C5FA 4B1C A6EE 431B 334C 27A8 53F6 95AE D0C5 F6D0 137F`) in the app's sheet.
+- **Check runs:** two `--check` runs, default and `--require-hardware`. Both decoded 306/306 frames at 1600x1034, `avc1.4D0028`, with no decode errors and no drops on either Windows side.
+- **Frame rate:** about 24 fps on a mostly still screen. ScreenCaptureKit delivers only on change, so gaps between frames reached about 250 ms.
+- **Visual:** the user checked the windowed and fullscreen views: smooth.
+- **Mac side:** M3 MacBook Air, macOS 26.6.2, app built at `1f8b979` with stable signing.
+  - Stream: display 1710x1107 pt captured to a 1600x1034 sRGB stream, 8 Mbit/s target.
+  - Sent: 2785 access units, 59 of them keyframes, 25,591,003 bytes in total, which is about 9.2 KB per frame, or 1.8 Mbit/s at 24 fps.
+  - Drops: none from pipe pressure. There was 1 dependent drop: a P-frame in flight at stream start, before the forced IDR, dropped by design. Peak queue 1, no encoder drops.
+  - Sessions started and stopped capture as designed, and the app showed the stored device name.
+- **Keyframe interval:** the encoder still forces an IDR every 60 frames or 2 s, carried over from the Milestone 1 diagnostics. With keyframes now on demand, a long safety interval (10–30 s) should save bandwidth. To measure before and after; Mac side.
+
 Still pending:
-- the end-to-end run with the Mac app
 - input and clipboard streams
 
 Deliverable: authenticated connections by hostname/IP with a documented pairing flow and bounded video transport.
