@@ -90,7 +90,7 @@ async function runCheck(launch) {
 const view = { mode: 'fit', panX: 0, panY: 0, fullscreen: false, showStatus: true };
 let current = null; // latest VideoFrame, held at EOF
 let info = { codec: '', decode: '', decoded: 0, total: 0, ended: false, error: null, live: false, host: null, fps: 0, notice: null, hook: false,
-  keyboard: null, drops: 0, decodeErrors: 0, waiting: false, lastKeyAt: null, jitterMs: null, queue: 0 };
+  keyboard: null, drops: 0, decodeErrors: 0, waiting: false, lastKeyAt: null, jitterMs: null, queue: 0, keyTiming: null };
 const statusText = document.createElement('span');
 statusEl.append(statusText);
 
@@ -136,7 +136,8 @@ function draw() {
     const video = `drops ${info.drops}, decode errors ${info.decodeErrors}, keyframe ${keyAge} ago${info.waiting ? ', waiting for keyframe' : ''}`
       + `, jitter ${jitter}, queue ${info.queue}`;
     const keyboard = info.keyboard ? ` | ${info.keyboard}` : '';
-    statusText.textContent = `${info.host ?? ''} ${info.codec} ${info.decode} | ${info.decoded} frames | ${view.mode} | ${state} | ${video}${keyboard}${notice} | ${keys} | `;
+    const timing = info.keyTiming ? ` | ${info.keyTiming}` : '';
+    statusText.textContent = `${info.host ?? ''} ${info.codec} ${info.decode} | ${info.decoded} frames | ${view.mode} | ${state} | ${video}${keyboard}${timing}${notice} | ${keys} | `;
   } else {
     const state = info.error ? `error: ${info.error}` : info.ended ? 'ended (holding last frame)' : 'playing';
     statusText.textContent = `${info.codec} ${info.decode} | ${info.decoded}/${info.total} frames | ${view.mode} | ${state} | ${keys}`;
@@ -222,12 +223,14 @@ const LIVE_CHECK_FRAMES = 300;
 // [u8 flags][u64 LE host_us][u8 codec_len][codec][access unit]; see live.rs.
 function parseLive(buf) {
   const v = new DataView(buf);
-  const codecLen = v.getUint8(9);
+  const flags = v.getUint8(0), codecLen = v.getUint8(13);
   return {
-    key: (v.getUint8(0) & 1) === 1,
+    key: (flags & 1) === 1,
     hostUs: Number(v.getBigUint64(1, true)),
-    codec: new TextDecoder().decode(new Uint8Array(buf, 10, codecLen)),
-    data: new Uint8Array(buf, 10 + codecLen),
+    // Key-down to now (in Rust's hands), for the first frame after a key; else null.
+    keyMs: flags & 2 ? v.getUint32(9, true) / 1000 : null,
+    codec: new TextDecoder().decode(new Uint8Array(buf, 14, codecLen)),
+    data: new Uint8Array(buf, 14 + codecLen),
   };
 }
 
@@ -249,6 +252,11 @@ async function live(launch) {
   const jitter = []; // [arrival ms, |gap difference| ms]
   const queueDepth = []; // [ms, decodeQueueSize before each decode]
   let lastArrival = null;
+  // Key-down to the decoded picture, for the first frame after each key-down: Rust's
+  // part (key read → frame handed over) plus the page's (frame received → decoded),
+  // each on its own monotonic clock. The IPC hop between them (~3 ms) isn't counted.
+  const keyed = new Map(); // host_us → { at: received, ms: Rust's part }
+  const shownMs = [];
   const requestKeyframe = () => invoke('live_request_keyframe').catch(() => {});
 
   const makeDecoder = c => {
@@ -257,6 +265,13 @@ async function live(launch) {
         stats.frames++;
         if (stats.width === null) { stats.width = frame.displayWidth; stats.height = frame.displayHeight; }
         const now = performance.now();
+        const k = keyed.get(frame.timestamp);
+        if (k) {
+          keyed.delete(frame.timestamp);
+          shownMs.push(k.ms + now - k.at);
+          if (shownMs.length > 32) shownMs.shift();
+          info.keyShown = { avg: shownMs.reduce((a, b) => a + b, 0) / shownMs.length, max: Math.max(...shownMs), n: (info.keyShown?.n ?? 0) + 1 };
+        }
         shown.push(now);
         while (shown.length && now - shown[0] > 1000) shown.shift();
         if (launch.check) { frame.close(); return; }
@@ -326,6 +341,10 @@ async function live(launch) {
       requestKeyframe();
       continue;
     }
+    if (f.keyMs !== null) {
+      if (keyed.size > 16) keyed.clear(); // outputs lost to a decoder error
+      keyed.set(f.hostUs, { at: arrival, ms: f.keyMs });
+    }
     decoder.decode(new EncodedVideoChunk({ type: f.key ? 'key' : 'delta', timestamp: f.hostUs, data: f.data }));
   }
   if (decoder) await decoder.flush().catch(() => {});
@@ -376,9 +395,13 @@ function startInput(launch) {
     const box = canvas.getBoundingClientRect(); // not offsetX: the event may target another element
     const scale = canvas.width / box.width;
     const r = contentRect(current.displayWidth, current.displayHeight);
-    let x = ((e.clientX - box.left) * scale - r.x) / r.w, y = ((e.clientY - box.top) * scale - r.y) / r.h;
-    if (clamp) { x = Math.min(1, Math.max(0, x)); y = Math.min(1, Math.max(0, y)); }
-    if (!(x >= 0 && x <= 1 && y >= 0 && y <= 1)) return null;
+    const px = (e.clientX - box.left) * scale - r.x, py = (e.clientY - box.top) * scale - r.y;
+    if (!clamp && !(px >= 0 && px < r.w && py >= 0 && py < r.h)) return null;
+    // The last CSS pixel of the picture starts one CSS pixel (`scale` canvas pixels) before
+    // its far edge: map it to 65535, so the host's last row and column (the Dock, hot
+    // corners) can be reached.
+    const x = Math.min(1, Math.max(0, px / Math.max(1, r.w - scale)));
+    const y = Math.min(1, Math.max(0, py / Math.max(1, r.h - scale)));
     return { kind: 'pointer_move', x: Math.round(x * 65535), y: Math.round(y * 65535) };
   };
   const releaseHeld = () => {
@@ -455,6 +478,11 @@ function startInput(launch) {
     if (!i) return;
     info.notice = i.notice;
     if (info.hook) info.keyboard = i.keyboard_active ? `keys on (${i.keys_sent} sent)` : 'keys off (window not in front)';
+    const ms = (avg, max) => `${avg.toFixed(0)}/${max.toFixed(0)}`;
+    if (i.key_frame?.n) {
+      const shown = info.keyShown ? `, shown ${ms(info.keyShown.avg, info.keyShown.max)}` : '';
+      info.keyTiming = `key→frame ${ms(i.key_frame.avg_ms, i.key_frame.max_ms)}${shown} ms avg/max (${i.key_frame.n}), send max ${i.key_send.max_ms.toFixed(1)} ms`;
+    }
     draw();
   }, 1000);
 }

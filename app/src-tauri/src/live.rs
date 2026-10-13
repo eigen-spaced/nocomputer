@@ -4,10 +4,13 @@
 //! viewer uses the same identity and known-hosts file). Frames are pulled by the page:
 //! `live_next` waits for the next frame and returns it as raw bytes,
 //!
-//!   [u8 flags (bit0 keyframe)][u64 LE host_us][u8 codec_len][codec][Annex B access unit]
+//!   [u8 flags (bit0 keyframe, bit1 key_us set)][u64 LE host_us][u32 LE key_us]
+//!   [u8 codec_len][codec][Annex B access unit]
 //!
 //! `host_us` is the host's monotonic clock: usable as decoder timestamps and for
-//! differences between frames, never against this machine's clock. If the page falls
+//! differences between frames, never against this machine's clock. `key_us` marks the
+//! first frame to arrive after a key went down: the time from reading that key-down from
+//! the hook to handing this frame to the page, on this machine's clock (0 otherwise). If the page falls
 //! behind, frames are dropped up to the next keyframe and one is requested, so the
 //! decoder never gets a frame whose keyframe it lacks.
 //!
@@ -15,10 +18,11 @@
 //! and on Windows the keyboard hook (`hook.rs`) sends keys. Neither is logged. Notices
 //! from the host (input unavailable, capture stopped) appear in `live_info`.
 
-use nocomputer_proto::{load_or_create_identity, paths, platform_keystore, Error, Input, KnownHosts, NoticeKind, Outcome, Viewer};
+use nocomputer_proto::{load_or_create_identity, paths, platform_keystore, Error, Input, KeyState, KnownHosts, NoticeKind, Outcome, Viewer};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::ipc::Response;
 use tokio::sync::mpsc;
 
@@ -37,9 +41,40 @@ pub struct LiveInfo {
     /// The keyboard hook is on (the window is in front), and keys sent so far.
     pub keyboard_active: bool,
     pub keys_sent: u64,
+    /// Key-down read from the hook → written to the connection.
+    pub key_send: Timing,
+    /// Key-down read from the hook → the next video frame received.
+    pub key_frame: Timing,
 }
 
-type Frames = mpsc::Receiver<Result<Vec<u8>, String>>;
+/// Over the last `SAMPLES` measurements, in ms on this machine's monotonic clock.
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct Timing {
+    pub avg_ms: f64,
+    pub max_ms: f64,
+    pub n: u64,
+}
+
+const SAMPLES: usize = 32;
+
+#[derive(Default)]
+struct Samples(std::collections::VecDeque<f64>, u64);
+
+impl Samples {
+    fn add(&mut self, d: Duration) -> Timing {
+        if self.0.len() == SAMPLES {
+            self.0.pop_front();
+        }
+        self.0.push_back(d.as_secs_f64() * 1000.0);
+        self.1 += 1;
+        let max_ms = self.0.iter().copied().fold(0.0, f64::max);
+        Timing { avg_ms: self.0.iter().sum::<f64>() / self.0.len() as f64, max_ms, n: self.1 }
+    }
+}
+
+/// A frame for the page, and when the key-down before it was read, if it is the first since.
+type Frame = (Vec<u8>, Option<Instant>);
+type Frames = mpsc::Receiver<Result<Frame, String>>;
 
 pub struct Live {
     address: String,
@@ -48,7 +83,8 @@ pub struct Live {
     /// Created by the first `live_next`, so nothing is dropped while the page loads.
     frames: tokio::sync::Mutex<Option<Frames>>,
     keyframe: Mutex<Option<mpsc::UnboundedSender<()>>>,
-    input: Mutex<Option<mpsc::UnboundedSender<Input>>>,
+    /// With when each was sent, for timing.
+    input: Mutex<Option<mpsc::UnboundedSender<(Input, Instant)>>>,
     /// A session is up, so input has somewhere to go.
     connected: Arc<AtomicBool>,
     /// Ends the session; the task then reports on `closed`.
@@ -63,9 +99,10 @@ fn device_name() -> String {
 
 fn encode(frame: &nocomputer_proto::VideoFrame) -> Vec<u8> {
     let codec = frame.codec.as_bytes();
-    let mut out = Vec::with_capacity(10 + codec.len() + frame.data.len());
+    let mut out = Vec::with_capacity(14 + codec.len() + frame.data.len());
     out.push(frame.keyframe as u8);
     out.extend_from_slice(&frame.host_us.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // key_us, set by live_next
     out.push(codec.len() as u8);
     out.extend_from_slice(codec);
     out.extend_from_slice(&frame.data);
@@ -110,7 +147,7 @@ impl Live {
     pub fn send_input(&self, input: Input) {
         if self.is_connected() {
             if let Some(tx) = self.input.lock().unwrap().as_ref() {
-                let _ = tx.send(input);
+                let _ = tx.send((input, Instant::now()));
             }
         }
     }
@@ -151,9 +188,9 @@ impl Live {
 async fn run(
     (address, dial): (String, String),
     info: Arc<Mutex<LiveInfo>>,
-    tx: mpsc::Sender<Result<Vec<u8>, String>>,
+    tx: mpsc::Sender<Result<Frame, String>>,
     mut keyframe: mpsc::UnboundedReceiver<()>,
-    mut input: mpsc::UnboundedReceiver<Input>,
+    mut input: mpsc::UnboundedReceiver<(Input, Instant)>,
     connected: Arc<AtomicBool>,
     shutdown: Arc<tokio::sync::Notify>,
 ) -> Result<(), String> {
@@ -205,21 +242,28 @@ async fn session_loop(
     session: &mut nocomputer_proto::Session,
     video: &mut mpsc::Receiver<Result<nocomputer_proto::VideoFrame, Error>>,
     info: &Mutex<LiveInfo>,
-    tx: &mpsc::Sender<Result<Vec<u8>, String>>,
+    tx: &mpsc::Sender<Result<Frame, String>>,
     keyframe: &mut mpsc::UnboundedReceiver<()>,
-    input: &mut mpsc::UnboundedReceiver<Input>,
+    input: &mut mpsc::UnboundedReceiver<(Input, Instant)>,
     shutdown: &tokio::sync::Notify,
 ) -> Result<(), String> {
     let mut gap = false;
+    // When a key went down with no frame received since.
+    let mut key_mark: Option<Instant> = None;
+    let (mut key_send, mut key_frame) = (Samples::default(), Samples::default());
     loop {
         tokio::select! {
             Some(frame) = video.recv() => {
                 let frame = frame.map_err(describe)?;
+                let mark = key_mark.take();
+                if let Some(mark) = mark {
+                    info.lock().unwrap().key_frame = key_frame.add(mark.elapsed());
+                }
                 if gap && !frame.keyframe {
                     continue;
                 }
                 gap = false;
-                match tx.try_send(Ok(encode(&frame))) {
+                match tx.try_send(Ok((encode(&frame), mark))) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         // The page is behind: drop up to the next keyframe.
@@ -231,7 +275,16 @@ async fn session_loop(
                 }
             }
             Some(()) = keyframe.recv() => session.request_keyframe().await.map_err(describe)?,
-            Some(i) = input.recv() => session.input(i).await.map_err(describe)?,
+            Some((i, sent)) = input.recv() => {
+                let down = matches!(i, Input::Key { state: KeyState::Down, .. });
+                if down {
+                    key_mark.get_or_insert(sent);
+                }
+                session.input(i).await.map_err(describe)?;
+                if down {
+                    info.lock().unwrap().key_send = key_send.add(sent.elapsed());
+                }
+            }
             Some(notice) = session.notice() => {
                 let what = match notice.kind {
                     NoticeKind::InputUnavailable => "input unavailable",
@@ -250,7 +303,14 @@ pub async fn live_next(live: tauri::State<'_, Live>) -> Result<Response, String>
     let mut frames = live.frames.lock().await;
     let frames = frames.get_or_insert_with(|| live.start());
     match frames.recv().await {
-        Some(Ok(frame)) => Ok(Response::new(frame)),
+        Some(Ok((mut frame, mark))) => {
+            if let Some(mark) = mark {
+                let us = u32::try_from(mark.elapsed().as_micros()).unwrap_or(u32::MAX).max(1);
+                frame[0] |= 2;
+                frame[9..13].copy_from_slice(&us.to_le_bytes());
+            }
+            Ok(Response::new(frame))
+        }
         Some(Err(e)) => Err(e),
         None => Err("the connection ended".into()),
     }
