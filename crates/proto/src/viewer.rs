@@ -1,6 +1,7 @@
 //! Viewer side: connects to a pinned host, or makes first contact to pair.
 
 use crate::identity::{Fingerprint, Identity, SERVER_NAME};
+use crate::input::{Input, Notice};
 use crate::tls;
 use crate::video::VideoReceiver;
 use crate::wire::{read_msg, valid_device_name, write_msg, Message, PROTOCOL_VERSION};
@@ -8,6 +9,7 @@ use crate::{Error, ErrorCode};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -80,45 +82,90 @@ impl FirstContact {
     }
 }
 
+/// Notices held for the caller before newer ones are dropped.
+const NOTICES: usize = 16;
+
 /// An authenticated, authorized connection to a pinned host.
 pub struct Session {
     pub host_fingerprint: Fingerprint,
     pub host_name: String,
-    channel: Channel,
+    endpoint: quinn::Endpoint,
+    conn: quinn::Connection,
+    send: quinn::SendStream,
+    /// Replies from the host, read by a task so that reading is never cut short.
+    replies: mpsc::Receiver<Message>,
+    notices: mpsc::Receiver<Notice>,
     seq: u64,
 }
 
 impl Session {
+    fn new(host_fingerprint: Fingerprint, host_name: String, channel: Channel) -> Self {
+        let Channel { endpoint, conn, send, mut recv } = channel;
+        let (replies_tx, replies) = mpsc::channel(1);
+        let (notices_tx, notices) = mpsc::channel(NOTICES);
+        tokio::spawn(async move {
+            while let Ok(m) = read_msg(&mut recv).await {
+                let delivered = match m {
+                    Message::Notice(n) => !matches!(notices_tx.try_send(n), Err(mpsc::error::TrySendError::Closed(_))),
+                    other => replies_tx.send(other).await.is_ok(),
+                };
+                if !delivered {
+                    break;
+                }
+            }
+        });
+        Session { host_fingerprint, host_name, endpoint, conn, send, replies, notices, seq: 0 }
+    }
+
     pub async fn ping(&mut self) -> Result<Duration, Error> {
         self.seq += 1;
         let started = Instant::now();
-        let reply = async {
-            write_msg(&mut self.channel.send, &Message::Ping { seq: self.seq }).await?;
-            timeout(REPLY_TIMEOUT, read_msg(&mut self.channel.recv)).await.map_err(|_| Error::Timeout("pong"))?
-        };
-        match reply.await.map_err(|e| self.explain_close(e))? {
-            Message::Pong { seq } if seq == self.seq => Ok(started.elapsed()),
-            Message::Error { code, message } => Err(Error::Remote { code, message }),
-            other => Err(Error::Protocol(format!("unexpected reply to ping: {other:?}"))),
+        write_msg(&mut self.send, &Message::Ping { seq: self.seq }).await.map_err(|e| self.explain_close(e))?;
+        let reply = timeout(REPLY_TIMEOUT, self.replies.recv()).await.map_err(|_| Error::Timeout("pong"))?;
+        match reply {
+            Some(Message::Pong { seq }) if seq == self.seq => Ok(started.elapsed()),
+            Some(Message::Error { code, message }) => Err(Error::Remote { code, message }),
+            Some(other) => Err(Error::Protocol(format!("unexpected reply to ping: {other:?}"))),
+            None => Err(self.ended()),
         }
     }
 
     fn explain_close(&self, error: Error) -> Error {
-        explain_close(&self.channel.conn, error)
+        explain_close(&self.conn, error)
+    }
+
+    /// Why the control stream ended.
+    fn ended(&self) -> Error {
+        let error = match self.conn.close_reason() {
+            Some(reason) => reason.into(),
+            None => Error::Protocol("the host ended the session".into()),
+        };
+        self.explain_close(error)
     }
 
     /// Asks the host for a keyframe, for example after a decoder error. No reply.
     pub async fn request_keyframe(&mut self) -> Result<(), Error> {
-        write_msg(&mut self.channel.send, &Message::RequestKeyframe).await.map_err(|e| self.explain_close(e))
+        write_msg(&mut self.send, &Message::RequestKeyframe).await.map_err(|e| self.explain_close(e))
+    }
+
+    /// Sends input to the host, in order. No reply.
+    pub async fn input(&mut self, input: Input) -> Result<(), Error> {
+        write_msg(&mut self.send, &Message::Input(input)).await.map_err(|e| self.explain_close(e))
+    }
+
+    /// The next notice from the host; `None` once the session has ended. Cancel-safe.
+    pub async fn notice(&mut self) -> Option<Notice> {
+        self.notices.recv().await
     }
 
     /// The host's video. Use it from a separate task; it shares the connection.
     pub fn video(&self) -> VideoReceiver {
-        VideoReceiver::new(self.channel.conn.clone())
+        VideoReceiver::new(self.conn.clone())
     }
 
     pub async fn close(self) {
-        self.channel.close().await;
+        self.conn.close(0u32.into(), b"");
+        let _ = timeout(Duration::from_secs(1), self.endpoint.wait_idle()).await;
     }
 }
 
@@ -205,7 +252,7 @@ impl Viewer {
         };
         match pinned {
             None => Ok(Outcome::FirstContact(FirstContact { host_fingerprint, host_name, already_paired: paired, channel })),
-            Some(_) if paired => Ok(Outcome::Ready(Session { host_fingerprint, host_name, channel, seq: 0 })),
+            Some(_) if paired => Ok(Outcome::Ready(Session::new(host_fingerprint, host_name, channel))),
             Some(_) => {
                 channel.close().await;
                 Err(Error::Remote { code: ErrorCode::NotPaired, message: "the host does not have this device paired; pair again".into() })

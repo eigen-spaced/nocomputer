@@ -8,6 +8,7 @@
 
 mod host;
 mod identity;
+mod input;
 mod keystore;
 pub mod paths;
 mod tls;
@@ -21,6 +22,7 @@ mod tests;
 
 pub use host::{Approver, Host, HostConfig, HostEvent, PairingPrompt};
 pub use identity::{Fingerprint, Identity, SERVER_NAME};
+pub use input::{Button, Input, KeyState, Notice, NoticeKind, ScrollUnit, MAX_NOTICE, MAX_SCROLL_LINES, MAX_SCROLL_PIXELS};
 pub use keystore::{load_or_create_identity, platform_keystore, KeyStore, MemoryKeyStore};
 pub use tls::ALPN;
 pub use trust::{ClientStatus, KnownHost, KnownHosts, PairedClient, PairedClients};

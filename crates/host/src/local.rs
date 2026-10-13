@@ -1,32 +1,50 @@
-//! local-v1: the pipe contract between the capture app (parent) and this host process
-//! (child), over the child's stdin and stdout.
+//! local-v2: the pipe contract between the capture app (parent) and this host process
+//! (child), over the child's stdin and stdout. v2 added input (0x86-0x8A) and
+//! InputUnavailable (0x05); there is no v1 compatibility.
 //!
 //! ```text
 //! frame: [u32 BE len][u8 type][payload]    len = 1 + payload length, 1..=4 MiB
 //!
 //! app -> host
-//!   0x01 Hello            u16 BE version (= 1); must be the first frame
+//!   0x01 Hello            u16 BE version (= 2); must be the first frame
 //!   0x02 AccessUnit       u8 flags (bit0 keyframe, others 0), u64 BE capture_us,
 //!                         Annex B bytes (at least 1); a keyframe is an IDR with SPS+PPS
 //!   0x03 CaptureStopped   UTF-8 reason, at most 1024 bytes
 //!   0x04 PairingDecision  u64 BE request_id, u8 approve (0 or 1); exactly 9 bytes
+//!   0x05 InputUnavailable UTF-8 reason, at most 1024 bytes: input can't be injected
 //! host -> app
 //!   0x81 HelloAck         u16 BE version
 //!   0x82 StartStream      empty: a controlling session began; start capture, IDR first
 //!   0x83 StopStream       empty: no controlling session remains
 //!   0x84 RequestKeyframe  empty
 //!   0x85 Event            UTF-8 JSON object tagged by "type"; unknown types are ignored
+//!   0x86 Pointer          u16 BE x, u16 BE y: 0..=65535 across the captured display,
+//!                         edges inclusive
+//!   0x87 Button           u8 button (0 left, 1 right, 2 middle, 3 back, 4 forward),
+//!                         u8 down (0 or 1); at the last pointer position
+//!   0x88 Scroll           i32 BE dx, i32 BE dy, u8 unit (0 pixel, 1 line); positive
+//!                         dy scrolls toward the end of the document (DOM sign);
+//!                         at most 10000 pixels or 100 lines per axis
+//!   0x89 Key              u16 BE USB HID usage (keyboard page 0x07), u8 state
+//!                         (0 up, 1 down, 2 repeat); unknown usages are the app's to drop
+//!   0x8A ReleaseAll       empty: release every key and button the remote holds
 //! ```
+//!
+//! Input comes only from the controlling session, in order. Pointer moves may be
+//! coalesced; buttons, keys and scrolls never are. The host sends ReleaseAll when a
+//! controlling session starts or ends (before StopStream) and when it discards an input
+//! backlog. Neither side logs input contents.
 //!
 //! Anything else is fatal: lengths out of range (checked before allocating), unknown
 //! frame types, a payload on an empty type, wrong fixed sizes, invalid UTF-8. The
-//! payloads of `testdata/local-v1/*.bin` are the reference encoding for both sides.
+//! payloads of `testdata/local-v2/*.bin` are the reference encoding for both sides.
 //! `capture_us` is the app's monotonic clock and only meaningful within the app.
 
+use nocomputer_proto::{Button, Input, KeyState, ScrollUnit, MAX_SCROLL_LINES, MAX_SCROLL_PIXELS};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 pub const MAX_REASON: usize = 1024;
 
@@ -34,11 +52,17 @@ const HELLO: u8 = 0x01;
 const ACCESS_UNIT: u8 = 0x02;
 const CAPTURE_STOPPED: u8 = 0x03;
 const PAIRING_DECISION: u8 = 0x04;
+const INPUT_UNAVAILABLE: u8 = 0x05;
 const HELLO_ACK: u8 = 0x81;
 const START_STREAM: u8 = 0x82;
 const STOP_STREAM: u8 = 0x83;
 const REQUEST_KEYFRAME: u8 = 0x84;
 const EVENT: u8 = 0x85;
+const POINTER: u8 = 0x86;
+const BUTTON: u8 = 0x87;
+const SCROLL: u8 = 0x88;
+const KEY: u8 = 0x89;
+const RELEASE_ALL: u8 = 0x8A;
 const FLAG_KEYFRAME: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +71,7 @@ pub enum FromApp {
     AccessUnit { keyframe: bool, capture_us: u64, data: Vec<u8> },
     CaptureStopped { reason: String },
     PairingDecision { request_id: u64, approve: bool },
+    InputUnavailable { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +81,11 @@ pub enum ToApp {
     StopStream,
     RequestKeyframe,
     Event(Event),
+    Pointer { x: u16, y: u16 },
+    Button { button: u8, down: bool },
+    Scroll { dx: i32, dy: i32, unit: u8 },
+    Key { usage: u16, state: u8 },
+    ReleaseAll,
 }
 
 /// Display-only notices for the app. Fingerprints are full, grouped hex strings.
@@ -86,7 +116,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "local pipe: {e}"),
             Error::Eof => write!(f, "local pipe closed"),
-            Error::Protocol(m) => write!(f, "local-v1: {m}"),
+            Error::Protocol(m) => write!(f, "local-v2: {m}"),
         }
     }
 }
@@ -95,6 +125,13 @@ impl std::error::Error for Error {}
 
 fn bad(message: impl Into<String>) -> Error {
     Error::Protocol(message.into())
+}
+
+fn reason(frame: &str, payload: Vec<u8>) -> Result<String, Error> {
+    if payload.len() > MAX_REASON {
+        return Err(bad(format!("{frame} reason exceeds 1024 bytes")));
+    }
+    String::from_utf8(payload).map_err(|_| bad(format!("{frame} reason is not UTF-8")))
 }
 
 fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
@@ -113,7 +150,52 @@ impl ToApp {
             ToApp::StopStream => frame(STOP_STREAM, &[]),
             ToApp::RequestKeyframe => frame(REQUEST_KEYFRAME, &[]),
             ToApp::Event(event) => frame(EVENT, &serde_json::to_vec(event).expect("events serialize")),
+            ToApp::Pointer { x, y } => frame(POINTER, &[x.to_be_bytes(), y.to_be_bytes()].concat()),
+            ToApp::Button { button, down } => frame(BUTTON, &[*button, *down as u8]),
+            ToApp::Scroll { dx, dy, unit } => frame(SCROLL, &[&dx.to_be_bytes()[..], &dy.to_be_bytes(), &[*unit]].concat()),
+            ToApp::Key { usage, state } => frame(KEY, &[&usage.to_be_bytes()[..], &[*state]].concat()),
+            ToApp::ReleaseAll => frame(RELEASE_ALL, &[]),
         }
+    }
+
+    /// The frame for sanitized input from the controlling session; `None` for input the
+    /// app has no encoding for.
+    pub fn from_input(input: Input) -> Option<ToApp> {
+        Some(match input {
+            Input::PointerMove { x, y } => ToApp::Pointer { x, y },
+            Input::PointerButton { button, down } => {
+                let button = match button {
+                    Button::Left => 0,
+                    Button::Right => 1,
+                    Button::Middle => 2,
+                    Button::Back => 3,
+                    Button::Forward => 4,
+                    Button::Unknown => return None,
+                };
+                ToApp::Button { button, down }
+            }
+            Input::Scroll { dx, dy, unit } => {
+                let (dx, dy, unit) = match unit {
+                    ScrollUnit::Pixel => (dx.clamp(-MAX_SCROLL_PIXELS, MAX_SCROLL_PIXELS), dy.clamp(-MAX_SCROLL_PIXELS, MAX_SCROLL_PIXELS), 0),
+                    ScrollUnit::Line => (dx.clamp(-MAX_SCROLL_LINES, MAX_SCROLL_LINES), dy.clamp(-MAX_SCROLL_LINES, MAX_SCROLL_LINES), 1),
+                };
+                ToApp::Scroll { dx, dy, unit }
+            }
+            Input::Key { usage, state } => {
+                let state = match state {
+                    KeyState::Up => 0,
+                    KeyState::Down => 1,
+                    KeyState::Repeat => 2,
+                };
+                ToApp::Key { usage, state }
+            }
+            Input::ReleaseAll => ToApp::ReleaseAll,
+        })
+    }
+
+    /// Input frames, which the host may coalesce or discard under backlog.
+    pub fn is_input(&self) -> bool {
+        matches!(self, ToApp::Pointer { .. } | ToApp::Button { .. } | ToApp::Scroll { .. } | ToApp::Key { .. } | ToApp::ReleaseAll)
     }
 }
 
@@ -129,6 +211,7 @@ impl FromApp {
                 frame(ACCESS_UNIT, &payload)
             }
             FromApp::CaptureStopped { reason } => frame(CAPTURE_STOPPED, reason.as_bytes()),
+            FromApp::InputUnavailable { reason } => frame(INPUT_UNAVAILABLE, reason.as_bytes()),
             FromApp::PairingDecision { request_id, approve } => {
                 let mut payload = request_id.to_be_bytes().to_vec();
                 payload.push(*approve as u8);
@@ -153,13 +236,8 @@ impl FromApp {
                 let capture_us = u64::from_be_bytes(payload[1..9].try_into().unwrap());
                 Ok(FromApp::AccessUnit { keyframe: payload[0] & FLAG_KEYFRAME != 0, capture_us, data: payload[9..].to_vec() })
             }
-            CAPTURE_STOPPED => {
-                if payload.len() > MAX_REASON {
-                    return Err(bad("CaptureStopped reason exceeds 1024 bytes"));
-                }
-                let reason = String::from_utf8(payload).map_err(|_| bad("CaptureStopped reason is not UTF-8"))?;
-                Ok(FromApp::CaptureStopped { reason })
-            }
+            CAPTURE_STOPPED => Ok(FromApp::CaptureStopped { reason: reason("CaptureStopped", payload)? }),
+            INPUT_UNAVAILABLE => Ok(FromApp::InputUnavailable { reason: reason("InputUnavailable", payload)? }),
             PAIRING_DECISION => {
                 if payload.len() != 9 {
                     return Err(bad("PairingDecision must be 9 bytes"));
@@ -214,18 +292,19 @@ mod tests {
 
     fn from_app() -> Vec<(&'static str, FromApp)> {
         vec![
-            ("01-hello", FromApp::Hello { version: 1 }),
+            ("01-hello", FromApp::Hello { version: 2 }),
             ("02-access-unit-key", FromApp::AccessUnit { keyframe: true, capture_us: 0x0102030405060708, data: SPS_PPS_IDR.to_vec() }),
             ("02-access-unit-delta", FromApp::AccessUnit { keyframe: false, capture_us: 0x0102030405064E20, data: DELTA.to_vec() }),
             ("03-capture-stopped", FromApp::CaptureStopped { reason: "display disconnected – ü".into() }),
             ("04-pairing-decision-approve", FromApp::PairingDecision { request_id: 0x0A0B0C0D0E0F1011, approve: true }),
             ("04-pairing-decision-deny", FromApp::PairingDecision { request_id: 7, approve: false }),
+            ("05-input-unavailable", FromApp::InputUnavailable { reason: "Accessibility not granted – ü".into() }),
         ]
     }
 
     fn to_app() -> Vec<(&'static str, ToApp)> {
         vec![
-            ("81-hello-ack", ToApp::HelloAck { version: 1 }),
+            ("81-hello-ack", ToApp::HelloAck { version: 2 }),
             ("82-start-stream", ToApp::StartStream),
             ("83-stop-stream", ToApp::StopStream),
             ("84-request-keyframe", ToApp::RequestKeyframe),
@@ -239,11 +318,20 @@ mod tests {
                 }),
             ),
             ("85-event-session", ToApp::Event(Event::Session { name: "latitude".into(), device_fingerprint: "1111 2222 3333 4444 5555 6666 7777 8888 9999 AAAA BBBB CCCC DDDD EEEE FFFF 0000".into() })),
+            ("86-pointer", ToApp::Pointer { x: 0x1234, y: 0xFFFF }),
+            ("87-button-left-down", ToApp::Button { button: 0, down: true }),
+            ("87-button-forward-up", ToApp::Button { button: 4, down: false }),
+            ("88-scroll-pixel", ToApp::Scroll { dx: -3, dy: 120, unit: 0 }),
+            ("88-scroll-line", ToApp::Scroll { dx: 0, dy: -100, unit: 1 }),
+            ("89-key-down", ToApp::Key { usage: 0x0004, state: 1 }),
+            ("89-key-up", ToApp::Key { usage: 0x00E3, state: 0 }),
+            ("89-key-repeat", ToApp::Key { usage: 0x0028, state: 2 }),
+            ("8a-release-all", ToApp::ReleaseAll),
         ]
     }
 
     fn golden(name: &str) -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/local-v1").join(format!("{name}.bin"))
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/local-v2").join(format!("{name}.bin"))
     }
 
     /// Compares against the checked-in vectors; NOCOMPUTER_WRITE_GOLDEN=1 rewrites them.
@@ -271,6 +359,23 @@ mod tests {
         FromApp::read(&mut &bytes[..]).await
     }
 
+    #[test]
+    fn input_maps_to_frames() {
+        use nocomputer_proto::{Button, Input, KeyState, ScrollUnit};
+        let cases = [
+            (Input::PointerMove { x: 1, y: 2 }, Some(ToApp::Pointer { x: 1, y: 2 })),
+            (Input::PointerButton { button: Button::Middle, down: true }, Some(ToApp::Button { button: 2, down: true })),
+            (Input::PointerButton { button: Button::Unknown, down: true }, None),
+            (Input::Scroll { dx: 50_000, dy: -1, unit: ScrollUnit::Pixel }, Some(ToApp::Scroll { dx: 10_000, dy: -1, unit: 0 })),
+            (Input::Scroll { dx: 0, dy: -500, unit: ScrollUnit::Line }, Some(ToApp::Scroll { dx: 0, dy: -100, unit: 1 })),
+            (Input::Key { usage: 0xE3, state: KeyState::Repeat }, Some(ToApp::Key { usage: 0xE3, state: 2 })),
+            (Input::ReleaseAll, Some(ToApp::ReleaseAll)),
+        ];
+        for (input, frame) in cases {
+            assert_eq!(ToApp::from_input(input), frame, "{input:?}");
+        }
+    }
+
     #[tokio::test]
     async fn malformed_frames_are_fatal() {
         assert!(matches!(read(&[]).await, Err(Error::Eof)));
@@ -287,5 +392,8 @@ mod tests {
         let mut long = vec![0, 0, 0x04, 0x02, 0x03];
         long.extend(std::iter::repeat_n(b'a', 1025));
         assert!(matches!(read(&long).await, Err(Error::Protocol(_))), "reason over 1024 bytes");
+        long[4] = 0x05;
+        assert!(matches!(read(&long).await, Err(Error::Protocol(_))), "InputUnavailable reason over 1024 bytes");
+        assert!(matches!(read(&[0, 0, 0, 1, 0x86]).await, Err(Error::Protocol(_))), "app-bound input type");
     }
 }

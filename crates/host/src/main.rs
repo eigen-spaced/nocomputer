@@ -1,20 +1,22 @@
 //! nocomputer-host: serves paired viewers. Normally spawned by the capture app with no
-//! arguments and fed over stdin/stdout (local-v1, see `local.rs`); stdout carries only
-//! local-v1 frames and all logging goes to stderr.
+//! arguments and fed over stdin/stdout (local-v2, see `local.rs`); stdout carries only
+//! local-v2 frames and all logging goes to stderr.
 //!
 //!   nocomputer-host [--listen ADDR] [--name NAME] [--state-dir DIR] [--from-file X.h264]
 //!
 //! `--from-file` replays an Annex B file at 60 fps instead of reading the app, and turns
-//! stdin into a y/N console for pairing approvals, for testing without the app.
+//! stdin into a y/N console for pairing approvals, for testing without the app. Input
+//! from the viewer is then only counted.
 //!
-//! Exit codes: 0 when stdin closes, 1 on startup errors, 2 on a local-v1 version
-//! mismatch, 3 on any other local-v1 violation.
+//! Exit codes: 0 when stdin closes, 1 on startup errors, 2 on a local-v2 version
+//! mismatch, 3 on any other local-v2 violation.
 
 use nocomputer_host::h264::{self, Kind};
+use nocomputer_host::input::InputQueue;
 use nocomputer_host::local::{self, Event, FromApp, ToApp};
 use nocomputer_proto::{
-    load_or_create_identity, platform_keystore, wire::valid_device_name, AccessUnit, Approver, Host, HostConfig, HostEvent, PairedClients,
-    DEFAULT_PORT,
+    load_or_create_identity, platform_keystore, wire::valid_device_name, AccessUnit, Approver, Host, HostConfig, HostEvent, Notice, NoticeKind,
+    PairedClients, DEFAULT_PORT,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -118,15 +120,27 @@ enum Capture {
     Start,
     Stop,
     Keyframe,
+    /// Release all remote input; sent in order with Start and Stop.
+    ReleaseAll,
 }
 
 fn fp(f: &nocomputer_proto::Fingerprint) -> String {
     f.to_string()
 }
 
-/// Turns host events into capture commands (with keyframe requests rate-limited) and
-/// display events.
-async fn route_events(mut events: mpsc::UnboundedReceiver<HostEvent>, capture: mpsc::UnboundedSender<Capture>, notices: mpsc::UnboundedSender<Event>) {
+/// Turns host events into capture commands (with keyframe requests rate-limited), input
+/// and display events. Input held by a session is released when any session starts or
+/// ends.
+async fn route_events(
+    mut events: mpsc::UnboundedReceiver<HostEvent>,
+    capture: mpsc::UnboundedSender<Capture>,
+    input: Arc<InputQueue>,
+    notices: mpsc::UnboundedSender<Event>,
+) {
+    let release = || {
+        input.clear();
+        let _ = capture.send(Capture::ReleaseAll);
+    };
     let mut sessions = 0usize;
     let mut last_keyframe: Option<Instant> = None;
     let mut deferred: Option<Instant> = None;
@@ -148,6 +162,7 @@ async fn route_events(mut events: mpsc::UnboundedReceiver<HostEvent>, capture: m
         };
         match event {
             HostEvent::Session { device, name, .. } => {
+                release();
                 sessions += 1;
                 if sessions == 1 {
                     let _ = capture.send(Capture::Start);
@@ -157,6 +172,7 @@ async fn route_events(mut events: mpsc::UnboundedReceiver<HostEvent>, capture: m
                 let _ = notices.send(Event::Session { name, device_fingerprint: fp(&device) });
             }
             HostEvent::SessionEnded { device } => {
+                release();
                 sessions = sessions.saturating_sub(1);
                 if sessions == 0 {
                     deferred = None;
@@ -178,6 +194,12 @@ async fn route_events(mut events: mpsc::UnboundedReceiver<HostEvent>, capture: m
                 }
             }
             HostEvent::KeyframeNeeded => {}
+            HostEvent::Input(i) if sessions > 0 => {
+                if let Some(frame) = ToApp::from_input(i) {
+                    input.push(frame);
+                }
+            }
+            HostEvent::Input(_) => {}
             HostEvent::Paired { device, name } => {
                 let _ = notices.send(Event::Paired { name, device_fingerprint: fp(&device) });
             }
@@ -255,6 +277,7 @@ async fn run() -> Result<(), Exit> {
     let (events_tx, events) = mpsc::unbounded_channel();
     let (capture_tx, capture) = mpsc::unbounded_channel();
     let (notices_tx, notices) = mpsc::unbounded_channel();
+    let input = Arc::new(InputQueue::default());
     let pending: Pending = Arc::default();
     let approver = match o.replay {
         Some(_) => console_approver(pending.clone()),
@@ -266,13 +289,13 @@ async fn run() -> Result<(), Exit> {
     let host = Arc::new(Host::bind(o.listen, &identity, config, clients, approver).map_err(Exit::startup)?);
     eprintln!("nocomputer-host: \"{}\" listening on {}", o.name, host.local_addr().map_err(Exit::startup)?);
     eprintln!("nocomputer-host: this host is {}", host.fingerprint());
-    tokio::spawn(route_events(events, capture_tx, notices_tx));
+    tokio::spawn(route_events(events, capture_tx, input.clone(), notices_tx));
     let runner = host.clone();
     tokio::spawn(async move { runner.run().await });
 
     let result = match o.replay {
-        Some(path) => replay(&host, &path, capture, notices, pending).await,
-        None => serve_app(&host, stdin, capture, notices, pending).await,
+        Some(path) => replay(&host, &path, capture, input, notices, pending).await,
+        None => serve_app(&host, stdin, capture, input, notices, pending).await,
     };
     host.close();
     result
@@ -283,12 +306,13 @@ async fn serve_app(
     host: &Arc<Host>,
     mut stdin: tokio::io::Stdin,
     mut capture: mpsc::UnboundedReceiver<Capture>,
+    input: Arc<InputQueue>,
     mut notices: mpsc::UnboundedReceiver<Event>,
     pending: Pending,
 ) -> Result<(), Exit> {
-
-    // One writer owns stdout, so frames never interleave. On shutdown it writes what is
-    // already queued, then stops.
+    // One writer owns stdout, so frames never interleave. Control frames go first; input
+    // is ordered among itself. On shutdown it writes the control frames already queued,
+    // then stops.
     let (out_tx, mut out) = mpsc::unbounded_channel::<ToApp>();
     let (stop_tx, mut stop) = oneshot::channel::<()>();
     let writer = tokio::spawn(async move {
@@ -297,6 +321,7 @@ async fn serve_app(
             let message = tokio::select! {
                 biased;
                 Some(m) = out.recv() => m,
+                m = input.pop() => m,
                 _ = &mut stop => {
                     while let Ok(m) = out.try_recv() {
                         if stdout.write_all(&m.encode()).await.is_err() {
@@ -321,6 +346,7 @@ async fn serve_app(
                     Capture::Start => ToApp::StartStream,
                     Capture::Stop => ToApp::StopStream,
                     Capture::Keyframe => ToApp::RequestKeyframe,
+                    Capture::ReleaseAll => ToApp::ReleaseAll,
                 },
                 Some(e) = notices.recv() => ToApp::Event(e),
                 else => return,
@@ -338,7 +364,14 @@ async fn serve_app(
                     break Err(Exit(3, format!("access unit: {e}")));
                 }
             }
-            Ok(FromApp::CaptureStopped { reason }) => eprintln!("nocomputer-host: capture stopped: {reason}"),
+            Ok(FromApp::CaptureStopped { reason }) => {
+                eprintln!("nocomputer-host: capture stopped: {reason}");
+                host.notice(Notice { kind: NoticeKind::CaptureStopped, message: reason });
+            }
+            Ok(FromApp::InputUnavailable { reason }) => {
+                eprintln!("nocomputer-host: input unavailable: {reason}");
+                host.notice(Notice { kind: NoticeKind::InputUnavailable, message: reason });
+            }
             Ok(FromApp::PairingDecision { request_id, approve }) => {
                 let mut slot = pending.lock().unwrap();
                 if slot.as_ref().is_some_and(|(id, _)| *id == request_id) {
@@ -362,7 +395,14 @@ async fn serve_app(
 }
 
 /// Test mode: replays a file as if the app were capturing, with a console for approvals.
-async fn replay(host: &Arc<Host>, path: &std::path::Path, mut capture: mpsc::UnboundedReceiver<Capture>, mut notices: mpsc::UnboundedReceiver<Event>, pending: Pending) -> Result<(), Exit> {
+async fn replay(
+    host: &Arc<Host>,
+    path: &std::path::Path,
+    mut capture: mpsc::UnboundedReceiver<Capture>,
+    input: Arc<InputQueue>,
+    mut notices: mpsc::UnboundedReceiver<Event>,
+    pending: Pending,
+) -> Result<(), Exit> {
     let data = std::fs::read(path).map_err(|e| Exit::startup(format!("{}: {e}", path.display())))?;
     let units: Vec<(bool, Vec<u8>)> = h264::access_units(&data)
         .into_iter()
@@ -382,6 +422,7 @@ async fn replay(host: &Arc<Host>, path: &std::path::Path, mut capture: mpsc::Unb
             eprintln!("nocomputer-host: {}", serde_json::to_string(&e).unwrap_or_default());
         }
     });
+    tokio::spawn(count_input(input));
     tokio::spawn(async move {
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -404,6 +445,7 @@ async fn replay(host: &Arc<Host>, path: &std::path::Path, mut capture: mpsc::Unb
                     next = keyframes[0];
                 }
                 Some(Capture::Stop) => streaming = false,
+                Some(Capture::ReleaseAll) => {}
                 // Like a forced IDR: jump to the next keyframe in the file.
                 Some(Capture::Keyframe) => next = keyframes.iter().copied().find(|&k| k >= next).unwrap_or(keyframes[0]),
             },
@@ -412,6 +454,28 @@ async fn replay(host: &Arc<Host>, path: &std::path::Path, mut capture: mpsc::Unb
                 submit(host, *keyframe, unit.clone()).map_err(|e| Exit(3, e))?;
                 next = (next + 1) % units.len();
             }
+        }
+    }
+}
+
+/// Replay mode has nothing to inject into: report how much input arrived, by kind only,
+/// at most once a second.
+async fn count_input(input: Arc<InputQueue>) {
+    let mut counts = [0u64; 5];
+    let mut last_report = Instant::now();
+    loop {
+        let kind = match input.pop().await {
+            ToApp::Pointer { .. } => 0,
+            ToApp::Button { .. } => 1,
+            ToApp::Scroll { .. } => 2,
+            ToApp::Key { .. } => 3,
+            _ => 4,
+        };
+        counts[kind] += 1;
+        if last_report.elapsed() >= Duration::from_secs(1) {
+            last_report = Instant::now();
+            let [moves, buttons, scrolls, keys, releases] = counts;
+            eprintln!("nocomputer-host: input so far: {moves} moves, {buttons} buttons, {scrolls} scrolls, {keys} keys, {releases} release-alls");
         }
     }
 }
@@ -430,10 +494,10 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    /// stdout belongs to local-v1 frames.
+    /// stdout belongs to local-v2 frames.
     #[test]
     fn nothing_prints_to_stdout() {
-        for (name, source) in [("main.rs", include_str!("main.rs")), ("local.rs", include_str!("local.rs")), ("h264.rs", include_str!("h264.rs"))] {
+        for (name, source) in [("main.rs", include_str!("main.rs")), ("local.rs", include_str!("local.rs")), ("h264.rs", include_str!("h264.rs")), ("input.rs", include_str!("input.rs"))] {
             let code = source.split("#[cfg(test)]").next().unwrap();
             for mac in [concat!("print", "ln!"), concat!("print", "!"), concat!("dbg", "!")] {
                 let stdout = code.match_indices(mac).any(|(i, _)| !code[..i].ends_with('e'));

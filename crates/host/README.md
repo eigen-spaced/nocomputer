@@ -2,23 +2,25 @@
 
 The host process. The Mac capture app spawns it from its bundle with no arguments. The app feeds it encoded video over stdin/stdout, and it serves paired viewers with `nocomputer-proto`. The app keeps the Screen Recording and Accessibility permissions; this process needs only the network and its own key.
 
-## Pipe contract (local-v1)
+## Pipe contract (local-v2)
 
-The contract is specified in `src/local.rs`, with golden vectors in `testdata/local-v1/`.
-- **App to host:** Hello, encoded access units, capture-stopped notices, and pairing decisions.
-- **Host to app:** HelloAck; start/stop stream when a controlling session begins or ends; keyframe requests, rate-limited to one per 500 ms; and display events.
+The contract is specified in `src/local.rs`, with golden vectors in `testdata/local-v2/`.
+- **App to host:** Hello, encoded access units, capture-stopped and input-unavailable notices (both forwarded to the viewer), and pairing decisions.
+- **Host to app:** HelloAck; start/stop stream when a controlling session begins or ends; keyframe requests, rate-limited to one per 500 ms; display events; and input from the controlling session.
+
+Input is ordered. Consecutive pointer moves coalesce while the app is busy; buttons, keys and scrolls are never coalesced. A backlog of 1024 frames first sheds moves, then is discarded and replaced by ReleaseAll; a working app never gets there. The host sends ReleaseAll whenever a session starts or ends, before StopStream, so nothing stays held when a viewer goes away. Input contents are never logged; replay mode prints counts by kind only.
 
 Pairing prompts go to the app with a fresh `request_id`. Only a decision carrying the id of the current prompt resolves it, so a late answer can't approve a later request. The pipe is the only approval path.
 
 Each access unit is checked against its keyframe flag. A keyframe must be an IDR with an in-band SPS and PPS. The WebCodecs codec string (`avc1.PPCCLL`) is taken from that SPS, so a new resolution simply arrives with the next IDR.
 
-stdout carries only local-v1 frames; logs go to stderr. A test fails if stdout printing appears in the source.
+stdout carries only local-v2 frames; logs go to stderr. A test fails if stdout printing appears in the source.
 
 Exit codes:
 - 0: stdin closed
 - 1: startup error (bind, key storage)
-- 2: local-v1 version mismatch
-- 3: any other local-v1 violation
+- 2: local-v2 version mismatch
+- 3: any other local-v2 violation
 
 ## Defaults
 
@@ -39,16 +41,16 @@ This mode replays the file at 60 fps while a viewer is connected. A keyframe req
 
 ## Status (2026-10-13, Windows)
 
-- 13 tests pass:
+- 17 tests pass:
   - golden vectors and malformed frames;
+  - input coalescing and backlog handling;
   - H.264 checks against the fixture (90 AUs, IDRs at 0 and 60);
   - the binary over real pipes (exit codes 0/2/3, HelloAck bytes);
+  - end to end through the app pipe: a viewer pairs through an app-side approval, its input arrives on stdout in order and sanitized, an app notice reaches the viewer, and held input is released before StopStream when the viewer leaves;
   - end to end on loopback: the real binary replays the fixture, and a viewer pairs through the console, receives 120 frames in order from a keyframe at about 60 fps, and gets an IDR soon after requesting one.
 - The full suite passed 20 times in a row, and clippy is clean.
 - A manual loopback run of `nocomputer-pair watch` received 60 frames per second.
 - The replay's frame spacing has gaps of up to 32 ms on Windows, because of timer granularity. Replay pacing only, not the real capture path.
 
 Not yet done:
-- the run with the Mac app;
-- telling the viewer when capture stops;
-- the viewer app (decode and display).
+- input between machines, with the Mac app injecting it.

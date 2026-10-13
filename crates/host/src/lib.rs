@@ -2,4 +2,5 @@
 //! over a local pipe (see [`local`]); it serves paired viewers with `nocomputer-proto`.
 
 pub mod h264;
+pub mod input;
 pub mod local;

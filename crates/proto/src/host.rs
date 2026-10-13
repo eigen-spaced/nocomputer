@@ -2,6 +2,7 @@
 //! and runs locally approved pairing for unknown devices.
 
 use crate::identity::{Fingerprint, Identity};
+use crate::input::{Input, Notice, MAX_NOTICE};
 use crate::tls;
 use crate::trust::{ClientStatus, PairedClients};
 use crate::video::{self, AccessUnit, Pushed, VideoQueue};
@@ -43,6 +44,9 @@ pub enum HostEvent {
     /// The capture side should encode a keyframe soon: a session started, the viewer
     /// asked, or the host dropped frames for a slow viewer. Rate-limit before acting.
     KeyframeNeeded,
+    /// From the controlling session, sanitized (see [`Input::sanitized`]). Inject it
+    /// promptly, and release everything held when the session ends.
+    Input(Input),
 }
 
 pub struct HostConfig {
@@ -74,8 +78,14 @@ struct Inner {
     live: Mutex<HashMap<Fingerprint, Vec<quinn::Connection>>>,
     /// The one controlling session.
     controller: Mutex<Option<(Fingerprint, quinn::Connection)>>,
-    /// Video for the controlling session, keyed by its connection's stable id.
-    video: Mutex<Option<(usize, Arc<VideoQueue>)>>,
+    /// The controlling session's outputs, keyed by its connection's stable id.
+    outputs: Mutex<Option<Outputs>>,
+}
+
+struct Outputs {
+    id: usize,
+    video: Arc<VideoQueue>,
+    notices: tokio::sync::mpsc::UnboundedSender<Notice>,
 }
 
 pub struct Host {
@@ -101,7 +111,7 @@ impl Host {
             return Err(Error::Protocol("invalid host name".into()));
         }
         let endpoint = quinn::Endpoint::server(tls::finish_server(tls)?, addr)?;
-        let inner = Inner { fingerprint, config, clients: Mutex::new(clients), approver, gate: Mutex::default(), live: Mutex::default(), controller: Mutex::default(), video: Mutex::default() };
+        let inner = Inner { fingerprint, config, clients: Mutex::new(clients), approver, gate: Mutex::default(), live: Mutex::default(), controller: Mutex::default(), outputs: Mutex::default() };
         Ok(Host { endpoint, inner: Arc::new(inner) })
     }
 
@@ -142,11 +152,25 @@ impl Host {
     /// falls behind, frames are dropped up to the next keyframe and
     /// [`HostEvent::KeyframeNeeded`] is emitted.
     pub fn send_access_unit(&self, au: AccessUnit) {
-        let queue = self.inner.video.lock().unwrap().as_ref().map(|(_, q)| q.clone());
+        let queue = self.inner.outputs.lock().unwrap().as_ref().map(|o| o.video.clone());
         if let Some(queue) = queue {
             if let Pushed::NeedKeyframe = queue.push(au) {
                 self.inner.emit(HostEvent::KeyframeNeeded);
             }
+        }
+    }
+
+    /// Tells the controlling session, if any. Messages are cut to [`MAX_NOTICE`] bytes.
+    pub fn notice(&self, mut notice: Notice) {
+        if notice.message.len() > MAX_NOTICE {
+            let mut end = MAX_NOTICE;
+            while !notice.message.is_char_boundary(end) {
+                end -= 1;
+            }
+            notice.message.truncate(end);
+        }
+        if let Some(o) = self.inner.outputs.lock().unwrap().as_ref() {
+            let _ = o.notices.send(notice);
         }
     }
 }
@@ -198,14 +222,15 @@ impl Inner {
                     return refuse(&mut send, ErrorCode::Busy, "another device is connected to this host").await;
                 }
                 let queue = VideoQueue::new();
+                let (notices_tx, notices) = tokio::sync::mpsc::unbounded_channel();
                 let result = async {
                     write_msg(&mut send, &Message::Welcome { version: PROTOCOL_VERSION, host_name: self.config.name.clone(), paired: true }).await?;
                     self.live.lock().unwrap().entry(device).or_default().push(conn.clone());
                     self.emit(HostEvent::Session { device, name, reported_name: device_name });
-                    *self.video.lock().unwrap() = Some((conn.stable_id(), queue.clone()));
+                    *self.outputs.lock().unwrap() = Some(Outputs { id: conn.stable_id(), video: queue.clone(), notices: notices_tx });
                     tokio::spawn(video::send_loop(conn.clone(), queue.clone()));
                     self.emit(HostEvent::KeyframeNeeded);
-                    let result = session(&mut send, &mut recv, || self.emit(HostEvent::KeyframeNeeded)).await;
+                    let result = self.session(&mut send, recv, notices).await;
                     if let Some(conns) = self.live.lock().unwrap().get_mut(&device) {
                         conns.retain(|c| c.stable_id() != conn.stable_id());
                     }
@@ -215,9 +240,9 @@ impl Inner {
                 .await;
                 queue.close();
                 {
-                    let mut video = self.video.lock().unwrap();
-                    if video.as_ref().is_some_and(|(id, _)| *id == conn.stable_id()) {
-                        *video = None;
+                    let mut outputs = self.outputs.lock().unwrap();
+                    if outputs.as_ref().is_some_and(|o| o.id == conn.stable_id()) {
+                        *outputs = None;
                     }
                 }
                 self.release_control(conn);
@@ -295,15 +320,46 @@ async fn refuse(send: &mut quinn::SendStream, code: ErrorCode, message: &str) ->
     Err(Error::Remote { code, message: message.to_string() })
 }
 
-/// Authorized control loop: keepalive pings and keyframe requests.
-async fn session(send: &mut quinn::SendStream, recv: &mut quinn::RecvStream, keyframe_needed: impl Fn()) -> Result<(), Error> {
-    loop {
-        match read_msg(recv).await {
-            Ok(Message::Ping { seq }) => write_msg(send, &Message::Pong { seq }).await?,
-            Ok(Message::RequestKeyframe) => keyframe_needed(),
-            Ok(_) => return refuse(send, ErrorCode::BadRequest, "unexpected message").await,
-            // The viewer finished its stream or closed the connection.
-            Err(_) => return Ok(()),
-        }
+/// Messages read ahead from the controller. A full buffer stops reading, which pushes
+/// back on the viewer through QUIC flow control.
+const READ_AHEAD: usize = 64;
+
+impl Inner {
+    /// Authorized control loop: keepalive pings, keyframe requests and input from the
+    /// viewer; notices to it.
+    async fn session(
+        &self,
+        send: &mut quinn::SendStream,
+        mut recv: quinn::RecvStream,
+        mut notices: tokio::sync::mpsc::UnboundedReceiver<Notice>,
+    ) -> Result<(), Error> {
+        // Reading happens in its own task: a read cut short by a notice would lose data.
+        let (tx, mut messages) = tokio::sync::mpsc::channel(READ_AHEAD);
+        let reader = tokio::spawn(async move {
+            while let Ok(m) = read_msg(&mut recv).await {
+                if tx.send(m).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let result = loop {
+            tokio::select! {
+                m = messages.recv() => match m {
+                    Some(Message::Ping { seq }) => write_msg(send, &Message::Pong { seq }).await?,
+                    Some(Message::RequestKeyframe) => self.emit(HostEvent::KeyframeNeeded),
+                    Some(Message::Input(input)) => {
+                        if let Some(input) = input.sanitized() {
+                            self.emit(HostEvent::Input(input));
+                        }
+                    }
+                    Some(_) => break refuse(send, ErrorCode::BadRequest, "unexpected message").await,
+                    // The viewer finished its stream or closed the connection.
+                    None => break Ok(()),
+                },
+                Some(notice) = notices.recv() => write_msg(send, &Message::Notice(notice)).await?,
+            }
+        };
+        reader.abort();
+        result
     }
 }

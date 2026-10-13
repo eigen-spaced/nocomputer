@@ -325,7 +325,7 @@ async fn version_mismatch_is_refused() {
     let endpoint = quinn::Endpoint::client(LOOPBACK.into()).unwrap();
     let conn = endpoint.connect_with(tls::finish_client(tls).unwrap(), host.addr, crate::SERVER_NAME).unwrap().await.unwrap();
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    write_msg(&mut send, &Message::Hello { min_version: 2, max_version: 3, device_name: "future".into() }).await.unwrap();
+    write_msg(&mut send, &Message::Hello { min_version: crate::PROTOCOL_VERSION + 1, max_version: crate::PROTOCOL_VERSION + 2, device_name: "future".into() }).await.unwrap();
     match read_msg(&mut recv).await.unwrap() {
         Message::Error { code: ErrorCode::VersionUnsupported, .. } => {}
         other => panic!("expected version_unsupported, got {other:?}"),
@@ -582,4 +582,80 @@ async fn reset_gop_never_reaches_the_decoder_without_its_keyframe() {
 
     let after: Vec<_> = [video.next().await.unwrap(), video.next().await.unwrap()].into_iter().map(|f| (f.keyframe, f.data)).collect();
     assert_eq!(after, vec![(true, vec![5]), (false, vec![6])]);
+}
+
+#[test]
+fn input_and_notices_have_a_fixed_json_shape() {
+    use crate::{Button, Input, KeyState, Notice, NoticeKind, ScrollUnit};
+    let cases = [
+        (Message::Input(Input::PointerMove { x: 0, y: 65535 }), r#"{"type":"input","kind":"pointer_move","x":0,"y":65535}"#),
+        (Message::Input(Input::PointerButton { button: Button::Right, down: true }), r#"{"type":"input","kind":"pointer_button","button":"right","down":true}"#),
+        (Message::Input(Input::Scroll { dx: 0, dy: -120, unit: ScrollUnit::Pixel }), r#"{"type":"input","kind":"scroll","dx":0,"dy":-120,"unit":"pixel"}"#),
+        (Message::Input(Input::Key { usage: 0xE3, state: KeyState::Repeat }), r#"{"type":"input","kind":"key","usage":227,"state":"repeat"}"#),
+        (Message::Input(Input::ReleaseAll), r#"{"type":"input","kind":"release_all"}"#),
+        (
+            Message::Notice(Notice { kind: NoticeKind::InputUnavailable, message: "no access".into() }),
+            r#"{"type":"notice","kind":"input_unavailable","message":"no access"}"#,
+        ),
+    ];
+    for (msg, json) in cases {
+        assert_eq!(serde_json::to_string(&msg).unwrap(), json);
+        assert_eq!(serde_json::from_str::<Message>(json).unwrap(), msg);
+    }
+    let future: Message = serde_json::from_str(r#"{"type":"input","kind":"pointer_button","button":"thumb","down":true}"#).unwrap();
+    assert_eq!(future, Message::Input(Input::PointerButton { button: Button::Unknown, down: true }));
+    assert!(serde_json::from_str::<Message>(r#"{"type":"input","kind":"pointer_move","x":70000,"y":0}"#).is_err());
+}
+
+#[test]
+fn the_host_sanitizes_input() {
+    use crate::{Button, Input, ScrollUnit};
+    assert_eq!(Input::PointerButton { button: Button::Unknown, down: true }.sanitized(), None);
+    assert_eq!(Input::Scroll { dx: i32::MIN, dy: 5, unit: ScrollUnit::Line }.sanitized(), Some(Input::Scroll { dx: -100, dy: 5, unit: ScrollUnit::Line }));
+    assert_eq!(Input::Scroll { dx: 0, dy: 99_999, unit: ScrollUnit::Pixel }.sanitized(), Some(Input::Scroll { dx: 0, dy: 10_000, unit: ScrollUnit::Pixel }));
+    assert_eq!(Input::Scroll { dx: 0, dy: 0, unit: ScrollUnit::Pixel }.sanitized(), None);
+}
+
+#[tokio::test]
+async fn input_reaches_the_host_in_order_and_notices_reach_the_viewer() {
+    use crate::{Button, HostEvent, Input, KeyState, Notice, NoticeKind};
+    let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
+    let mut config = HostConfig::new("test-host");
+    config.events = Some(events);
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let host = start(Host::bind(LOOPBACK.into(), &Identity::generate().unwrap(), config, PairedClients::in_memory(), approver(true, prompts.clone())).unwrap(), prompts);
+    let viewer = viewer();
+    let host_fp = pair(&viewer, &host).await;
+
+    // No session yet: nobody to tell.
+    host.host.notice(Notice { kind: NoticeKind::CaptureStopped, message: "nobody hears this".into() });
+    let Outcome::Ready(mut session) = viewer.connect(host.addr, Some(host_fp)).await.unwrap() else { panic!() };
+    let sent = [
+        Input::PointerMove { x: 1, y: 2 },
+        Input::PointerButton { button: Button::Left, down: true },
+        Input::PointerButton { button: Button::Unknown, down: true },
+        Input::Key { usage: 0x04, state: KeyState::Down },
+        Input::Key { usage: 0x04, state: KeyState::Repeat },
+        Input::Key { usage: 0x04, state: KeyState::Up },
+        Input::PointerButton { button: Button::Left, down: false },
+        Input::ReleaseAll,
+    ];
+    for input in sent {
+        session.input(input).await.unwrap();
+    }
+    session.ping().await.unwrap(); // everything before the ping has been handled
+    let inputs: Vec<Input> = drain(&mut seen).into_iter().filter_map(|e| if let HostEvent::Input(i) = e { Some(i) } else { None }).collect();
+    let expected: Vec<Input> = sent.into_iter().filter(|i| !matches!(i, Input::PointerButton { button: Button::Unknown, .. })).collect();
+    assert_eq!(inputs, expected);
+
+    let long = "é".repeat(crate::MAX_NOTICE);
+    host.host.notice(Notice { kind: NoticeKind::InputUnavailable, message: long });
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(5), session.notice()).await.unwrap().unwrap();
+    assert_eq!(notice.kind, NoticeKind::InputUnavailable);
+    assert_eq!(notice.message, "é".repeat(crate::MAX_NOTICE / 2), "cut to the byte limit on a character boundary");
+    // A notice between a ping and its pong doesn't disturb the ping.
+    host.host.notice(Notice { kind: NoticeKind::CaptureStopped, message: "display asleep".into() });
+    session.ping().await.unwrap();
+    assert_eq!(session.notice().await.unwrap().kind, NoticeKind::CaptureStopped);
+    session.close().await;
 }

@@ -1,6 +1,6 @@
 # nocomputer-proto
 
-Transport, device identity, pairing and video for nocomputer, shared by the viewer and host. QUIC (quinn) with TLS 1.3 (rustls, ring provider), mutually authenticated. There is no input or clipboard yet.
+Transport, device identity, pairing and video for nocomputer, shared by the viewer and host. QUIC (quinn) with TLS 1.3 (rustls, ring provider), mutually authenticated. Input goes from the controlling viewer to the host; there is no clipboard yet.
 
 ## Security model
 
@@ -32,7 +32,7 @@ On macOS, Keychain access control is bound to the code signature of the program 
 
 ## Wire format
 
-The viewer opens one bidirectional control stream. Each message is a 4-byte big-endian length, then one JSON object tagged by `type` (see `src/wire.rs`). Messages are capped at 64 KiB, checked before allocating. Unknown fields are ignored, for forward compatibility; unknown message types are errors. `Hello` carries `min_version`/`max_version`, and the host refuses ranges that exclude its version with `version_unsupported`. Video and input will use separate binary streams or datagrams, not this channel. ALPN is `nocomputer/1`, and the default port is 47900/UDP.
+The viewer opens one bidirectional control stream. Each message is a 4-byte big-endian length, then one JSON object tagged by `type` (see `src/wire.rs`). Messages are capped at 64 KiB, checked before allocating. Unknown fields are ignored, for forward compatibility; unknown message types are errors. `Hello` carries `min_version`/`max_version`, and the host refuses ranges that exclude its version with `version_unsupported`; the protocol version is 2. Video has its own streams. Input and notices are messages on this channel, so they stay ordered with the session. ALPN is `nocomputer/1`, and the default port is 47900/UDP.
 
 ## Video
 
@@ -40,6 +40,17 @@ The host sends H.264 to the controlling session on QUIC unidirectional streams, 
 - **Host:** `Host::send_access_unit` never blocks. Up to 8 frames queue for the viewer. On overflow the host resets the current stream, drops everything up to the next keyframe, and emits `HostEvent::KeyframeNeeded`. It also emits that event when a session starts and when the viewer calls `Session::request_keyframe`.
 - **Viewer:** `Session::video()` yields only frames whose GOP keyframe it has delivered. A reset or truncated stream is discarded, partial frame included. A stream that doesn't start at a keyframe is ignored. A newer GOP that has already arrived supersedes unread frames of the current one.
 - **Timestamps:** `host_us` is the host's monotonic clock, for differences between frames only.
+
+## Input
+
+The controlling viewer sends `{"type":"input","kind":...}` messages (see `src/input.rs`):
+- `pointer_move{x,y}`: 0..=65535 across the video picture, edges inclusive. The viewer never sends positions in the letterbox.
+- `pointer_button{button,down}`: left, right, middle, back or forward, at the last position.
+- `scroll{dx,dy,unit}`: pixel or line, with the DOM sign (positive `dy` scrolls toward the end of the document).
+- `key{usage,state}`: a USB HID keyboard usage, never a character, so the layout stays the host's concern. `state` is up, down or repeat. Any modifier remapping (which key sends Command) happens on the viewer.
+- `release_all`.
+
+The host drops unknown buttons, clamps scrolls to ±10000 px or ±100 lines, and emits each one as `HostEvent::Input`. Only one session exists at a time, so input comes only from the controller. The host's capture side reports problems through `Host::notice`, which reaches the viewer as `{"type":"notice","kind":"input_unavailable"|"capture_stopped","message":...}` (`Session::notice`). Neither side logs input contents.
 
 ## Manual test tool
 
@@ -56,7 +67,7 @@ nocomputer-pair clients | revoke FINGERPRINT | forget HOST[:PORT]
 
 ## Status
 
-Verified on Windows, 2026-10-13, on the target client: all 24 tests pass (`cargo test`, including the DPAPI store); `cargo clippy --all-targets` is clean; and a local `host`/`pair`/`connect` run with separate state folders works.
+Verified on Windows, 2026-10-13, on the target client: all 27 tests pass (`cargo test`, including the DPAPI store); `cargo clippy --all-targets` is clean; and a local `host`/`pair`/`connect` run with separate state folders works.
 
 Verified between machines, 2026-10-13: the Windows client paired with the MacBook Air host over the tailnet, with matching full fingerprints on both screens and approval on the Mac. Pinned reconnects then worked without prompting, with control-channel pings of 26–28 ms. Revoking the device on the Mac closed a live session from Windows, and the next connection was refused as revoked. The Mac side (build, Keychain store, tests) was run by the Mac session. Details are in `docs/development-plan.md`, Milestone 2.
 
@@ -65,5 +76,6 @@ Session names come from the pairing record. The name a device sends in `Hello` i
 Not yet verified:
 - Linux key storage.
 - Video between machines (the loopback path is tested here and in `crates/host`).
-- Input and clipboard streams.
+- Input between machines.
+- Clipboard.
 - Linking into the Tauri viewer and the Swift host.

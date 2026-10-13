@@ -1,13 +1,16 @@
 //! Control-channel messages: a 4-byte big-endian length, then one JSON object.
 //!
 //! Unknown fields are ignored so later versions can add fields; unknown message types
-//! are errors. Video and input will use separate binary streams, not this channel.
+//! are errors. Video uses its own streams (`video.rs`); input and notices are messages
+//! here, so they stay ordered with the rest of the session (`input.rs`).
 
+use crate::input::{Input, Notice};
 use crate::Error;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+/// 2 added input and notices.
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_CONTROL_MESSAGE: usize = 64 * 1024;
 pub const MAX_DEVICE_NAME_CHARS: usize = 64;
 
@@ -26,6 +29,10 @@ pub enum Message {
     /// Viewer -> host, in a session: the decoder needs a keyframe. No reply.
     RequestKeyframe,
     Pong { seq: u64 },
+    /// Viewer -> host, controlling session only. No reply.
+    Input(Input),
+    /// Host -> viewer, at any time in a session. No reply.
+    Notice(Notice),
     Error { code: ErrorCode, message: String },
 }
 
