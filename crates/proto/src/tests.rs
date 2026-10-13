@@ -2,7 +2,7 @@
 
 use crate::host::{Approver, Host, HostConfig};
 use crate::wire::{read_msg, valid_device_name, write_msg, ErrorCode, Message, MAX_CONTROL_MESSAGE};
-use crate::{tls, Error, Fingerprint, Identity, KeyStore, MemoryKeyStore, Outcome, PairedClients, Viewer};
+use crate::{tls, Error, Fingerprint, Identity, MemoryKeyStore, Outcome, PairedClients, Viewer};
 use rustls::sign::CertifiedKey;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -355,6 +355,7 @@ fn known_hosts_pin_by_address() {
 #[cfg(windows)]
 #[test]
 fn dpapi_store_round_trips_and_does_not_store_plaintext() {
+    use crate::KeyStore;
     let dir = std::env::temp_dir().join(format!("nocomputer-proto-dpapi-{}", std::process::id()));
     let path = dir.join("identity.dpapi");
     let store = crate::keystore::dpapi::DpapiKeyStore::new(path.clone());
