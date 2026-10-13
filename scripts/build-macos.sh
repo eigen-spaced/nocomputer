@@ -8,13 +8,22 @@ app_path="$PWD/build/NoComputer Diagnostics.app"
 mkdir -p "$app_path/Contents/MacOS"
 cp resources/Info.plist "$app_path/Contents/Info.plist"
 cp "$binary_dir/NoComputerDiagnostics" "$app_path/Contents/MacOS/NoComputerDiagnostics"
-# Local ad-hoc signing is enough to build/run; TCC identity stability must be
-# tested across rebuilds. A real development certificate can be supplied later.
-signing_identity="${NOCOMPUTER_SIGN_IDENTITY:--}"
+# A stable certificate keeps the designated requirement (and so TCC/Keychain
+# grants) unchanged across rebuilds; ad-hoc signing pins each binary's cdhash.
+# Prefer NOCOMPUTER_SIGN_IDENTITY, then the local self-signed development
+# identity described in docs/macos-feasibility.md, then ad-hoc.
+default_identity="nocomputer Local Development"
+if [ -n "${NOCOMPUTER_SIGN_IDENTITY:-}" ]; then
+    signing_identity="$NOCOMPUTER_SIGN_IDENTITY"
+elif security find-identity -p codesigning | grep -q "\"$default_identity\""; then
+    signing_identity="$default_identity"
+else
+    signing_identity="-"
+fi
 codesign --force --sign "$signing_identity" "$app_path"
 codesign --verify --strict "$app_path"
 if [ "$signing_identity" = "-" ]; then
     printf '%s\n' 'Ad-hoc signing: changed builds may invalidate Accessibility/Screen Recording grants even if Settings shows them enabled.'
-    printf '%s\n' 'For stable development signing, supply an existing certificate via NOCOMPUTER_SIGN_IDENTITY. No privacy settings have been reset.'
+    printf '%s\n' 'For stable development signing, create the local identity (docs/macos-feasibility.md) or set NOCOMPUTER_SIGN_IDENTITY. No privacy settings have been reset.'
 fi
 printf 'Built %s\n' "$app_path"

@@ -7,7 +7,7 @@ bash scripts/build-macos.sh
 open "build/NoComputer Diagnostics.app"
 ```
 
-The package has no external dependencies. The current app builds with Command Line Tools, without full Xcode. The stable bundle identifier is `dev.nocomputer.diagnostics`. Local builds use ad-hoc signing; permission persistence across rebuilds is not established. Optionally set `NOCOMPUTER_SIGN_IDENTITY` to an existing development signing identity for the build script. Do not reset privacy permissions indiscriminately.
+The package has no external dependencies. The current app builds with Command Line Tools, without full Xcode. The stable bundle identifier is `dev.nocomputer.diagnostics`. Local builds sign with the local `nocomputer Local Development` identity when present (see [Development signing](#development-signing-and-stale-permissions)), otherwise ad-hoc. `NOCOMPUTER_SIGN_IDENTITY` overrides both. Do not reset privacy permissions indiscriminately.
 
 Launch does not start capture, request permissions, post input, or prevent sleep. Use the buttons to request Screen Recording and Accessibility when ready. macOS may require granting access in System Settings and relaunching. Refresh permissions after changing them.
 
@@ -224,7 +224,9 @@ On 2026-10-01 the user reported Accessibility appearing enabled in Settings but 
 
 For now, check effective permission status in the app after rebuilding. If stale, quit it, remove/re-add only this app in the relevant privacy pane, grant permission, and reopen. Do not reset unrelated apps or the whole privacy database.
 
-The durable development fix is to use the same certificate-backed code-signing identity across builds, supplied through `NOCOMPUTER_SIGN_IDENTITY`. Certificate/keychain setup is not implemented or changed by this project. Do not weaken the designated requirement to only a bundle ID to avoid reauthorization. Apple explains how [compatible designated requirements share privacy access](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).
+The durable development fix is to use the same certificate-backed code-signing identity across builds. Do not weaken the designated requirement to only a bundle ID to avoid reauthorization. Apple explains how [compatible designated requirements share privacy access](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).
+
+Stable local signing (2026-10-13, user-approved): a self-signed code-signing certificate, `nocomputer Local Development` (RSA 2048, critical `codeSigning` extended key usage, valid to 2036-10-10, certificate SHA-1 `670422BFC61AA432B9E8101BB7DBA7EE83A71EB7`), was created with `/usr/bin/openssl` and imported into the login keychain with access limited to `/usr/bin/codesign`. The temporary key and PKCS#12 files were deleted after import. It is not marked trusted; codesign does not need trust to sign, so `security find-identity -v` lists it as `CSSMERR_TP_NOT_TRUSTED`, and no system trust settings were changed. The first signing required the user to allow codesign access to the key. `scripts/build-macos.sh` uses `NOCOMPUTER_SIGN_IDENTITY` if set, otherwise this identity if present, otherwise ad-hoc. The designated requirement is now `identifier "dev.nocomputer.diagnostics" and certificate leaf = H"670422bf…1eb7"`, and it is unchanged across rebuilds. Existing Screen Recording/Accessibility grants were made against the old ad-hoc `cdhash`, so they need re-granting once for this signature. Persistence of those grants across later rebuilds still needs a manual check. The certificate is local to this Mac and is not a distribution identity. To recreate it elsewhere, generate an equivalent certificate; never commit the key.
 
 ## API references
 
