@@ -137,7 +137,8 @@ function draw() {
       + `, jitter ${jitter}, queue ${info.queue}`;
     const keyboard = info.keyboard ? ` | ${info.keyboard}` : '';
     const timing = info.keyTiming ? ` | ${info.keyTiming}` : '';
-    statusText.textContent = `${info.host ?? ''} ${info.codec} ${info.decode} | ${info.decoded} frames | ${view.mode} | ${state} | ${video}${keyboard}${timing}${notice} | ${keys} | `;
+    const clipboard = info.clipboard ? ` | ${info.clipboard}` : '';
+    statusText.textContent = `${info.host ?? ''} ${info.codec} ${info.decode} | ${info.decoded} frames | ${view.mode} | ${state} | ${video}${keyboard}${timing}${clipboard}${notice} | ${keys} | `;
   } else {
     const state = info.error ? `error: ${info.error}` : info.ended ? 'ended (holding last frame)' : 'playing';
     statusText.textContent = `${info.codec} ${info.decode} | ${info.decoded}/${info.total} frames | ${view.mode} | ${state} | ${keys}`;
@@ -244,7 +245,10 @@ async function live(launch) {
   };
   info.decode = ACCELERATION[launch.decode];
   info.live = true;
-  if (!launch.check) startInput(launch);
+  if (!launch.check) {
+    startInput(launch);
+    await clipboardSwitch(); // before the session starts, so a saved "off" holds from the start
+  }
   let decoder = null, codec = null, waitingForKey = true, lastHostUs = null;
   const shown = []; // performance.now() of recent outputs, for the frame rate
   // Arrival jitter: how far each arrival gap (this clock) strays from its capture gap
@@ -478,6 +482,11 @@ function startInput(launch) {
     if (!i) return;
     info.notice = i.notice;
     if (info.hook) info.keyboard = i.keyboard_active ? `keys on (${i.keys_sent} sent)` : `keys off (${i.keyboard_off ?? 'unknown'})`;
+    const c = i.clipboard;
+    if (c) {
+      const counts = `${c.sent} sent, ${c.received} received, ${c.skipped} skipped${c.failed ? `, ${c.failed} failed` : ''}`;
+      info.clipboard = c.on ? `clipboard ${counts}` : `clipboard off${c.error ? ` (${c.error})` : ''}`;
+    }
     const ms = (avg, max) => `${avg.toFixed(0)}/${max.toFixed(0)}`;
     if (i.key_frame?.n) {
       const shown = info.keyShown ? `, shown ${ms(info.keyShown.avg, info.keyShown.max)}` : '';
@@ -485,6 +494,27 @@ function startInput(launch) {
     }
     draw();
   }, 1000);
+}
+
+// Shares plain-text copies with the host; on unless switched off. Only counts are shown.
+async function clipboardSwitch() {
+  statusEl.classList.add('interactive');
+  const label = document.createElement('label');
+  label.title = 'Share copied text with the host, both ways. Text that apps mark private (password managers) is never sent.';
+  const box = document.createElement('input');
+  box.type = 'checkbox';
+  let saved = null;
+  try { saved = localStorage.getItem('clipboard'); } catch {}
+  box.checked = saved !== 'off';
+  const apply = () => {
+    try { localStorage.setItem('clipboard', box.checked ? 'on' : 'off'); } catch {}
+    box.blur(); // keys belong to the host
+    return invoke('live_clipboard', { on: box.checked }).catch(() => {});
+  };
+  box.addEventListener('change', apply);
+  label.append(box, 'Clipboard ');
+  statusEl.append(label);
+  await apply();
 }
 
 (async () => {

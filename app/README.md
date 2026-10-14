@@ -1,6 +1,6 @@
 # Tauri viewer
 
-The Rust + Tauri viewer. It plays one local Annex B `.h264` file, or live video from a paired host (`--connect`), through WebCodecs in the system web view (WebView2 on Windows, WKWebView on macOS). Live mode forwards pointer, wheel and keyboard input (see Remote input); there is no clipboard yet. The C++ viewer in `viewer/` stays as the fallback comparison until this proof passes on native Windows.
+The Rust + Tauri viewer. It plays one local Annex B `.h264` file, or live video from a paired host (`--connect`), through WebCodecs in the system web view (WebView2 on Windows, WKWebView on macOS). Live mode forwards pointer, wheel and keyboard input (see Remote input) and shares plain-text clipboard both ways (see Clipboard). The C++ viewer in `viewer/` stays as the fallback comparison until this proof passes on native Windows.
 
 - `src-tauri/src/annexb.rs` splits the stream into access units (SPS/PPS/SEI kept with their picture) and derives the codec string from the first SPS. Limits: 8 MiB file, 1 MiB per access unit, 10,000 units. The first unit must be an IDR.
 - `src-tauri/src/main.rs` reads only the file named on the command line and sends it to the page as raw bytes.
@@ -74,6 +74,16 @@ Key timing over Tailscale (DERP), 2026-10-13, typing into a still Terminal on th
 | After | 56 / 164 | 58 / 166 | 89 |
 
 *send* stayed at most 0.2 ms. After the rewrite, a frame is decoded about 2 ms after it arrives; the user called typing "blazing fast". The Mac side at the same time (its own clock, 60 fps): key injected → next captured frame 40.5 / 62.2 ms, encode 15.1 / 24.9 ms. The two sides' "next frame" can be different frames, so these don't add up exactly.
+
+## Clipboard
+
+Live mode shares plain text both ways on the authenticated connection (protocol v3 side streams), while the **Clipboard** switch in the status bar is on. It is on by default; the choice is saved in the page's local storage, and the page sets it before the session starts, so a saved "off" holds from the start. `--check` never shares.
+
+- **Windows side (`src/clipboard.rs`):** a message-only window on its own thread is registered with `AddClipboardFormatListener` only while a session is up and the switch is on, and does every clipboard read and write.
+- **Sent:** what is on the clipboard when sharing starts, then each copy, with `\r\n` made `\n` and the text cut at its first NUL. Nothing is sent for copies with no text, text that is empty or over 1 MiB, text equal to the last sent or received, or copies other apps mark private: `ExcludeClipboardContentFromMonitorProcessing`, `Clipboard Viewer Ignore`, or `CanIncludeInClipboardHistory` / `CanUploadToCloudClipboard` holding anything but 1 (password managers set these).
+- **Received:** the host's text is put on the clipboard with `\n` made `\r\n` and `CanUploadToCloudClipboard` = 0, so Windows doesn't sync it to the cloud clipboard; it can still appear in local clipboard history (Win+V). Text arriving while the switch is off is dropped. The write is recognised by its clipboard sequence number and not sent back.
+- **Never logged:** the status bar shows only counts: sent, received, skipped, and failed (the clipboard stayed busy for 200 ms, or a write failed).
+- **Test against the real clipboard** (it overwrites the clipboard and puts its text back): `cargo test -- --ignored clipboard`.
 
 ## What counts as hardware-decode evidence
 

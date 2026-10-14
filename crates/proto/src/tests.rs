@@ -715,6 +715,17 @@ async fn clipboard_crosses_both_ways_beside_input() {
         last = Some(text);
     }
     assert_eq!(last.map(ClipboardText::into_string).as_deref(), Some("update 19"));
+
+    // A receiver waits beside notice() in one select!, and starts after what was read.
+    let mut receiver = session.clipboard_receiver();
+    host.host.send_clipboard(ClipboardText::new("beside notices".into()).unwrap());
+    let text = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            _ = session.notice() => None,
+            text = receiver.next() => text,
+        }
+    });
+    assert_eq!(text.await.unwrap().map(ClipboardText::into_string).as_deref(), Some("beside notices"));
     session.close().await;
 }
 

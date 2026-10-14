@@ -59,7 +59,7 @@ mod with_identity {
     fn hello_is_acknowledged_then_eof_exits_cleanly() {
         let (code, out) = run(&golden("01-hello"));
         assert_eq!(code, 0);
-        assert_eq!(out, ToApp::HelloAck { version: 2 }.encode());
+        assert_eq!(out, ToApp::HelloAck { version: 3 }.encode());
         assert_eq!(out, golden("81-hello-ack"));
     }
 

@@ -29,7 +29,7 @@ pub use keystore::{load_or_create_identity, platform_keystore, KeyStore, MemoryK
 pub use tls::ALPN;
 pub use trust::{ClientStatus, KnownHost, KnownHosts, PairedClient, PairedClients};
 pub use video::{AccessUnit, VideoFrame, VideoReceiver, MAX_ACCESS_UNIT, VIDEO_STREAM_VERSION};
-pub use viewer::{FirstContact, Outcome, Session, Viewer};
+pub use viewer::{ClipboardReceiver, FirstContact, Outcome, Session, Viewer};
 pub use wire::{ErrorCode, PROTOCOL_VERSION};
 
 pub const DEFAULT_PORT: u16 = 47900;

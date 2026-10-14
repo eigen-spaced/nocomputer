@@ -17,7 +17,11 @@
 //! Input goes the other way: the page sends pointer and wheel input with `live_input`,
 //! and on Windows the keyboard hook (`hook.rs`) sends keys. Neither is logged. Notices
 //! from the host (input unavailable, capture stopped) appear in `live_info`.
+//!
+//! Clipboard text is shared both ways while the switch is on (`clipboard.rs`); only
+//! counts reach `live_info`.
 
+use crate::clipboard::{Clipboard, Event};
 use nocomputer_proto::{load_or_create_identity, paths, platform_keystore, Error, Input, KeyState, KnownHosts, NoticeKind, Outcome, Viewer};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,6 +51,22 @@ pub struct LiveInfo {
     pub key_send: Timing,
     /// Key-down read from the hook → the next video frame received.
     pub key_frame: Timing,
+    pub clipboard: ClipboardInfo,
+}
+
+/// Clipboard sharing, as counts; never the text.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ClipboardInfo {
+    /// Sharing is running for this session.
+    pub on: bool,
+    pub sent: u64,
+    pub received: u64,
+    /// Copies here that weren't text, were marked private, or were too long.
+    pub skipped: u64,
+    /// The clipboard stayed busy, or text from the host couldn't be written.
+    pub failed: u64,
+    /// Why sharing stopped, if it did on its own.
+    pub error: Option<String>,
 }
 
 /// Over the last `SAMPLES` measurements, in ms on this machine's monotonic clock.
@@ -234,6 +254,7 @@ async fn run(
     crate::hook::set_connected(true);
     let result = session_loop(&mut session, &mut video, &info, &tx, &mut keyframe, &mut input, &shutdown).await;
     reader.abort();
+    info.lock().unwrap().clipboard.on = false; // the watcher went with session_loop
     connected.store(false, Ordering::Relaxed);
     crate::hook::set_connected(false);
     if result.is_ok() {
@@ -257,6 +278,10 @@ async fn session_loop(
     // When a key went down with no frame received since.
     let mut key_mark: Option<Instant> = None;
     let (mut key_send, mut key_frame) = (Samples::default(), Samples::default());
+    let mut switch = crate::clipboard::switch();
+    let mut clipboard = None;
+    share(&mut clipboard, *switch.borrow_and_update(), info);
+    let mut from_host = session.clipboard_receiver();
     loop {
         tokio::select! {
             Some(frame) = video.recv() => {
@@ -299,8 +324,56 @@ async fn session_loop(
                 };
                 info.lock().unwrap().notice = Some(format!("{what}: {}", notice.message));
             }
+            Ok(()) = switch.changed() => share(&mut clipboard, *switch.borrow_and_update(), info),
+            event = next_copy(&mut clipboard), if clipboard.is_some() => {
+                let mut info = info.lock().unwrap();
+                let counts = &mut info.clipboard;
+                match event {
+                    Some(Event::Copied(text)) => {
+                        session.send_clipboard(text);
+                        counts.sent += 1;
+                    }
+                    Some(Event::Skipped) => counts.skipped += 1,
+                    Some(Event::Failed) => counts.failed += 1,
+                    None => {
+                        clipboard = None;
+                        (counts.on, counts.error) = (false, Some("the clipboard watcher stopped".into()));
+                    }
+                }
+            }
+            Some(text) = from_host.next() => {
+                // Dropped while the switch is off.
+                if let Some(c) = &clipboard {
+                    c.apply(text);
+                    info.lock().unwrap().clipboard.received += 1;
+                }
+            }
             _ = shutdown.notified() => return Ok(()),
         }
+    }
+}
+
+/// Starts or stops watching this machine's clipboard. Starting sends what is on it now.
+fn share(clipboard: &mut Option<Clipboard>, on: bool, info: &Mutex<LiveInfo>) {
+    if on == clipboard.is_some() {
+        return;
+    }
+    let counts = &mut info.lock().unwrap().clipboard;
+    *clipboard = None;
+    counts.error = None;
+    if on {
+        match Clipboard::start() {
+            Ok(c) => *clipboard = Some(c),
+            Err(e) => counts.error = Some(e),
+        }
+    }
+    counts.on = clipboard.is_some();
+}
+
+async fn next_copy(clipboard: &mut Option<Clipboard>) -> Option<Event> {
+    match clipboard {
+        Some(c) => c.next().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -340,6 +413,12 @@ pub fn live_input(live: tauri::State<'_, Live>, events: Vec<Input>) {
 #[tauri::command]
 pub fn live_settings(command_key: crate::keys::CommandKey) {
     crate::hook::set_command(command_key);
+}
+
+/// The status bar's clipboard switch. The page sets it before the first `live_next`.
+#[tauri::command]
+pub fn live_clipboard(on: bool) {
+    crate::clipboard::set_enabled(on);
 }
 
 #[tauri::command]

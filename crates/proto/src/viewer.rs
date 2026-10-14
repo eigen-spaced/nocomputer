@@ -183,12 +183,15 @@ impl Session {
     /// has ended. Cancel-safe. Updates that arrive while the caller is busy are
     /// replaced, never queued.
     pub async fn clipboard(&mut self) -> Option<ClipboardText> {
-        loop {
-            self.clipboard_in.changed().await.ok()?;
-            if let Some(text) = self.clipboard_in.borrow_and_update().clone() {
-                return Some(text);
-            }
-        }
+        next_clipboard(&mut self.clipboard_in).await
+    }
+
+    /// The same as [`Session::clipboard`], but without borrowing the session, so it can
+    /// wait in one `select!` with [`Session::notice`]. Starts after what `clipboard` has
+    /// already returned. Holds the session's connection open until dropped, if the
+    /// session is dropped without `close()`.
+    pub fn clipboard_receiver(&self) -> ClipboardReceiver {
+        ClipboardReceiver(self.clipboard_in.clone())
     }
 
     /// The host's video. Use it from a separate task; it shares the connection.
@@ -199,6 +202,26 @@ impl Session {
     pub async fn close(self) {
         self.conn.close(0u32.into(), b"");
         let _ = timeout(Duration::from_secs(1), self.endpoint.wait_idle()).await;
+    }
+}
+
+/// The host's clipboard text; see [`Session::clipboard_receiver`].
+pub struct ClipboardReceiver(tokio::sync::watch::Receiver<Option<ClipboardText>>);
+
+impl ClipboardReceiver {
+    /// The host's newest clipboard text since the last call; `None` once the session
+    /// has ended. Cancel-safe.
+    pub async fn next(&mut self) -> Option<ClipboardText> {
+        next_clipboard(&mut self.0).await
+    }
+}
+
+async fn next_clipboard(updates: &mut tokio::sync::watch::Receiver<Option<ClipboardText>>) -> Option<ClipboardText> {
+    loop {
+        updates.changed().await.ok()?;
+        if let Some(text) = updates.borrow_and_update().clone() {
+            return Some(text);
+        }
     }
 }
 

@@ -15,6 +15,7 @@
 
 mod annexb;
 mod bench;
+mod clipboard;
 mod hook;
 mod keys;
 mod live;
@@ -186,6 +187,7 @@ fn main() {
             live::live_info,
             live::live_input,
             live::live_settings,
+            live::live_clipboard,
             bench::bench_now,
             bench::bench_push,
             bench::bench_pull_start,
