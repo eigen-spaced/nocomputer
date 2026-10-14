@@ -229,6 +229,7 @@ End to end between machines (2026-10-13): the Mac app's bundled host streamed th
 
 Still pending:
 
+- **Host panel (b2):** the host window becomes one bundled web page shared by the Mac app and a future Windows host; the contract is in [host-panel.md](host-panel.md). The page is the Windows agent's; the Swift shell is the Mac agent's.
 - **Re-dial finds the device already paired:** if this PC got paired another way while its pairing screen was open, the viewer says the host fingerprint changed. That's safe but wrong; it should say "already paired, connect again".
 - **Reverse direction (Mac viewer, Windows host):** use the same flow. A Windows host running in the user's session can't capture the secure desktop where Windows shows its lock screen.
 

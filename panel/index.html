@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nocomputer</title>
+  <link rel="stylesheet" href="panel.css">
+</head>
+<body>
+  <main>
+    <p id="outdated" class="warn" role="alert" hidden>This window is older than the app. Update the app.</p>
+    <p class="intro">Remote access runs the bundled host and accepts paired viewers only. It keeps the computer awake while on. No video, typed input or clipboard is saved or logged.</p>
+
+    <section id="permissions" hidden>
+      <h2>Permissions</h2>
+      <ul id="permission-list"></ul>
+      <button id="refresh" type="button" class="secondary">Check again</button>
+    </section>
+
+    <section>
+      <label class="switch"><input id="remote" type="checkbox" disabled> Remote access (paired viewers only)</label>
+      <p id="remote-error" class="warn" hidden></p>
+      <label class="switch"><input id="clipboard" type="checkbox" disabled> Share clipboard text with the viewer</label>
+    </section>
+
+    <section>
+      <h2>This computer</h2>
+      <p id="host-off" class="muted">Its name and fingerprint appear here while Remote access is on.</p>
+      <div id="host" hidden>
+        <p>Viewers should show this fingerprint for <span id="host-name" class="name"></span>:</p>
+        <p id="host-fingerprint" class="fingerprint"></p>
+      </div>
+      <p id="pairing-notice" class="notice" hidden></p>
+    </section>
+
+    <section id="session-box" hidden>
+      <h2>Viewer</h2>
+      <p id="session-none" class="muted">No viewer connected.</p>
+      <div id="session" hidden>
+        <p>Connected: <span id="session-device" class="name"></span></p>
+        <p id="session-fingerprint" class="fingerprint"></p>
+      </div>
+    </section>
+
+    <section>
+      <h2>Status</h2>
+      <pre id="status">Remote access off</pre>
+      <h2>Log</h2>
+      <pre id="log" tabindex="0"></pre>
+    </section>
+  </main>
+  <script src="panel.js"></script>
+</body>
+</html>
