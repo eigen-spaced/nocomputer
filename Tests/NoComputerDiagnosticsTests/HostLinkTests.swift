@@ -9,10 +9,10 @@ import Testing
 struct HostLinkTests {
     private static func fakeChild(in directory: URL, received: URL) throws -> URL {
         let script = directory.appendingPathComponent("fake-host")
-        // HelloAck(3) = [0 0 0 3][0x81][0 3]
+        // HelloAck(4) = [0 0 0 3][0x81][0 4]
         try """
             #!/bin/sh
-            printf '\\000\\000\\000\\003\\201\\000\\003'
+            printf '\\000\\000\\000\\003\\201\\000\\004'
             exec cat > '\(received.path)'
             """.write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
@@ -62,13 +62,14 @@ struct HostLinkTests {
         encoder.close()
         link.captureStopped(reason: "test")
         link.decide(requestID: 42, approve: false)
+        link.loginVerdict(requestID: 9, ok: true)
         link.stop()
         for _ in 0..<200 where link.runningForTesting { try await Task.sleep(nanoseconds: 10_000_000) }
 
         let messages = try Self.frames(try Data(contentsOf: received))
         try #require(messages.count >= 3)
         #expect(messages.first?.0 == 0x01)
-        #expect(messages.first?.1 == Data([0, 3]))
+        #expect(messages.first?.1 == Data([0, 4]))
         let units = messages.filter { $0.0 == 0x02 }
         #expect(units.count == 20)
         #expect(link.snapshot().accessUnits == 20)
@@ -84,10 +85,12 @@ struct HostLinkTests {
         }
         #expect(keyframes.first == 0)
         #expect(keyframes.contains(10))
-        #expect(messages[messages.count - 2].0 == 0x03)
-        #expect(messages[messages.count - 2].1 == Data("test".utf8))
-        #expect(messages.last?.0 == 0x04)
-        #expect(messages.last?.1 == Data([0, 0, 0, 0, 0, 0, 0, 42, 0]))
+        #expect(messages[messages.count - 3].0 == 0x03)
+        #expect(messages[messages.count - 3].1 == Data("test".utf8))
+        #expect(messages[messages.count - 2].0 == 0x04)
+        #expect(messages[messages.count - 2].1 == Data([0, 0, 0, 0, 0, 0, 0, 42, 0]))
+        #expect(messages.last?.0 == 0x07)
+        #expect(messages.last?.1 == Data([0, 0, 0, 0, 0, 0, 0, 9, 1]))
     }
 
     @Test func wrongHelloAckEndsTheLink() async throws {

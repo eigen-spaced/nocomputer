@@ -29,6 +29,8 @@ final class RemoteHost {
     // Input is injected on its own queue, never behind UI work. The injector
     // and the fields below are only touched on this queue.
     private let inputQueue = DispatchQueue(label: "dev.nocomputer.input", qos: .userInteractive)
+    // Account checks block on OpenDirectory; one at a time, off the main thread.
+    private let accountQueue = DispatchQueue(label: "dev.nocomputer.account-check", qos: .userInitiated)
     nonisolated(unsafe) private var injector: InputInjector?
     nonisolated(unsafe) private var inputDisplay = CGMainDisplayID()
     nonisolated(unsafe) private var trustCheckedAt: TimeInterval = -.infinity
@@ -60,6 +62,12 @@ final class RemoteHost {
         clipboard.onLocalText = { [weak link] in link?.sendClipboard($0) }
         link.onExit = { [weak self] in self?.exited($0) }
         link.onInput = { [weak self] input in self?.inputQueue.async { self?.inject(input) } }
+        link.onVerifyLogin = { [weak link, accountQueue] request in
+            accountQueue.async {
+                let ok = AccountCheck.verify(username: request.username, password: request.password)
+                link?.loginVerdict(requestID: request.requestID, ok: ok)
+            }
+        }
         try sleep.enable()
         do { try link.start() } catch { sleep.disable(); throw error }
         self.link = link
@@ -161,6 +169,11 @@ final class RemoteHost {
                 return
             }
             showPairingPrompt(request)
+        case "pairing_withdrawn":
+            guard let withdrawn = try? JSONDecoder().decode(LocalLink.PairingWithdrawn.self, from: json),
+                  prompt?.requestID == withdrawn.requestID else { return }
+            dismissPrompt()
+            log("Pairing request withdrawn: the device left or the request timed out")
         case let type?:
             // Display only. The JSON carries names and fingerprints, never keys.
             log("Host event \(type): \(String(decoding: json, as: UTF8.self))")
@@ -202,6 +215,7 @@ final class RemoteHost {
         guard let (alert, _) = prompt else { return }
         prompt = nil
         if let sheetParent = alert.window.sheetParent { sheetParent.endSheet(alert.window) }
+        else if NSApp.modalWindow == alert.window { NSApp.abortModal() }
     }
 
     private func exited(_ reason: String) {

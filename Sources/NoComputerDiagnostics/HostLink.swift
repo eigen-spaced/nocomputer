@@ -46,10 +46,11 @@ struct PipeAdmission {
     mutating func written() { queued -= 1 }
 }
 
-// Owns the bundled `nocomputer-host` child and the local-v3 pipe to it. The pipe is
+// Owns the bundled `nocomputer-host` child and the local-v4 pipe to it. The pipe is
 // inherited, never a socket, so no other local process can reach this channel.
 // Network, pairing state and keys live entirely in the child.
-final class HostLink {
+// Sendable: its mutable state is behind `lock`, and writes go through `writer`.
+final class HostLink: @unchecked Sendable {
     static let maximumQueued = 3
 
     // All handlers run on the main queue.
@@ -62,6 +63,9 @@ final class HostLink {
     // Not on the main queue: called in order on the pipe reader's queue, so
     // input never waits behind UI work. The receiver must not block.
     var onInput: ((RemoteInput) -> Void)?
+    // Also on the reader's queue, so the password never passes through the UI.
+    // Answer with `loginVerdict`; the receiver must not block.
+    var onVerifyLogin: ((LocalLink.LoginRequest) -> Void)?
 
     private let process = Process()
     private let input = Pipe()
@@ -72,6 +76,8 @@ final class HostLink {
     private var acknowledged = false
     private var admission = PipeAdmission(limit: HostLink.maximumQueued)
     private var failed: String?
+    // Set by stop(): the child is closing, so a failed write is expected.
+    private var stopping = false
     private var state = HostLinkSnapshot()
 
     init(executable: URL, arguments: [String] = []) {
@@ -115,6 +121,9 @@ final class HostLink {
     // Closing stdin asks the child to end its sessions and exit; terminate it if
     // it has not exited after a grace period.
     func stop() {
+        lock.lock()
+        stopping = true
+        lock.unlock()
         writer.async { [input, process] in
             try? input.fileHandleForWriting.close()
             DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
@@ -128,6 +137,8 @@ final class HostLink {
     func inputUnavailable(reason: String) { send(.inputUnavailable(reason: reason)) }
 
     func decide(requestID: UInt64, approve: Bool) { send(.pairingDecision(requestID: requestID, approve: approve)) }
+
+    func loginVerdict(requestID: UInt64, ok: Bool) { send(.loginVerdict(requestID: requestID, ok: ok)) }
 
     func sendClipboard(_ text: LocalLink.ClipboardText) {
         lock.lock()
@@ -193,7 +204,7 @@ final class HostLink {
             do {
                 try input.fileHandleForWriting.write(contentsOf: frame)
             } catch {
-                self?.fail("pipe write failed: \(error.localizedDescription)")
+                self?.writeFailed(error)
             }
             if accessUnit, let self {
                 self.lock.lock()
@@ -229,6 +240,10 @@ final class HostLink {
                 onInput?(input)
                 continue
             }
+            if case let .verifyLogin(request) = message {
+                onVerifyLogin?(request)
+                continue
+            }
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 switch message {
@@ -238,10 +253,19 @@ final class HostLink {
                 case .requestKeyframe: self.expectKeyframe(); self.onRequestKeyframe?()
                 case let .event(json): self.onEvent?(json)
                 case let .clipboard(text): self.onClipboard?(text)
-                case .input: break
+                case .input, .verifyLogin: break
                 }
             }
         }
+    }
+
+    // While stopping, the child closes its end and a write in flight fails; that
+    // is the expected end, not a contract violation.
+    private func writeFailed(_ error: Error) {
+        lock.lock()
+        let expected = stopping
+        lock.unlock()
+        if !expected { fail("pipe write failed: \(error.localizedDescription)") }
     }
 
     private func failureReason() -> String? {

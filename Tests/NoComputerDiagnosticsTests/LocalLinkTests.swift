@@ -141,11 +141,11 @@ struct PipeAdmissionTests {
     }
 }
 
-// crates/host owns local-v3; its golden vectors are the shared reference bytes.
+// crates/host owns local-v4; its golden vectors are the shared reference bytes.
 struct LocalLinkGoldenTests {
     private static let directory = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        .appendingPathComponent("crates/host/testdata/local-v3")
+        .appendingPathComponent("crates/host/testdata/local-v4")
 
     private static func golden(_ name: String) throws -> Data {
         try Data(contentsOf: directory.appendingPathComponent(name))
@@ -157,7 +157,7 @@ struct LocalLinkGoldenTests {
     }
 
     @Test func swiftEncodesTheGoldenOutgoingFrames() throws {
-        #expect(try LocalLink.encode(.hello(version: 3)) == Self.golden("01-hello.bin"))
+        #expect(try LocalLink.encode(.hello(version: 4)) == Self.golden("01-hello.bin"))
         #expect(try LocalLink.encode(.accessUnit(keyframe: true, captureMicroseconds: 0x0102_0304_0506_0708,
             annexB: Self.annexB("02-access-unit-key.bin"))) == Self.golden("02-access-unit-key.bin"))
         let delta = try Self.golden("02-access-unit-delta.bin")
@@ -178,6 +178,24 @@ struct LocalLinkGoldenTests {
         let string = try #require(String(data: clipboard.dropFirst(5), encoding: .utf8))
         let text = try #require(LocalLink.ClipboardText(string))
         #expect(try LocalLink.encode(.clipboard(text)) == clipboard)
+        #expect(try LocalLink.encode(.loginVerdict(requestID: 0x0A0B_0C0D_0E0F_1011, ok: true))
+            == Self.golden("07-login-verdict-ok.bin"))
+        #expect(try LocalLink.encode(.loginVerdict(requestID: 7, ok: false)) == Self.golden("07-login-verdict-refused.bin"))
+    }
+
+    @Test func swiftDecodesTheGoldenLoginFrames() throws {
+        var reader = LocalLink.Reader()
+        let messages = try reader.feed(Self.golden("8c-verify-login.bin") + Self.golden("85-event-pairing-withdrawn.bin"))
+        try #require(messages.count == 2)
+        guard case let .verifyLogin(request) = messages[0], case let .event(json) = messages[1] else {
+            Issue.record("expected VerifyLogin and an event")
+            return
+        }
+        #expect(request.requestID == 9)
+        #expect(request.username == "Jürgen")
+        #expect(request.password.withString { $0 } == "correct horse – ü 🙂")
+        #expect(LocalLink.eventType(json) == "pairing_withdrawn")
+        #expect(try JSONDecoder().decode(LocalLink.PairingWithdrawn.self, from: json).requestID == 7)
     }
 
     @Test func swiftDecodesTheGoldenClipboardFrame() throws {
@@ -192,7 +210,7 @@ struct LocalLinkGoldenTests {
                      "85-event-pairing-prompt.bin", "85-event-session.bin"]
         let messages = try reader.feed(names.map { try Self.golden($0) }.reduce(Data(), +))
         try #require(messages.count == 6)
-        #expect(Array(messages[0..<4]) == [.helloAck(version: 3), .startStream, .stopStream, .requestKeyframe])
+        #expect(Array(messages[0..<4]) == [.helloAck(version: 4), .startStream, .stopStream, .requestKeyframe])
         guard case let .event(prompt) = messages[4], case let .event(session) = messages[5] else {
             Issue.record("expected two events")
             return
@@ -225,7 +243,7 @@ struct LocalLinkGoldenTests {
     // Swift→Rust frames must never be accepted coming back the other way.
     @Test func outgoingGoldenFramesAreRejectedAsIncoming() throws {
         for name in ["01-hello.bin", "02-access-unit-key.bin", "03-capture-stopped.bin", "04-pairing-decision-deny.bin",
-                     "05-input-unavailable.bin", "06-clipboard.bin"] {
+                     "05-input-unavailable.bin", "06-clipboard.bin", "07-login-verdict-ok.bin"] {
             var reader = LocalLink.Reader()
             #expect(throws: LocalLink.ProtocolError.self, "\(name)") { try reader.feed(Self.golden(name)) }
         }
@@ -267,7 +285,7 @@ struct LocalLinkInputTests {
 
     @Test func encodesInputUnavailable() throws {
         #expect(try LocalLink.encode(.inputUnavailable(reason: "no AX")) == frame(0x05, Array("no AX".utf8)))
-        #expect(try LocalLink.encode(.hello(version: LocalLink.version)) == frame(0x01, [0, 3]))
+        #expect(try LocalLink.encode(.hello(version: LocalLink.version)) == frame(0x01, [0, 4]))
     }
 
     @Test func clipboardTextIsBoundedAndNeverDescribed() throws {
@@ -281,5 +299,66 @@ struct LocalLinkInputTests {
         #expect(!String(reflecting: message).contains("hunter2"))
         var reader = LocalLink.Reader()
         #expect(try reader.feed(frame(0x8B, [UInt8](repeating: 0x61, count: LocalLink.maximumClipboard))).count == 1)
+    }
+}
+
+struct LocalLinkLoginTests {
+    private static func verifyLogin(id: UInt64 = 1, username: [UInt8], password: [UInt8]) -> Data {
+        var payload = withUnsafeBytes(of: id.bigEndian) { [UInt8]($0) }
+        payload.append(UInt8(truncatingIfNeeded: username.count))
+        return frame(0x8C, payload + username + password)
+    }
+
+    @Test func passwordsAreNeverDescribed() throws {
+        var reader = LocalLink.Reader()
+        let messages = try reader.feed(Self.verifyLogin(username: Array("me".utf8), password: Array("hunter2".utf8)))
+        let message = try #require(messages.first)
+        #expect(!"\(message)".contains("hunter2"))
+        #expect(!String(reflecting: message).contains("hunter2"))
+        guard case let .verifyLogin(request) = message else { Issue.record("expected VerifyLogin"); return }
+        #expect("\(request.password)" == "Password(redacted)")
+    }
+
+    @Test func malformedVerifyLoginIsFatal() {
+        let cases: [(String, Data)] = [
+            ("too short", frame(0x8C, [0, 0, 0, 0, 0, 0, 0, 1, 1, 0x61])),
+            ("empty username", Self.verifyLogin(username: [], password: [0x61])),
+            ("no password", Self.verifyLogin(username: [0x61], password: [])),
+            ("control character in username", Self.verifyLogin(username: [0x61, 0x0A], password: [0x61])),
+            ("username not UTF-8", Self.verifyLogin(username: [0xC3, 0x28], password: [0x61])),
+            ("NUL in password", Self.verifyLogin(username: [0x61], password: [0x61, 0, 0x62])),
+            ("password not UTF-8", Self.verifyLogin(username: [0x61], password: [0xC3, 0x28])),
+            ("password over 1024 bytes", Self.verifyLogin(username: [0x61], password: [UInt8](repeating: 0x61, count: 1025))),
+        ]
+        for (name, bytes) in cases {
+            var reader = LocalLink.Reader()
+            #expect(throws: LocalLink.ProtocolError.self, "\(name)") { try reader.feed(bytes) }
+        }
+    }
+
+    @Test func boundsMatchTheRustSide() throws {
+        // Rust's char::is_control is Cc only, so a format character must pass.
+        var reader = LocalLink.Reader()
+        let zwj = Array("a\u{200D}b".utf8)
+        let longest = [UInt8](repeating: 0x61, count: LocalLink.maximumUsername)
+        let messages = try reader.feed(Self.verifyLogin(username: zwj, password: [0x61])
+            + Self.verifyLogin(username: longest, password: [UInt8](repeating: 0x62, count: LocalLink.maximumPassword)))
+        #expect(messages.count == 2)
+    }
+
+    @Test func onlyThisAccountsNamesAreChecked() {
+        #expect(AccountCheck.names("alex", short: "alex", full: "Alex Doe"))
+        #expect(AccountCheck.names("ALEX", short: "alex", full: "Alex Doe"))
+        #expect(AccountCheck.names("alex doe", short: "alex", full: "Alex Doe"))
+        #expect(!AccountCheck.names("root", short: "alex", full: "Alex Doe"))
+        #expect(!AccountCheck.names("", short: "alex", full: ""))
+        #expect(!AccountCheck.names("alex2", short: "alex", full: "Alex Doe"))
+    }
+
+    // Never sends a password for the real account: a wrong one could count toward
+    // its failed-login policy. Another account is refused before any lookup.
+    @Test func anotherAccountIsRefusedWithoutLookup() {
+        let password = LocalLink.Password(Array("certainly not the password \(UUID())".utf8))
+        #expect(!AccountCheck.verify(username: "root", password: password))
     }
 }

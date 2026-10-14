@@ -1,11 +1,11 @@
 //! End to end on loopback, as the app sees it: the real host binary over its pipes, a
-//! viewer pairing through an app-side approval, input arriving on stdout in order, and
-//! clipboard text in both directions.
+//! viewer pairing through an app-side approval, logging in through the app's account
+//! check, input arriving on stdout in order, and clipboard text in both directions.
 
 #![cfg(not(target_os = "macos"))] // the host identity would be the app's Keychain item
 
 use nocomputer_host::local::{FromApp, ToApp};
-use nocomputer_proto::{Button, ClipboardText, Identity, Input, KeyState, NoticeKind, Outcome, ScrollUnit, Viewer};
+use nocomputer_proto::{Button, ClipboardText, Identity, Input, KeyState, LoginResult, NoticeKind, Outcome, Password, ScrollUnit, Viewer};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::Receiver;
@@ -54,6 +54,18 @@ fn next_command(frames: &Receiver<(u8, Vec<u8>)>) -> Vec<u8> {
     }
 }
 
+/// The next VerifyLogin frame, as (request_id, username, password).
+fn verify_login(frames: &Receiver<(u8, Vec<u8>)>) -> (u64, String, String) {
+    let frame = next_command(frames);
+    assert_eq!(frame[4], 0x8C, "expected VerifyLogin");
+    let payload = &frame[5..];
+    let request_id = u64::from_be_bytes(payload[..8].try_into().unwrap());
+    let len = payload[8] as usize;
+    let username = String::from_utf8(payload[9..9 + len].to_vec()).unwrap();
+    let password = String::from_utf8(payload[9 + len..].to_vec()).unwrap();
+    (request_id, username, password)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn input_reaches_the_app_in_order_and_is_released_at_session_end() {
     let state = std::env::temp_dir().join(format!("nocomputer-host-app-{}", std::process::id()));
@@ -70,8 +82,8 @@ async fn input_reaches_the_app_in_order_and_is_released_at_session_end() {
     let mut app = child.0.stdin.take().unwrap();
     let frames = read_frames(child.0.stdout.take().unwrap());
     let stderr = BufReader::new(child.0.stderr.take().unwrap());
-    app.write_all(&FromApp::Hello { version: 3 }.encode()).unwrap();
-    assert_eq!(next(&frames), (0x81, vec![0, 3]));
+    app.write_all(&FromApp::Hello { version: 4 }.encode()).unwrap();
+    assert_eq!(next(&frames), (0x81, vec![0, 4]));
     // Keep draining stderr: the host must never block or fail on its logging.
     let (addr_tx, addr) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -97,7 +109,21 @@ async fn input_reaches_the_app_in_order_and_is_released_at_session_end() {
     app.write_all(&FromApp::PairingDecision { request_id, approve: true }.encode()).unwrap();
     assert!(pairing.await.unwrap().unwrap());
 
-    let Outcome::Ready(mut session) = viewer.connect(addr, Some(host_fp)).await.unwrap() else { panic!() };
+    // Log in: the app refuses the first password and accepts the second.
+    let Outcome::Login(prompt) = viewer.connect(addr, Some(host_fp)).await.unwrap() else { panic!() };
+    let attempt = tokio::spawn(prompt.login("app-user", Password::new("wrong".into()).unwrap()));
+    let (request_id, username, password) = verify_login(&frames);
+    assert_eq!((username.as_str(), password.as_str()), ("app-user", "wrong"));
+    app.write_all(&FromApp::LoginVerdict { request_id, ok: false }.encode()).unwrap();
+    let LoginResult::Failed { retry_after, prompt } = attempt.await.unwrap().unwrap() else { panic!("a refused login succeeded") };
+    tokio::time::sleep(retry_after).await;
+    let attempt = tokio::spawn(prompt.login("app-user", Password::new("right – ü".into()).unwrap()));
+    let (request_id, _, password) = verify_login(&frames);
+    assert_eq!(password, "right – ü");
+    // A verdict for another request is ignored.
+    app.write_all(&FromApp::LoginVerdict { request_id: request_id + 100, ok: true }.encode()).unwrap();
+    app.write_all(&FromApp::LoginVerdict { request_id, ok: true }.encode()).unwrap();
+    let LoginResult::Session(mut session) = attempt.await.unwrap().unwrap() else { panic!("an accepted login failed") };
     assert_eq!(next_command(&frames), ToApp::ReleaseAll.encode(), "a session starts with nothing held");
     assert_eq!(next_command(&frames), ToApp::StartStream.encode());
 

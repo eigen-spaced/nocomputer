@@ -1,13 +1,14 @@
-//! local-v3: the pipe contract between the capture app (parent) and this host process
+//! local-v4: the pipe contract between the capture app (parent) and this host process
 //! (child), over the child's stdin and stdout. v2 added input (0x86-0x8A) and
-//! InputUnavailable (0x05); v3 added Clipboard (0x06, 0x8B). Only the current version
-//! is spoken.
+//! InputUnavailable (0x05); v3 added Clipboard (0x06, 0x8B); v4 added the account
+//! check (0x8C, 0x07) and the pairing_withdrawn and login_failed events. Only the
+//! current version is spoken.
 //!
 //! ```text
 //! frame: [u32 BE len][u8 type][payload]    len = 1 + payload length, 1..=4 MiB
 //!
 //! app -> host
-//!   0x01 Hello            u16 BE version (= 3); must be the first frame
+//!   0x01 Hello            u16 BE version (= 4); must be the first frame
 //!   0x02 AccessUnit       u8 flags (bit0 keyframe, others 0), u64 BE capture_us,
 //!                         Annex B bytes (at least 1); a keyframe is an IDR with SPS+PPS
 //!   0x03 CaptureStopped   UTF-8 reason, at most 1024 bytes
@@ -15,6 +16,7 @@
 //!   0x05 InputUnavailable UTF-8 reason, at most 1024 bytes: input can't be injected
 //!   0x06 Clipboard        UTF-8 text for the controlling viewer: 1 byte to 1 MiB, no
 //!                         U+0000; dropped when no session is running
+//!   0x07 LoginVerdict     u64 BE request_id, u8 ok (0 or 1); exactly 9 bytes
 //! host -> app
 //!   0x81 HelloAck         u16 BE version
 //!   0x82 StartStream      empty: a controlling session began; start capture, IDR first
@@ -33,23 +35,31 @@
 //!   0x8A ReleaseAll       empty: release every key and button the remote holds
 //!   0x8B Clipboard        UTF-8 text from the controlling viewer, as 0x06; only the
 //!                         newest is kept while the app is busy
+//!   0x8C VerifyLogin      u64 BE request_id, u8 username length (1..=255), username,
+//!                         password (the rest, 1..=1024 bytes); both UTF-8, no
+//!                         control characters in the username and no U+0000 in the
+//!                         password. Answer with LoginVerdict: ok only if the username
+//!                         names the account the app runs as and the password is that
+//!                         account's. At most one is outstanding; a newer request
+//!                         replaces it, and a verdict for any other id is ignored.
 //! ```
 //!
 //! Input comes only from the controlling session, in order. Pointer moves may be
 //! coalesced; buttons, keys and scrolls never are. The host sends ReleaseAll when a
 //! controlling session starts or ends (before StopStream) and when it discards an input
-//! backlog. Neither side logs input or clipboard contents.
+//! backlog. Neither side logs input or clipboard contents, or the username or password
+//! of a VerifyLogin; both clear their copies of the password when done.
 //!
 //! Anything else is fatal: lengths out of range (checked before allocating), unknown
 //! frame types, a payload on an empty type, wrong fixed sizes, invalid UTF-8. The
-//! payloads of `testdata/local-v3/*.bin` are the reference encoding for both sides.
+//! payloads of `testdata/local-v4/*.bin` are the reference encoding for both sides.
 //! `capture_us` is the app's monotonic clock and only meaningful within the app.
 
-use nocomputer_proto::{Button, ClipboardText, Input, KeyState, ScrollUnit, MAX_SCROLL_LINES, MAX_SCROLL_PIXELS};
+use nocomputer_proto::{valid_username, Button, ClipboardText, Input, KeyState, Password, ScrollUnit, MAX_SCROLL_LINES, MAX_SCROLL_PIXELS};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 pub const MAX_REASON: usize = 1024;
 
@@ -59,6 +69,7 @@ const CAPTURE_STOPPED: u8 = 0x03;
 const PAIRING_DECISION: u8 = 0x04;
 const INPUT_UNAVAILABLE: u8 = 0x05;
 const CLIPBOARD: u8 = 0x06;
+const LOGIN_VERDICT: u8 = 0x07;
 const HELLO_ACK: u8 = 0x81;
 const START_STREAM: u8 = 0x82;
 const STOP_STREAM: u8 = 0x83;
@@ -70,6 +81,7 @@ const SCROLL: u8 = 0x88;
 const KEY: u8 = 0x89;
 const RELEASE_ALL: u8 = 0x8A;
 const CLIPBOARD_TO_APP: u8 = 0x8B;
+const VERIFY_LOGIN: u8 = 0x8C;
 const FLAG_KEYFRAME: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +93,7 @@ pub enum FromApp {
     InputUnavailable { reason: String },
     /// `Debug` shows only the length.
     Clipboard(ClipboardText),
+    LoginVerdict { request_id: u64, ok: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +109,8 @@ pub enum ToApp {
     Key { usage: u16, state: u8 },
     ReleaseAll,
     Clipboard(ClipboardText),
+    /// `Debug` hides the password. Built only from a valid username and password.
+    VerifyLogin { request_id: u64, username: String, password: Password },
 }
 
 /// Display-only notices for the app. Fingerprints are full, grouped hex strings.
@@ -111,6 +126,11 @@ pub enum Event {
     Paired { name: String, device_fingerprint: String },
     PairingDenied { device_fingerprint: String },
     Rejected { device_fingerprint: Option<String>, reason: String },
+    /// The device behind this prompt disconnected, or the request timed out; close the
+    /// prompt. No decision is needed.
+    PairingWithdrawn { request_id: u64 },
+    /// A paired device's login failed; `failures` is its count since its last success.
+    LoginFailed { device_fingerprint: String, failures: u32 },
 }
 
 #[derive(Debug)]
@@ -126,7 +146,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "local pipe: {e}"),
             Error::Eof => write!(f, "local pipe closed"),
-            Error::Protocol(m) => write!(f, "local-v3: {m}"),
+            Error::Protocol(m) => write!(f, "local-v4: {m}"),
         }
     }
 }
@@ -142,6 +162,18 @@ fn reason(frame: &str, payload: Vec<u8>) -> Result<String, Error> {
         return Err(bad(format!("{frame} reason exceeds 1024 bytes")));
     }
     String::from_utf8(payload).map_err(|_| bad(format!("{frame} reason is not UTF-8")))
+}
+
+fn id_and_flag(frame: &str, payload: &[u8]) -> Result<(u64, bool), Error> {
+    if payload.len() != 9 {
+        return Err(bad(format!("{frame} must be 9 bytes")));
+    }
+    let flag = match payload[8] {
+        0 => false,
+        1 => true,
+        _ => return Err(bad(format!("{frame} flag must be 0 or 1"))),
+    };
+    Ok((u64::from_be_bytes(payload[..8].try_into().unwrap()), flag))
 }
 
 fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
@@ -166,6 +198,18 @@ impl ToApp {
             ToApp::Key { usage, state } => frame(KEY, &[&usage.to_be_bytes()[..], &[*state]].concat()),
             ToApp::ReleaseAll => frame(RELEASE_ALL, &[]),
             ToApp::Clipboard(text) => frame(CLIPBOARD_TO_APP, text.as_str().as_bytes()),
+            ToApp::VerifyLogin { request_id, username, password } => {
+                debug_assert!(valid_username(username));
+                let password = password.expose().as_bytes();
+                let mut out = Vec::with_capacity(5 + 9 + username.len() + password.len());
+                out.extend_from_slice(&(1 + 9 + username.len() as u32 + password.len() as u32).to_be_bytes());
+                out.push(VERIFY_LOGIN);
+                out.extend_from_slice(&request_id.to_be_bytes());
+                out.push(username.len() as u8);
+                out.extend_from_slice(username.as_bytes());
+                out.extend_from_slice(password);
+                out
+            }
         }
     }
 
@@ -229,6 +273,11 @@ impl FromApp {
                 payload.push(*approve as u8);
                 frame(PAIRING_DECISION, &payload)
             }
+            FromApp::LoginVerdict { request_id, ok } => {
+                let mut payload = request_id.to_be_bytes().to_vec();
+                payload.push(*ok as u8);
+                frame(LOGIN_VERDICT, &payload)
+            }
         }
     }
 
@@ -255,15 +304,12 @@ impl FromApp {
                 Ok(FromApp::Clipboard(ClipboardText::new(text).ok_or_else(|| bad("Clipboard is empty, over 1 MiB or contains NUL"))?))
             }
             PAIRING_DECISION => {
-                if payload.len() != 9 {
-                    return Err(bad("PairingDecision must be 9 bytes"));
-                }
-                let approve = match payload[8] {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(bad("PairingDecision approve must be 0 or 1")),
-                };
-                Ok(FromApp::PairingDecision { request_id: u64::from_be_bytes(payload[..8].try_into().unwrap()), approve })
+                let (request_id, approve) = id_and_flag("PairingDecision", &payload)?;
+                Ok(FromApp::PairingDecision { request_id, approve })
+            }
+            LOGIN_VERDICT => {
+                let (request_id, ok) = id_and_flag("LoginVerdict", &payload)?;
+                Ok(FromApp::LoginVerdict { request_id, ok })
             }
             other => Err(bad(format!("unknown frame type 0x{other:02x}"))),
         }
@@ -308,7 +354,7 @@ mod tests {
 
     fn from_app() -> Vec<(&'static str, FromApp)> {
         vec![
-            ("01-hello", FromApp::Hello { version: 3 }),
+            ("01-hello", FromApp::Hello { version: 4 }),
             ("02-access-unit-key", FromApp::AccessUnit { keyframe: true, capture_us: 0x0102030405060708, data: SPS_PPS_IDR.to_vec() }),
             ("02-access-unit-delta", FromApp::AccessUnit { keyframe: false, capture_us: 0x0102030405064E20, data: DELTA.to_vec() }),
             ("03-capture-stopped", FromApp::CaptureStopped { reason: "display disconnected – ü".into() }),
@@ -316,12 +362,14 @@ mod tests {
             ("04-pairing-decision-deny", FromApp::PairingDecision { request_id: 7, approve: false }),
             ("05-input-unavailable", FromApp::InputUnavailable { reason: "Accessibility not granted – ü".into() }),
             ("06-clipboard", FromApp::Clipboard(ClipboardText::new("line one\nzwei – ü 🙂".into()).unwrap())),
+            ("07-login-verdict-ok", FromApp::LoginVerdict { request_id: 0x0A0B0C0D0E0F1011, ok: true }),
+            ("07-login-verdict-refused", FromApp::LoginVerdict { request_id: 7, ok: false }),
         ]
     }
 
     fn to_app() -> Vec<(&'static str, ToApp)> {
         vec![
-            ("81-hello-ack", ToApp::HelloAck { version: 3 }),
+            ("81-hello-ack", ToApp::HelloAck { version: 4 }),
             ("82-start-stream", ToApp::StartStream),
             ("83-stop-stream", ToApp::StopStream),
             ("84-request-keyframe", ToApp::RequestKeyframe),
@@ -345,11 +393,16 @@ mod tests {
             ("89-key-repeat", ToApp::Key { usage: 0x0028, state: 2 }),
             ("8a-release-all", ToApp::ReleaseAll),
             ("8b-clipboard", ToApp::Clipboard(ClipboardText::new("from the viewer\n– ü 🙂".into()).unwrap())),
+            (
+                "8c-verify-login",
+                ToApp::VerifyLogin { request_id: 9, username: "Jürgen".into(), password: Password::new("correct horse – ü 🙂".into()).unwrap() },
+            ),
+            ("85-event-pairing-withdrawn", ToApp::Event(Event::PairingWithdrawn { request_id: 7 })),
         ]
     }
 
     fn golden(name: &str) -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/local-v3").join(format!("{name}.bin"))
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/local-v4").join(format!("{name}.bin"))
     }
 
     /// Compares against the checked-in vectors; NOCOMPUTER_WRITE_GOLDEN=1 rewrites them.
@@ -407,6 +460,9 @@ mod tests {
         assert!(matches!(read(&[0, 0, 0, 11, 0x02, 2, 0, 0, 0, 0, 0, 0, 0, 0, 9]).await, Err(Error::Protocol(_))), "unknown AU flag");
         assert!(matches!(read(&[0, 0, 0, 3, 0x03, 0xC3, 0x28]).await, Err(Error::Protocol(_))), "invalid UTF-8");
         assert!(matches!(read(&[0, 0, 0, 10, 0x04, 0, 0, 0, 0, 0, 0, 0, 1, 2]).await, Err(Error::Protocol(_))), "approve not 0/1");
+        assert!(matches!(read(&[0, 0, 0, 10, 0x07, 0, 0, 0, 0, 0, 0, 0, 1, 2]).await, Err(Error::Protocol(_))), "ok not 0/1");
+        assert!(matches!(read(&[0, 0, 0, 9, 0x07, 0, 0, 0, 0, 0, 0, 0, 1]).await, Err(Error::Protocol(_))), "short LoginVerdict");
+        assert!(matches!(read(&[0, 0, 0, 1, 0x8C]).await, Err(Error::Protocol(_))), "app-bound VerifyLogin");
         let mut long = vec![0, 0, 0x04, 0x02, 0x03];
         long.extend(std::iter::repeat_n(b'a', 1025));
         assert!(matches!(read(&long).await, Err(Error::Protocol(_))), "reason over 1024 bytes");
@@ -424,5 +480,16 @@ mod tests {
         big[..4].copy_from_slice(&((nocomputer_proto::MAX_CLIPBOARD + 1) as u32).to_be_bytes());
         assert!(matches!(read(&big).await, Ok(FromApp::Clipboard(_))), "clipboard of exactly 1 MiB");
         assert_eq!(format!("{:?}", read(&big).await.unwrap()), "Clipboard(ClipboardText(1048576 bytes))");
+    }
+}
+
+#[cfg(test)]
+mod login_tests {
+    use super::*;
+
+    #[test]
+    fn verify_login_never_shows_the_password() {
+        let message = ToApp::VerifyLogin { request_id: 1, username: "u".into(), password: Password::new("hunter2".into()).unwrap() };
+        assert!(!format!("{message:?}").contains("hunter2"));
     }
 }
