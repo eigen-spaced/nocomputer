@@ -84,6 +84,11 @@ async fn input_reaches_the_app_in_order_and_is_released_at_session_end() {
     let stderr = BufReader::new(child.0.stderr.take().unwrap());
     app.write_all(&FromApp::Hello { version: 4 }.encode()).unwrap();
     assert_eq!(next(&frames), (0x81, vec![0, 4]));
+    // Then the host's identity, for the app to show.
+    let (kind, identity) = next(&frames);
+    assert_eq!(kind, 0x85);
+    let identity: serde_json::Value = serde_json::from_slice(&identity).unwrap();
+    assert_eq!((identity["type"].as_str(), identity["name"].as_str()), (Some("identity"), Some("app-host")));
     // Keep draining stderr: the host must never block or fail on its logging.
     let (addr_tx, addr) = std::sync::mpsc::channel();
     std::thread::spawn(move || {

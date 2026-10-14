@@ -12,6 +12,9 @@ final class RemoteHost {
 
     var onLog: ((String) -> Void)?
     var onExit: (() -> Void)?
+    // This Mac's name and fingerprint while remote access is on, for comparing with
+    // what a viewer shows; nil when off.
+    var onIdentity: ((LocalLink.Identity?) -> Void)?
 
     private weak var window: NSWindow?
     private var link: HostLink?
@@ -169,6 +172,12 @@ final class RemoteHost {
                 return
             }
             showPairingPrompt(request)
+        case "identity":
+            guard let identity = try? JSONDecoder().decode(LocalLink.Identity.self, from: json) else {
+                log("Ignored malformed identity")
+                return
+            }
+            onIdentity?(identity)
         case "pairing_withdrawn":
             guard let withdrawn = try? JSONDecoder().decode(LocalLink.PairingWithdrawn.self, from: json),
                   prompt?.requestID == withdrawn.requestID else { return }
@@ -226,6 +235,7 @@ final class RemoteHost {
         restartTask?.cancel()
         Task { await stopCapture() }
         link = nil
+        onIdentity?(nil)
         sleep.disable()
         log("Remote access off: \(reason); sleep assertion released")
         onExit?()

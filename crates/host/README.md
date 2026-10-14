@@ -12,6 +12,8 @@ Input is ordered. Consecutive pointer moves coalesce while the app is busy; butt
 
 Pairing prompts go to the app with a fresh `request_id`. Only a decision carrying the id of the current prompt resolves it, so a late answer can't approve a later request. The pipe is the only approval path. When the device disconnects or the request times out, the host sends a `pairing_withdrawn` event, and the app closes the prompt.
 
+Right after HelloAck the host sends an `identity` event with its name and fingerprint. The app shows it in its window while Remote access is on, so a user can compare it with a viewer's screen even when no pairing prompt appears (a device the host already knows).
+
 Logins (protocol v4) go to the app as VerifyLogin with a fresh `request_id`. The app answers with LoginVerdict: ok only if the username is its own account's short or full name, OpenDirectory finds that record with this process's UID, and `ODRecord.verifyPassword` accepts the password. The proto host applies the delays and runs one check at a time; the app only checks. The host clears its frame buffer after writing, and the app clears the consumed pipe bytes and its copy of the password when done. The String handed to OpenDirectory can't be cleared, so this is best effort. Neither side logs the username or password; the app sees `login_failed` events with a device fingerprint and a count.
 
 Each access unit is checked against its keyframe flag. A keyframe must be an IDR with an in-band SPS and PPS. The WebCodecs codec string (`avc1.PPCCLL`) is taken from that SPS, so a new resolution simply arrives with the next IDR.

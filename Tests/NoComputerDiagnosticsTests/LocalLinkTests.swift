@@ -198,6 +198,18 @@ struct LocalLinkGoldenTests {
         #expect(try JSONDecoder().decode(LocalLink.PairingWithdrawn.self, from: json).requestID == 7)
     }
 
+    @Test func swiftDecodesTheGoldenIdentityEvent() throws {
+        var reader = LocalLink.Reader()
+        guard case let .event(json) = try reader.feed(Self.golden("85-event-identity.bin")).first else {
+            Issue.record("expected an event")
+            return
+        }
+        #expect(LocalLink.eventType(json) == "identity")
+        let identity = try JSONDecoder().decode(LocalLink.Identity.self, from: json)
+        #expect(identity.name == "MacBook Air")
+        #expect(identity.hostFingerprint.hasPrefix("0102 0304"))
+    }
+
     @Test func swiftDecodesTheGoldenClipboardFrame() throws {
         var reader = LocalLink.Reader()
         let messages = try reader.feed(Self.golden("8b-clipboard.bin"))

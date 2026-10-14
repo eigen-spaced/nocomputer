@@ -9,6 +9,8 @@ final class AppController: NSObject, NSApplicationDelegate {
     private let remoteAccess = NSButton(checkboxWithTitle: "Remote access (paired viewers only)", target: nil, action: nil)
     private let shareClipboard = NSButton(checkboxWithTitle: "Share clipboard text with the viewer", target: nil, action: nil)
     private let remoteStatus = NSTextField(wrappingLabelWithString: "Remote access off")
+    // Selectable, so the fingerprint can be read out in full and compared.
+    private let identityLabel = NSTextField(wrappingLabelWithString: "")
     private let logView = NSTextView()
     private var log: [String] = []
     private var timer: Timer?
@@ -43,6 +45,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         shareClipboard.target = self
         shareClipboard.action = #selector(toggleShareClipboard)
         root.addArrangedSubview(shareClipboard)
+        identityLabel.isSelectable = true
+        identityLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        showIdentity(nil)
+        root.addArrangedSubview(identityLabel)
         root.addArrangedSubview(remoteStatus)
         logView.isEditable = false
         logView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
@@ -100,6 +106,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         if remoteAccess.state == .on {
             let host = remoteHost ?? RemoteHost(window: window)
             host.onLog = { [weak self] in self?.record($0) }
+            host.onIdentity = { [weak self] in self?.showIdentity($0) }
             host.onExit = { [weak self] in
                 self?.remoteAccess.state = .off
                 self?.remoteStatus.stringValue = "Remote access off"
@@ -113,6 +120,14 @@ final class AppController: NSObject, NSApplicationDelegate {
         } else {
             remoteHost?.disable()
         }
+    }
+
+    private func showIdentity(_ identity: LocalLink.Identity?) {
+        guard let identity else {
+            identityLabel.stringValue = "This Mac's fingerprint appears here while Remote access is on."
+            return
+        }
+        identityLabel.stringValue = "This Mac (\(identity.name)) fingerprint, as a viewer should show it:\n\(identity.hostFingerprint)"
     }
 
     @objc private func toggleShareClipboard() {

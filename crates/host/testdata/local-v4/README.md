@@ -16,7 +16,7 @@ Reference encodings of every local-v4 frame. Each file is one complete frame: le
 | `07-login-verdict-refused.bin` | LoginVerdict, request_id 7, refused |
 | `81-hello-ack.bin` | HelloAck, version 4 |
 | `82-start-stream.bin`, `83-stop-stream.bin`, `84-request-keyframe.bin` | empty frames |
-| `85-event-pairing-prompt.bin`, `85-event-session.bin`, `85-event-pairing-withdrawn.bin` | Event JSON |
+| `85-event-pairing-prompt.bin`, `85-event-session.bin`, `85-event-pairing-withdrawn.bin`, `85-event-identity.bin` | Event JSON |
 | `86-pointer.bin` | Pointer x `0x1234`, y `0xFFFF` |
 | `87-button-left-down.bin`, `87-button-forward-up.bin` | Button 0 down, button 4 up |
 | `88-scroll-pixel.bin` | Scroll dx -3, dy 120, pixels |

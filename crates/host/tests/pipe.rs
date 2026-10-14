@@ -59,8 +59,16 @@ mod with_identity {
     fn hello_is_acknowledged_then_eof_exits_cleanly() {
         let (code, out) = run(&golden("01-hello"));
         assert_eq!(code, 0);
-        assert_eq!(out, ToApp::HelloAck { version: 4 }.encode());
-        assert_eq!(out, golden("81-hello-ack"));
+        // HelloAck, then the identity event, then nothing.
+        let ack = golden("81-hello-ack");
+        assert_eq!(ack, ToApp::HelloAck { version: 4 }.encode());
+        assert!(out.starts_with(&ack), "{out:?}");
+        let rest = &out[ack.len()..];
+        let len = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
+        assert_eq!(rest.len(), 4 + len, "exactly one frame after HelloAck");
+        assert_eq!(rest[4], 0x85);
+        let identity: serde_json::Value = serde_json::from_slice(&rest[5..]).unwrap();
+        assert_eq!(identity["type"], "identity");
     }
 
     #[test]

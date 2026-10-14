@@ -367,6 +367,7 @@ async fn run() -> Result<(), Exit> {
     let host = Arc::new(Host::bind(o.listen, &identity, config, clients, approver, verifier).map_err(Exit::startup)?);
     eprintln!("nocomputer-host: \"{}\" listening on {}", o.name, host.local_addr().map_err(Exit::startup)?);
     eprintln!("nocomputer-host: this host is {}", host.fingerprint());
+    let _ = notices_tx.send(Event::Identity { name: o.name.clone(), host_fingerprint: fp(&host.fingerprint()) });
     tokio::spawn(route_events(events, capture_tx, input.clone(), clipboard_tx, notices_tx));
     let runner = host.clone();
     tokio::spawn(async move { runner.run().await });

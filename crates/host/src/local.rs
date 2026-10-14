@@ -1,7 +1,7 @@
 //! local-v4: the pipe contract between the capture app (parent) and this host process
 //! (child), over the child's stdin and stdout. v2 added input (0x86-0x8A) and
 //! InputUnavailable (0x05); v3 added Clipboard (0x06, 0x8B); v4 added the account
-//! check (0x8C, 0x07) and the pairing_withdrawn and login_failed events. Only the
+//! check (0x8C, 0x07) and the identity, pairing_withdrawn and login_failed events. Only the
 //! current version is spoken.
 //!
 //! ```text
@@ -126,6 +126,9 @@ pub enum Event {
     Paired { name: String, device_fingerprint: String },
     PairingDenied { device_fingerprint: String },
     Rejected { device_fingerprint: Option<String>, reason: String },
+    /// Sent once after HelloAck: this host's name and fingerprint, for the app to show
+    /// so its user can compare it with what a viewer shows.
+    Identity { name: String, host_fingerprint: String },
     /// The device behind this prompt disconnected, or the request timed out; close the
     /// prompt. No decision is needed.
     PairingWithdrawn { request_id: u64 },
@@ -398,6 +401,13 @@ mod tests {
                 ToApp::VerifyLogin { request_id: 9, username: "Jürgen".into(), password: Password::new("correct horse – ü 🙂".into()).unwrap() },
             ),
             ("85-event-pairing-withdrawn", ToApp::Event(Event::PairingWithdrawn { request_id: 7 })),
+            (
+                "85-event-identity",
+                ToApp::Event(Event::Identity {
+                    name: "MacBook Air".into(),
+                    host_fingerprint: "0102 0304 0506 0708 090A 0B0C 0D0E 0F10 1112 1314 1516 1718 191A 1B1C 1D1E 1F20".into(),
+                }),
+            ),
         ]
     }
 

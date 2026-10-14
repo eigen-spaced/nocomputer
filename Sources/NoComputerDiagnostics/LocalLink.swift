@@ -267,6 +267,12 @@ enum LocalLink {
         }
     }
 
+    struct Identity: Decodable, Equatable {
+        let name: String
+        let hostFingerprint: String
+        enum CodingKeys: String, CodingKey { case name, hostFingerprint = "host_fingerprint" }
+    }
+
     struct PairingWithdrawn: Decodable, Equatable {
         let requestID: UInt64
         enum CodingKeys: String, CodingKey { case requestID = "request_id" }
