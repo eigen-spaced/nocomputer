@@ -30,7 +30,12 @@ final class RemoteHost {
     private var streamWanted = false
     private var starting = false
     private var restartTask: Task<Void, Never>?
-    private var prompt: (alert: NSAlert, requestID: UInt64, deviceName: String)?
+    private var prompt: (alert: NSAlert, request: LocalLink.PairingPrompt)?
+    // Controlling sessions, counted as the child does: a replacing session can
+    // start before the one it replaces ends.
+    private var sessions = 0 {
+        didSet { if (oldValue > 0) != (sessions > 0), let request = prompt?.request { showPairingPrompt(request) } }
+    }
     // Input is injected on its own queue, never behind UI work. The injector
     // and the fields below are only touched on this queue.
     private let inputQueue = DispatchQueue(label: "dev.nocomputer.input", qos: .userInteractive)
@@ -182,10 +187,13 @@ final class RemoteHost {
             onIdentity?(identity)
         case "pairing_withdrawn":
             guard let withdrawn = try? JSONDecoder().decode(LocalLink.PairingWithdrawn.self, from: json),
-                  let current = prompt, current.requestID == withdrawn.requestID else { return }
+                  let current = prompt, current.request.requestID == withdrawn.requestID else { return }
             dismissPrompt()
-            onPairingNotice?("Pairing request from \"\(current.deviceName)\" closed: the device cancelled or 60 s passed. Nothing was approved.")
+            onPairingNotice?("Pairing request from \"\(current.request.deviceName)\" closed: the device cancelled or 60 s passed. Nothing was approved.")
             log("Pairing request withdrawn: the device left or the request timed out")
+        case "session", "session_ended":
+            sessions = max(0, sessions + (LocalLink.eventType(json) == "session" ? 1 : -1))
+            log("Host event \(LocalLink.eventType(json) ?? ""): \(String(decoding: json, as: UTF8.self))")
         case let type?:
             // Display only. The JSON carries names and fingerprints, never keys.
             log("Host event \(type): \(String(decoding: json, as: UTF8.self))")
@@ -196,12 +204,15 @@ final class RemoteHost {
 
     // Deny is the default button; approving needs a deliberate click. Only one
     // request is pending in the child at a time, so a newer prompt replaces this one.
+    // While a viewer is in control, a click may be the viewer's rather than someone
+    // at this Mac, so Approve is disabled; the prompt is redrawn when that changes.
     private func showPairingPrompt(_ request: LocalLink.PairingPrompt) {
         dismissPrompt()
         onPairingNotice?(nil)
+        let controlled = sessions > 0
         let alert = NSAlert()
         alert.messageText = "Allow \"\(request.deviceName)\" to control this Mac?"
-        alert.informativeText = """
+        alert.informativeText = (controlled ? "Disconnect the viewer first to approve a new device.\n\n" : "") + """
             Only approve if the viewer shows these same fingerprints.
 
             Device:
@@ -211,12 +222,14 @@ final class RemoteHost {
             \(request.hostFingerprint)
             """
         alert.addButton(withTitle: "Deny")
-        alert.addButton(withTitle: "Approve")
-        prompt = (alert, request.requestID, request.deviceName)
-        let decide: (NSApplication.ModalResponse) -> Void = { [weak self] response in
-            guard let self, self.prompt?.requestID == request.requestID else { return }
+        alert.addButton(withTitle: "Approve").isEnabled = !controlled
+        prompt = (alert, request)
+        // Matched by dialog, not request id: a redrawn prompt reuses the id, and the
+        // dialog it replaced must not answer for it.
+        let decide: (NSApplication.ModalResponse) -> Void = { [weak self, weak alert] response in
+            guard let self, let alert, self.prompt?.alert === alert else { return }
             self.prompt = nil
-            let approve = response == .alertSecondButtonReturn
+            let approve = response == .alertSecondButtonReturn && self.sessions == 0
             self.link?.decide(requestID: request.requestID, approve: approve)
             self.log("Pairing \(approve ? "approved" : "denied"): \(request.deviceName)")
             self.onPairingNotice?("Pairing request from \"\(request.deviceName)\" \(approve ? "approved" : "denied").")
@@ -226,7 +239,7 @@ final class RemoteHost {
     }
 
     private func dismissPrompt() {
-        guard let (alert, _, _) = prompt else { return }
+        guard let (alert, _) = prompt else { return }
         prompt = nil
         if let sheetParent = alert.window.sheetParent { sheetParent.endSheet(alert.window) }
         else if NSApp.modalWindow == alert.window { NSApp.abortModal() }
@@ -240,6 +253,7 @@ final class RemoteHost {
         restartTask?.cancel()
         Task { await stopCapture() }
         link = nil
+        sessions = 0
         onIdentity?(nil)
         onPairingNotice?(nil)
         sleep.disable()
