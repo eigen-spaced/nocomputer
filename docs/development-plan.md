@@ -227,6 +227,17 @@ End to end between machines (2026-10-13): the Mac app's bundled host streamed th
     - a new device paired after approval on the Mac (then removed);
     - Cancel during pairing: the Mac's prompt closed by itself, and the Mac window said nothing was approved.
 
+- **Display wake on input (2026-10-14):** modelled on how NoMachine wakes the display.
+  - A session start and remote input declare local user activity (`IOPMAssertionDeclareUserActivity`), at most once a second. This wakes a sleeping display and restarts its idle timer.
+  - Input from a viewer without Accessibility still counts.
+  - While the display sleeps, capture waits for it instead of failing every 2 s. After input, a stream that died with `-3815` starts again within about 0.5 s of the display waking.
+  - The assertion is released when the session ends, so the display may sleep again.
+  - **Live test, user-confirmed:**
+    - connected with the Mac locked and its display off: first frame decoded 0.7 s after login;
+    - while locked, the display sleeps about 60 s after the last input (the lock screen's timer). Two mid-session sleeps each woke on the next viewer input; the picture returned 0.7–1.2 s later on a fresh keyframe, with no decode errors and no connection loss;
+    - after disconnect, the display slept on its normal timer.
+  - Turning Remote access off ends the session with "connection lost" in the viewer. A distinct host-ended close code is a follow-up.
+
 Still pending:
 
 - **Host panel (b2):** the host window becomes one bundled web page shared by the Mac app and a future Windows host; the contract is in [host-panel.md](host-panel.md). The page is the Windows agent's; the Swift shell is the Mac agent's.

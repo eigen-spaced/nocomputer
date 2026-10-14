@@ -9,6 +9,8 @@ import CoreMedia
 final class RemoteHost {
     static let executableName = "nocomputer-host"
     static let retryDelay: UInt64 = 2_000_000_000
+    // Display wake takes a fraction of a second; poll for it this often.
+    static let wakePollDelay: UInt64 = 500_000_000
 
     var onLog: ((String) -> Void)?
     var onExit: (() -> Void)?
@@ -31,6 +33,7 @@ final class RemoteHost {
     }
     private var streamWanted = false
     private var starting = false
+    private var waitingForDisplay = false
     private var restartTask: Task<Void, Never>?
     private var prompt: (alert: NSAlert, request: LocalLink.PairingPrompt)?
     // Controlling sessions, counted as the child does: a replacing session can
@@ -55,6 +58,8 @@ final class RemoteHost {
     nonisolated(unsafe) private var trusted = false
     nonisolated(unsafe) private var untrustedDrops = 0
     nonisolated(unsafe) private var timedOutput: CaptureOutput?
+    // Wakes the display for remote input. Also only touched on inputQueue.
+    nonisolated(unsafe) private let displayWake = DisplayWakeRequest()
 
     var running: Bool { link != nil }
 
@@ -103,7 +108,7 @@ final class RemoteHost {
     func statusLine() -> String {
         guard let link else { return "Remote access off" }
         let state = link.snapshot()
-        let input = inputQueue.sync { (injector?.state ?? InputSnapshot(), untrustedDrops) }
+        let input = inputQueue.sync { (injector?.state ?? InputSnapshot(), untrustedDrops, displayWake.failures) }
         var line = "Remote access on; streaming=\(capture.stream != nil ? "yes" : "no"); sent=\(state.accessUnits) (keyframes \(state.keyframes), \(state.bytes) bytes); pipe drops=\(state.pressureDrops)+\(state.dependentDrops) dependent; peak queued=\(state.peakQueued)"
         if let e = capture.output?.encoder?.snapshot() {
             let average = e.encoded > 0 ? e.totalMilliseconds / Double(e.encoded) : 0
@@ -116,6 +121,7 @@ final class RemoteHost {
         // Counts only; no key identities.
         line += "\nInput: pointer=\(input.0.pointerEvents) buttons=\(input.0.buttonEvents) scroll=\(input.0.scrollEvents) keys=\(input.0.keyEvents) unmapped=\(input.0.unmappedKeys) releaseAll=\(input.0.releaseAlls)"
         if input.1 > 0 { line += " dropped without Accessibility=\(input.1)" }
+        if input.2 > 0 { line += " display wake failures=\(input.2)" }
         // Counts only; never the text.
         let c = clipboard.state
         line += "\nClipboard: \(clipboardEnabled ? "on" : "off"); sent=\(c.sent) received=\(c.applied) skipped secret=\(c.skippedSecret) over 1 MiB=\(c.skippedLarge) not text=\(c.skippedNonText)"
@@ -127,6 +133,8 @@ final class RemoteHost {
         // saw an earlier one.
         if !AXIsProcessTrusted() { link?.inputUnavailable(reason: "Accessibility is not granted to the host app") }
         if clipboardEnabled { clipboard.start() }
+        // Capture cannot start, and ends with -3815, while the display sleeps.
+        inputQueue.async { self.displayWake.requestIfDue() }
         startStream()
     }
 
@@ -134,6 +142,14 @@ final class RemoteHost {
         streamWanted = true
         restartTask?.cancel()
         guard capture.stream == nil, !starting, let link else { return }
+        if CGDisplayIsAsleep(CGMainDisplayID()) != 0 {
+            // Woken by the session start or the viewer's next input.
+            if !waitingForDisplay { log("Display asleep; capture waits for it to wake") }
+            waitingForDisplay = true
+            scheduleStart(after: Self.wakePollDelay)
+            return
+        }
+        waitingForDisplay = false
         starting = true
         link.expectKeyframe()
         Task {
@@ -155,6 +171,7 @@ final class RemoteHost {
         releaseInput()
         clipboard.stop()
         streamWanted = false
+        waitingForDisplay = false
         restartTask?.cancel()
         Task { await stopCapture() }
         log("Stream stopped: \(reason)")
@@ -171,12 +188,23 @@ final class RemoteHost {
         log("Capture ended: \(reason)")
         capture.retireStoppedStream()
         guard streamWanted else { return }
+        scheduleStart(after: Self.retryDelay)
+    }
+
+    private func scheduleStart(after delay: UInt64) {
         restartTask?.cancel()
         restartTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: Self.retryDelay)
+            try? await Task.sleep(nanoseconds: delay)
             guard !Task.isCancelled, let self, self.streamWanted else { return }
             self.startStream()
         }
+    }
+
+    // Remote input declared activity, which wakes a sleeping display. If capture
+    // ended while it slept, try again soon rather than after the full retry delay.
+    private func inputDeclaredActivity() {
+        guard streamWanted, capture.stream == nil, !starting else { return }
+        scheduleStart(after: Self.wakePollDelay)
     }
 
     private func event(_ json: Data) {
@@ -271,11 +299,20 @@ final class RemoteHost {
         onExit?()
     }
 
-    private func releaseInput() { inputQueue.async { self.injector?.releaseAll() } }
+    // Also lets the display sleep again on its normal idle timer.
+    private func releaseInput() {
+        inputQueue.async {
+            self.injector?.releaseAll()
+            self.displayWake.release()
+        }
+    }
 
     // On inputQueue. Without Accessibility, posted events are silently
     // discarded by the system, so drop and count them instead.
     nonisolated private func inject(_ input: RemoteInput) {
+        // Any viewer input counts as activity, as a local user's would, even
+        // when Accessibility is missing and the input itself is dropped.
+        if displayWake.requestIfDue() { Task { @MainActor in self.inputDeclaredActivity() } }
         let now = ProcessInfo.processInfo.systemUptime
         if now - trustCheckedAt > 1 {
             trustCheckedAt = now
