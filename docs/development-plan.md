@@ -214,17 +214,23 @@ End to end between machines (2026-10-13): the Mac app's bundled host streamed th
   - **Path:** Tailscale direct (192.168.66.112), 12 ms ping.
   - **Pointer off the window:** with the viewer in front, keys pressed while the pointer is off its window stay with Windows, so Win+Shift+S works (see [app/README.md](../app/README.md#remote-input)).
 
+- **Connection screen and account login (2026-10-14), on main at `98ac864`:** protocol v4 and local-v4, modelled on NoMachine. Details are in [app/README.md](../app/README.md#live-video).
+  - **Start screen:** the viewer opens to saved hosts and an address field (name or IP). `--connect` stays for testing.
+  - **Pairing:** an unknown host shows both fingerprints in the viewer, and the user approves on the Mac. While Remote access is on, the Mac window shows its fingerprint and a line saying how the last pairing request ended. "Ask the host to approve" opens a fresh connection and checks the host still has the fingerprint shown, so the pairing screen has no time limit. The host gives an unpaired connection 30 s to ask.
+  - **Login:** after pairing, the Mac checks a username and password against the signed-in account with OpenDirectory, over the encrypted connection. Every failure gets the same message. The wait before the next try is 1 s, doubling from the third failure up to 5 min, counted per device and across the host. A connection gets 5 tries or 2 minutes. Neither side stores or logs the password; the viewer remembers only the username per host.
+  - **After login:** if the Mac is locked, the user unlocks it at the lock screen (option A). There is no automatic unlock. Disconnect returns to the start screen.
+  - **Live test, user-confirmed (viewer `33cbffe`, then `4002f60` for the pairing fix; Mac `013ef80`, then `e7835ff` for the status line):**
+    - wrong password, then the right one;
+    - wrong username, same message;
+    - logged in, locked the Mac, unlocked it at the lock screen through the viewer;
+    - Remote access off mid-session: the viewer said "The connection to the host was lost." and the Mac log had no `pipe write failed`;
+    - a new device paired after approval on the Mac (then removed);
+    - Cancel during pairing: the Mac's prompt closed by itself, and the Mac window said nothing was approved.
+
 Still pending:
 
-- **Connection screen and account login (user request, 2026-10-14), modelled on NoMachine:**
-  - **Start screen:** the viewer opens to saved hosts and an address field (name or IP), plus Connect. `--connect` stays for testing.
-  - **First connection:** an unknown host goes through the existing pairing approval, shown in the viewer: fingerprints on both screens, approve on the Mac. Pairing stays the device check; the login does not replace it.
-  - **Login:** after pairing, a username and password, checked by the Mac against the account of the signed-in user, over the encrypted connection. Failures get one generic message and a growing delay. Neither side stores or logs the password; there is no "remember password".
-  - **After login:** the screen appears. If the Mac is locked, the user unlocks it at the lock screen as tested above (option A). Automatic unlock is not planned.
-  - **Errors in plain words:** can't reach the Mac or Remote access is off, not paired, revoked, another viewer connected, wrong login.
-  - **Disconnect:** returns to the start screen.
-  - **Work split:** this needs a protocol version bump. Login messages and the Mac's password check are the Mac agent's; the screens are mine.
-  - **Reverse direction (Mac viewer, Windows host):** use the same flow if needed: a Windows host running in the user's session can't capture the secure desktop where Windows shows its lock screen.
+- **Re-dial finds the device already paired:** if this PC got paired another way while its pairing screen was open, the viewer says the host fingerprint changed. That's safe but wrong; it should say "already paired, connect again".
+- **Reverse direction (Mac viewer, Windows host):** use the same flow. A Windows host running in the user's session can't capture the secure desktop where Windows shows its lock screen.
 
 Deliverable: authenticated connections by hostname/IP with a documented pairing flow and bounded video transport.
 
