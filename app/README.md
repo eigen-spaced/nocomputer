@@ -83,6 +83,7 @@ Live mode shares plain text both ways on the authenticated connection (protocol 
 - **Sent:** what is on the clipboard when sharing starts, then each copy, with `\r\n` made `\n` and the text cut at its first NUL. Nothing is sent for copies with no text, text that is empty or over 1 MiB, text equal to the last sent or received, or copies other apps mark private: `ExcludeClipboardContentFromMonitorProcessing`, `Clipboard Viewer Ignore`, or `CanIncludeInClipboardHistory` / `CanUploadToCloudClipboard` holding anything but 1 (password managers set these).
 - **Received:** the host's text is put on the clipboard with `\n` made `\r\n` and `CanUploadToCloudClipboard` = 0, so Windows doesn't sync it to the cloud clipboard; it can still appear in local clipboard history (Win+V). Text arriving while the switch is off is dropped. The write is recognised by its clipboard sequence number and not sent back.
 - **Never logged:** the status bar shows only counts: sent, received, skipped, and failed (the clipboard stayed busy for 200 ms, or a write failed).
+- **Live test** (`118d6c6`, user-confirmed 2026-10-14, against the Mac host): multi-line text Windows→Mac, ü and emoji Mac→Windows, password-manager copies skipped on both sides, and the switch off on each side. Text from the Mac appears in local Win+V history.
 - **Test against the real clipboard** (it overwrites the clipboard and puts its text back): `cargo test -- --ignored clipboard`.
 
 ## What counts as hardware-decode evidence
