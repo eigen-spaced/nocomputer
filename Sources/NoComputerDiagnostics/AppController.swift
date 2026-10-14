@@ -11,6 +11,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private let remoteStatus = NSTextField(wrappingLabelWithString: "Remote access off")
     // Selectable, so the fingerprint can be read out in full and compared.
     private let identityLabel = NSTextField(wrappingLabelWithString: "")
+    private let pairingNotice = NSTextField(wrappingLabelWithString: "")
     private let logView = NSTextView()
     private var log: [String] = []
     private var timer: Timer?
@@ -49,6 +50,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         identityLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         showIdentity(nil)
         root.addArrangedSubview(identityLabel)
+        pairingNotice.isHidden = true
+        root.addArrangedSubview(pairingNotice)
         root.addArrangedSubview(remoteStatus)
         logView.isEditable = false
         logView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
@@ -107,6 +110,10 @@ final class AppController: NSObject, NSApplicationDelegate {
             let host = remoteHost ?? RemoteHost(window: window)
             host.onLog = { [weak self] in self?.record($0) }
             host.onIdentity = { [weak self] in self?.showIdentity($0) }
+            host.onPairingNotice = { [weak self] notice in
+                self?.pairingNotice.stringValue = notice ?? ""
+                self?.pairingNotice.isHidden = notice == nil
+            }
             host.onExit = { [weak self] in
                 self?.remoteAccess.state = .off
                 self?.remoteStatus.stringValue = "Remote access off"
