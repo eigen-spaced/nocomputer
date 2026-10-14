@@ -7,12 +7,16 @@
 //!   nocomputer-pair watch HOST[:PORT] [--seconds N] [--name NAME]   (video statistics)
 //!   nocomputer-pair clients | revoke FINGERPRINT | forget HOST[:PORT]
 //!
+//! `connect` and `watch` ask for the host account's username and password; the password
+//! is read without echo and never stored. The `host` here has no account to check, so
+//! it asks its own console to allow each login instead; it is a protocol test tool.
+//!
 //! State lives in NOCOMPUTER_STATE_DIR, or the per-user app data folder. The private
 //! key is kept in DPAPI (Windows) or the Keychain (macOS).
 
 use nocomputer_proto::{
-    load_or_create_identity, platform_keystore, Approver, Fingerprint, Host, HostConfig, HostEvent, Identity, KnownHosts, Outcome, PairedClients,
-    paths, Viewer, DEFAULT_PORT,
+    load_or_create_identity, platform_keystore, Approver, Fingerprint, Host, HostConfig, HostEvent, Identity, KnownHost, KnownHosts, LoginResult,
+    Outcome, PairedClients, Password, Session, Verifier, Viewer, DEFAULT_PORT, paths,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -103,10 +107,23 @@ async fn host(args: &[String]) -> Result<(), BoxError> {
             Box::pin(async move { rx.await.unwrap_or(false) })
         })
     };
+    // No account to check here: the console allows each login. The password is dropped
+    // unread.
+    let verifier: Verifier = {
+        let pending = pending.clone();
+        Arc::new(move |attempt| {
+            let (tx, rx) = oneshot::channel();
+            *pending.lock().unwrap() = Some(tx);
+            println!();
+            println!("Login from device {} (test host: the password is not checked)", attempt.device);
+            println!("Allow? [y/N]");
+            Box::pin(async move { rx.await.unwrap_or(false) })
+        })
+    };
     let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
     let mut config = HostConfig::new(name.clone());
     config.events = Some(events_tx);
-    let host = Arc::new(Host::bind(listen, &identity, config, PairedClients::at(state_dir().join("paired-clients.json")), approver)?);
+    let host = Arc::new(Host::bind(listen, &identity, config, PairedClients::at(state_dir().join("paired-clients.json")), approver, verifier)?);
 
     println!("host \"{name}\" listening on {}", host.local_addr()?);
     println!("this host: {}", host.fingerprint());
@@ -122,6 +139,7 @@ async fn host(args: &[String]) -> Result<(), BoxError> {
                 HostEvent::SessionEnded { device } => println!("session ended: {device}"),
                 HostEvent::Paired { device, name } => println!("paired: \"{name}\" {device}"),
                 HostEvent::PairingDenied { device } => println!("pairing denied or timed out: {device}"),
+                HostEvent::LoginFailed { device, failures } => println!("login failed ({failures} in a row): {device}"),
                 HostEvent::Rejected { device: Some(d), reason } => println!("rejected {d}: {reason}"),
                 HostEvent::Rejected { device: None, reason } => println!("rejected: {reason}"),
                 // This host has no capture, input injection or clipboard; input and
@@ -192,15 +210,44 @@ async fn pair(args: &[String]) -> Result<(), BoxError> {
     Ok(())
 }
 
+/// Connects to a pinned host and logs in, asking on the terminal.
+async fn log_in(viewer: &Viewer, address: &str, pinned: &KnownHost) -> Result<Session, BoxError> {
+    let Outcome::Login(mut prompt) = viewer.connect(resolve(address).await?, Some(pinned.fingerprint)).await? else {
+        unreachable!("pinned connections return a login prompt or an error")
+    };
+    println!("\"{}\" asks for its account's username and password", prompt.host_name);
+    let default_user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default();
+    loop {
+        let username = ask_username(&default_user).await?;
+        let password = tokio::task::spawn_blocking(|| rpassword::prompt_password("password: ")).await??;
+        let password = Password::new(password).ok_or("the password must be 1 to 1024 bytes")?;
+        match prompt.login(&username, password).await? {
+            LoginResult::Session(session) => return Ok(session),
+            LoginResult::Failed { retry_after, prompt: again } => {
+                println!("login failed; try again in {:.0} s", retry_after.as_secs_f64().ceil());
+                tokio::time::sleep(retry_after).await;
+                prompt = again;
+            }
+        }
+    }
+}
+
+async fn ask_username(default_user: &str) -> Result<String, BoxError> {
+    print!("username [{default_user}]: ");
+    use std::io::Write;
+    std::io::stdout().flush()?;
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let typed = read_line(&mut lines).await;
+    Ok(if typed.trim().is_empty() { default_user.to_string() } else { typed.trim().to_string() })
+}
+
 async fn connect(args: &[String]) -> Result<(), BoxError> {
     let address = with_port(&args[1]);
     let count: u32 = option(args, "--count").map(|c| c.parse()).transpose()?.unwrap_or(5);
     let known = KnownHosts::at(state_dir().join("known-hosts.json"));
     let pinned = known.get(&address)?.ok_or_else(|| format!("{address} is not paired; run `pair {address}` first"))?;
     let viewer = Viewer::new(identity()?, option(args, "--name").unwrap_or_else(default_name))?;
-    let Outcome::Ready(mut session) = viewer.connect(resolve(&address).await?, Some(pinned.fingerprint)).await? else {
-        unreachable!("pinned connections return a session or an error")
-    };
+    let mut session = log_in(&viewer, &address, &pinned).await?;
     println!("connected to \"{}\" {}", session.host_name, session.host_fingerprint);
     for _ in 0..count {
         println!("ping {:.2} ms", session.ping().await?.as_secs_f64() * 1000.0);
@@ -218,9 +265,7 @@ async fn watch(args: &[String]) -> Result<(), BoxError> {
     let known = KnownHosts::at(state_dir().join("known-hosts.json"));
     let pinned = known.get(&address)?.ok_or_else(|| format!("{address} is not paired; run `pair {address}` first"))?;
     let viewer = Viewer::new(identity()?, option(args, "--name").unwrap_or_else(default_name))?;
-    let Outcome::Ready(session) = viewer.connect(resolve(&address).await?, Some(pinned.fingerprint)).await? else {
-        unreachable!("pinned connections return a session or an error")
-    };
+    let session = log_in(&viewer, &address, &pinned).await?;
     println!("connected to \"{}\" {}", session.host_name, session.host_fingerprint);
     // Read in a task of its own: VideoReceiver::next is not cancel-safe.
     let (video_tx, mut video) = tokio::sync::mpsc::channel(1);

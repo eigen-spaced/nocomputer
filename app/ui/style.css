@@ -1,4 +1,8 @@
-html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+:root {
+  --bg: #000; --panel: #16181c; --line: #2c3036; --text: #e8eaed; --muted: #9aa0a6;
+  --accent: #3b82f6; --accent-text: #fff; --warn-bg: #3a1d1d; --warn-line: #7f2d2d;
+}
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); overflow: hidden; }
 canvas { display: block; width: 100vw; height: 100vh; }
 #status {
   position: fixed; left: 8px; bottom: 8px; padding: 4px 8px;
@@ -6,5 +10,54 @@ canvas { display: block; width: 100vw; height: 100vh; }
   background: rgba(0, 0, 0, 0.6); border-radius: 4px; pointer-events: none;
 }
 #status.hidden { display: none; }
-#status.interactive select, #status.interactive label { pointer-events: auto; } /* the rest passes the pointer to the picture */
-#status select { font: inherit; color: inherit; background: #222; border: 1px solid #555; border-radius: 3px; }
+#status.interactive select, #status.interactive label, #status.interactive button { pointer-events: auto; } /* the rest passes the pointer to the picture */
+#status select, #status button { font: inherit; color: inherit; background: #222; border: 1px solid #555; border-radius: 3px; }
+#status button { margin-left: 8px; padding: 0 6px; cursor: pointer; }
+
+/* Start screen: saved hosts, pairing and login. */
+#home { display: none; }
+body.home canvas, body.home #status { display: none; }
+body.home { overflow: auto; }
+body.home #home {
+  display: block; box-sizing: border-box; max-width: 460px; margin: 0 auto; padding: 32px 16px;
+  font: 14px/1.5 system-ui, "Segoe UI", -apple-system, sans-serif;
+}
+#home h1 { font-size: 20px; font-weight: 600; margin: 0 0 20px; }
+#home h2 { font-size: 16px; font-weight: 600; margin: 0 0 8px; }
+#home p { margin: 0 0 12px; color: var(--muted); }
+#home .view { display: none; }
+#home .view.shown { display: block; }
+#home label { display: block; margin: 12px 0 4px; color: var(--muted); }
+#home input {
+  box-sizing: border-box; width: 100%; padding: 8px 10px; font: inherit; color: var(--text);
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+}
+#home input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+#home .row { display: flex; gap: 8px; align-items: center; margin-top: 16px; }
+#home .row input { flex: 1; }
+#open-form .row { margin-top: 0; }
+#home button {
+  padding: 8px 14px; font: inherit; color: var(--accent-text); background: var(--accent);
+  border: 1px solid var(--accent); border-radius: 6px; cursor: pointer; white-space: nowrap;
+}
+#home button.secondary { color: var(--text); background: transparent; border-color: var(--line); }
+#home button:disabled { opacity: 0.5; cursor: default; }
+#hosts { list-style: none; margin: 0 0 20px; padding: 0; }
+#hosts:empty { display: none; }
+#hosts li {
+  display: flex; gap: 8px; align-items: center; padding: 10px 12px; margin-bottom: 8px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+}
+#hosts .who { flex: 1; min-width: 0; }
+#hosts .name { font-weight: 600; overflow-wrap: anywhere; }
+#hosts .address { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+#home dl { margin: 0; }
+#home dt { margin-top: 10px; color: var(--muted); }
+#home dd { margin: 2px 0 0; }
+.fingerprint { font: 13px/1.5 ui-monospace, Consolas, monospace; overflow-wrap: anywhere; }
+#problem:empty { display: none; }
+#problem {
+  margin-top: 20px; padding: 10px 12px; border: 1px solid var(--warn-line); border-radius: 6px;
+  background: var(--warn-bg); overflow-wrap: anywhere;
+}
+#problem .fingerprint { display: block; margin-top: 6px; }

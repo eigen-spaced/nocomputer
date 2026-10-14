@@ -1,4 +1,5 @@
-// WebCodecs viewer: a local file, or live video from a paired host (--connect).
+// WebCodecs viewer: a local file, or live video from a paired host, reached through
+// the start screen (saved hosts, pairing, login; see connect.rs).
 // Live, the pointer and wheel over the picture go to the host; on Windows the keyboard
 // goes through the native hook (hook.rs), and viewer controls move to Ctrl+Alt+Shift.
 // Input is never logged.
@@ -208,6 +209,7 @@ const KEY_SHORTCUTS = {
 };
 
 window.addEventListener('keydown', e => {
+  if (document.body.classList.contains('home')) return; // typing into the start screen
   // With the hook, keys belong to the host. The ones that reach the page (local combos,
   // or typing with the pointer off the window) mustn't work the browser: no reload,
   // print or find. Windows' own shortcuts never come here, and Alt+F4 still closes.
@@ -251,7 +253,8 @@ async function live(launch) {
   info.live = true;
   if (!launch.check) {
     startInput(launch);
-    await clipboardSwitch(); // before the session starts, so a saved "off" holds from the start
+    await clipboardSwitch();
+    disconnectButton();
   }
   let decoder = null, codec = null, waitingForKey = true, lastHostUs = null;
   const shown = []; // performance.now() of recent outputs, for the frame rate
@@ -521,10 +524,201 @@ async function clipboardSwitch() {
   await apply();
 }
 
+function disconnectButton() {
+  statusEl.classList.add('interactive');
+  const button = document.createElement('button');
+  button.textContent = 'Disconnect';
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    await invoke('live_disconnect').catch(() => {});
+    // A fresh page for the start screen; #start keeps --connect from opening again.
+    location.hash = 'start';
+    location.reload();
+  });
+  statusEl.append(button);
+}
+
+// ---- start screen ----
+
+const DEFAULT_PORT = ':47900';
+
+function savedPref(key) {
+  try { return localStorage.getItem(key); } catch { return null; }
+}
+
+function savePref(key, value) {
+  try { localStorage.setItem(key, value); } catch {}
+}
+
+// Connect, pair, log in, then hand over to live(). Each step is one connect_* command;
+// errors come back as { kind, message } in plain words.
+async function home(launch) {
+  const $ = id => document.getElementById(id);
+  document.body.classList.add('home');
+  // Settings that must hold from the session's first moment, set before any login.
+  await invoke('live_clipboard', { on: savedPref('clipboard') !== 'off' }).catch(() => {});
+  if (launch.keyboard_hook) {
+    const commandKey = savedPref('commandKey') === 'right_alt' ? 'right_alt' : 'win';
+    await invoke('live_settings', { commandKey }).catch(() => {});
+  }
+  const shortName = address => address.endsWith(DEFAULT_PORT) ? address.slice(0, -DEFAULT_PORT.length) : address;
+  let loginStep = null; // the login on screen
+  let retryTimer = null;
+  let note = null; // shown with the next login form
+
+  const showProblem = p => {
+    const el = $('problem');
+    el.textContent = '';
+    if (!p) return;
+    el.append(p.message ?? String(p));
+    if (p.expected) {
+      for (const [label, fp] of [['Paired: ', p.expected], ['Now: ', p.presented]]) {
+        const line = document.createElement('span');
+        line.className = 'fingerprint';
+        line.textContent = label + fp;
+        el.append(line);
+      }
+    }
+  };
+  const show = (view, problem = null) => {
+    clearInterval(retryTimer);
+    for (const v of document.querySelectorAll('#home .view')) v.classList.toggle('shown', v.id === view);
+    showProblem(problem);
+  };
+  const busy = text => { $('busy-text').textContent = text; show('busy'); };
+
+  const list = async (problem = null) => {
+    loginStep = null;
+    const ul = $('hosts');
+    ul.textContent = '';
+    let hosts = [];
+    try { hosts = await invoke('connect_hosts'); } catch (e) { problem ??= e; }
+    for (const h of hosts) {
+      const li = document.createElement('li');
+      const who = document.createElement('div');
+      who.className = 'who';
+      const name = document.createElement('div');
+      name.className = 'name';
+      name.textContent = h.name;
+      const address = document.createElement('div');
+      address.className = 'address';
+      address.textContent = shortName(h.address);
+      who.append(name, address);
+      const connect = document.createElement('button');
+      connect.textContent = 'Connect';
+      connect.addEventListener('click', () => open(h.address));
+      const forget = document.createElement('button');
+      forget.className = 'secondary';
+      forget.textContent = 'Forget';
+      let armed = null;
+      forget.addEventListener('click', async () => {
+        if (!armed) {
+          forget.textContent = 'Really forget?';
+          armed = setTimeout(() => { forget.textContent = 'Forget'; armed = null; }, 4000);
+          return;
+        }
+        clearTimeout(armed);
+        const problem = await invoke('connect_forget', { address: h.address }).then(() => null, e => e);
+        list(problem);
+      });
+      li.append(who, connect, forget);
+      ul.append(li);
+    }
+    show('list', problem);
+    if (!hosts.length) $('address').focus();
+  };
+
+  const step = s => {
+    if (s.step === 'pair') pair(s);
+    else if (s.step === 'login') login(s);
+    else if (s.step === 'live') { document.body.classList.remove('home'); resizeCanvas(); live(launch); }
+    else list();
+  };
+  // Only the latest command's answer counts; Cancel, or a newer command, drops the rest.
+  let latest = 0;
+  const run = (promise, onError = list) => {
+    const id = ++latest;
+    return promise.then(s => { if (id === latest) step(s); }, e => { if (id === latest) onError(e); });
+  };
+  const open = address => {
+    busy(`Connecting to ${shortName(address)}…`);
+    run(invoke('connect_open', { address }));
+  };
+
+  const pair = s => {
+    $('pair-title').textContent = `Pair with ${s.host_name}`;
+    $('pair-text').textContent = s.already_paired
+      ? `${s.host_name} already has this PC paired, but this PC hasn't saved it. Check that the host's fingerprint below matches the one its app shows, then continue.`
+      : `This PC hasn't connected to ${shortName(s.address)} before. Check that the host shows these same two fingerprints before asking it to approve.`;
+    $('pair-host').textContent = s.host_fingerprint;
+    $('pair-this').textContent = s.this_fingerprint;
+    $('pair-go').textContent = s.already_paired ? 'Continue' : 'Ask the host to approve';
+    $('pair-go').onclick = () => {
+      busy(s.already_paired ? 'Connecting…' : `Waiting for approval on ${s.host_name}. Approve this PC there within 60 seconds.`);
+      run(invoke('connect_pair'));
+    };
+    show('pair');
+  };
+
+  const login = s => {
+    loginStep = s;
+    $('login-title').textContent = `Log in to ${s.host_name}`;
+    const username = $('username');
+    if (!username.value) username.value = savedPref(`user:${s.address}`) ?? '';
+    $('password').value = '';
+    show('login', s.failed ? { message: 'Wrong username or password.' } : note);
+    note = null;
+    const go = $('login-go');
+    let wait = Math.ceil((s.retry_after_ms ?? 0) / 1000);
+    const tick = () => {
+      go.disabled = wait > 0;
+      go.textContent = wait > 0 ? `Try again in ${wait} s` : 'Log in';
+      if (wait-- <= 0) clearInterval(retryTimer);
+    };
+    tick();
+    if (wait >= 0) retryTimer = setInterval(tick, 1000);
+    (username.value ? $('password') : username).focus();
+  };
+
+  $('login-form').addEventListener('submit', e => {
+    e.preventDefault();
+    const s = loginStep;
+    if (!s || $('login-go').disabled) return;
+    const username = $('username').value.trim();
+    const password = $('password').value;
+    $('password').value = ''; // the page keeps no copy
+    savePref(`user:${s.address}`, username); // not secret; the password never is saved
+    busy('Logging in…');
+    run(invoke('connect_login', { username, password }), e => {
+      if (e.kind === 'bad_input') { login({ ...s, failed: false, retry_after_ms: 0 }); showProblem(e); }
+      else if (e.kind === 'disconnected') {
+        // The host gives each connection 2 minutes to log in; or the network dropped.
+        note = { message: 'The connection closed before the login finished. Enter the password again.' };
+        open(s.address);
+      } else list(e);
+    });
+  });
+  $('open-form').addEventListener('submit', e => {
+    e.preventDefault();
+    const address = $('address').value.trim();
+    if (address) open(address);
+  });
+  for (const b of document.querySelectorAll('#home .cancel')) {
+    b.addEventListener('click', async () => {
+      latest++;
+      await invoke('connect_cancel').catch(() => {});
+      list();
+    });
+  }
+
+  if (launch.connect && location.hash !== '#start') open(launch.connect);
+  else list();
+}
+
 (async () => {
   resizeCanvas();
   const launch = await invoke('launch_options');
-  if (launch.connect) await live(launch);
+  if (launch.live) await home(launch);
   else if (launch.check) await runCheck(launch);
   else await play(launch);
 })();

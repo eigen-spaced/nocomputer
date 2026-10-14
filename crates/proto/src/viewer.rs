@@ -1,8 +1,9 @@
-//! Viewer side: connects to a pinned host, or makes first contact to pair.
+//! Viewer side: connects to a pinned host and logs in, or makes first contact to pair.
 
 use crate::clipboard::{self, ClipboardText};
 use crate::identity::{Fingerprint, Identity, SERVER_NAME};
 use crate::input::{Input, Notice};
+use crate::login::Password;
 use crate::tls;
 use crate::video::VideoReceiver;
 use crate::wire::{read_msg, valid_device_name, write_msg, Message, PROTOCOL_VERSION};
@@ -16,6 +17,8 @@ use tokio::time::timeout;
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longer than the host's approval timeout, so the host answers first.
 const PAIR_RESULT_TIMEOUT: Duration = Duration::from_secs(90);
+/// Longer than the host's check and answer delay together.
+const LOGIN_RESULT_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub struct Viewer {
     identity: Identity,
@@ -25,8 +28,8 @@ pub struct Viewer {
 }
 
 pub enum Outcome {
-    /// Pinned host, and it has this device paired.
-    Ready(Session),
+    /// Pinned host, and it has this device paired; log in next.
+    Login(LoginPrompt),
     /// No pin was given. Nothing is trusted yet; see [`FirstContact`].
     FirstContact(FirstContact),
 }
@@ -81,6 +84,75 @@ impl FirstContact {
     pub(crate) fn channel_mut(&mut self) -> (&mut quinn::SendStream, &mut quinn::RecvStream) {
         (&mut self.channel.send, &mut self.channel.recv)
     }
+}
+
+/// A pinned host that has this device paired, waiting for its account's username and
+/// password. Nothing else happens on the connection until a login succeeds. The host
+/// closes it after 5 failed attempts or 2 minutes.
+pub struct LoginPrompt {
+    pub host_fingerprint: Fingerprint,
+    pub host_name: String,
+    channel: Channel,
+}
+
+pub enum LoginResult {
+    Session(Session),
+    /// Wrong username or password, or the attempt came before `retry_after` of the
+    /// previous failure had passed. The host doesn't say which; neither should the
+    /// viewer. Try again on `prompt` once `retry_after` has passed.
+    Failed { retry_after: Duration, prompt: LoginPrompt },
+}
+
+impl LoginPrompt {
+    /// Sends the login. `Err` ends the connection; [`crate::ErrorKind::LoginFailed`]
+    /// means too many attempts on it, and connecting again gives a new prompt.
+    pub async fn login(mut self, username: &str, password: Password) -> Result<LoginResult, Error> {
+        let login = Message::Login { username: username.to_string(), password };
+        let sent = write_msg(&mut self.channel.send, &login).await;
+        drop(login);
+        if let Err(e) = sent {
+            return Err(explain_close(&self.channel.conn, e));
+        }
+        let reply = match timeout(LOGIN_RESULT_TIMEOUT, read_msg(&mut self.channel.recv)).await {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(e)) => return Err(explain_close(&self.channel.conn, e)),
+            Err(_) => {
+                self.channel.close().await;
+                return Err(Error::Timeout("login result"));
+            }
+        };
+        match reply {
+            Message::LoginResult { ok: true, .. } => Ok(LoginResult::Session(Session::new(self.host_fingerprint, self.host_name, self.channel))),
+            Message::LoginResult { ok: false, retry_after_ms } => {
+                // Bounded, so a host can't make the viewer wait forever.
+                let retry_after = Duration::from_millis(retry_after_ms.min(3_600_000));
+                Ok(LoginResult::Failed { retry_after, prompt: self })
+            }
+            Message::Error { code, message } => {
+                self.channel.close().await;
+                Err(Error::Remote { code, message })
+            }
+            other => {
+                self.channel.close().await;
+                Err(Error::Protocol(format!("unexpected reply to login: {}", message_type(&other))))
+            }
+        }
+    }
+
+    /// Gives up without logging in.
+    pub async fn close(self) {
+        self.channel.close().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn channel_mut(&mut self) -> (&mut quinn::SendStream, &mut quinn::RecvStream) {
+        (&mut self.channel.send, &mut self.channel.recv)
+    }
+}
+
+/// Only the message type: replies are never echoed in full.
+fn message_type(message: &Message) -> String {
+    serde_json::to_value(message).ok().and_then(|v| v.get("type")?.as_str().map(str::to_string)).unwrap_or_default()
 }
 
 /// Notices held for the caller before newer ones are dropped.
@@ -308,7 +380,7 @@ impl Viewer {
         };
         match pinned {
             None => Ok(Outcome::FirstContact(FirstContact { host_fingerprint, host_name, already_paired: paired, channel })),
-            Some(_) if paired => Ok(Outcome::Ready(Session::new(host_fingerprint, host_name, channel))),
+            Some(_) if paired => Ok(Outcome::Login(LoginPrompt { host_fingerprint, host_name, channel })),
             Some(_) => {
                 channel.close().await;
                 Err(Error::Remote { code: ErrorCode::NotPaired, message: "the host does not have this device paired; pair again".into() })

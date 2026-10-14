@@ -1,22 +1,23 @@
 //! nocomputer-host: serves paired viewers. Normally spawned by the capture app with no
-//! arguments and fed over stdin/stdout (local-v3, see `local.rs`); stdout carries only
-//! local-v3 frames and all logging goes to stderr.
+//! arguments and fed over stdin/stdout (local-v4, see `local.rs`); stdout carries only
+//! local-v4 frames and all logging goes to stderr.
 //!
 //!   nocomputer-host [--listen ADDR] [--name NAME] [--state-dir DIR] [--from-file X.h264]
 //!
 //! `--from-file` replays an Annex B file at 60 fps instead of reading the app, and turns
-//! stdin into a y/N console for pairing approvals, for testing without the app. Input
-//! from the viewer is then only counted.
+//! stdin into a y/N console for pairing approvals and logins (the password is not
+//! checked then), for testing without the app. Input from the viewer is then only
+//! counted.
 //!
-//! Exit codes: 0 when stdin closes, 1 on startup errors, 2 on a local-v3 version
-//! mismatch, 3 on any other local-v3 violation.
+//! Exit codes: 0 when stdin closes, 1 on startup errors, 2 on a local-v4 version
+//! mismatch, 3 on any other local-v4 violation.
 
 use nocomputer_host::h264::{self, Kind};
 use nocomputer_host::input::InputQueue;
 use nocomputer_host::local::{self, Event, FromApp, ToApp};
 use nocomputer_proto::{
     load_or_create_identity, platform_keystore, wire::valid_device_name, AccessUnit, Approver, ClipboardText, Host, HostConfig, HostEvent, Notice, NoticeKind,
-    PairedClients, DEFAULT_PORT,
+    PairedClients, Verifier, DEFAULT_PORT,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -26,6 +27,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
+use zeroize::Zeroizing;
 
 /// At most one keyframe request to the capture side per this interval.
 const KEYFRAME_INTERVAL: Duration = Duration::from_millis(500);
@@ -214,14 +216,38 @@ async fn route_events(
             HostEvent::Rejected { device, reason } => {
                 let _ = notices.send(Event::Rejected { device_fingerprint: device.as_ref().map(fp), reason });
             }
+            HostEvent::LoginFailed { device, failures } => {
+                let _ = notices.send(Event::LoginFailed { device_fingerprint: fp(&device), failures });
+            }
         }
     }
 }
 
 type Pending = Arc<Mutex<Option<(u64, oneshot::Sender<bool>)>>>;
 
+/// Clears a request that ends unanswered: the proto host dropped its future because the
+/// device left or the request timed out.
+struct Unanswered {
+    pending: Pending,
+    request_id: u64,
+    on_drop: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Drop for Unanswered {
+    fn drop(&mut self) {
+        let mut slot = self.pending.lock().unwrap();
+        if slot.as_ref().is_some_and(|(id, _)| *id == self.request_id) {
+            *slot = None;
+            drop(slot);
+            if let Some(f) = self.on_drop.take() {
+                f();
+            }
+        }
+    }
+}
+
 /// Pairing approvals go to the app as prompts with a fresh id; only a decision carrying
-/// the id of the current prompt resolves it.
+/// the id of the current prompt resolves it. A prompt left unanswered is withdrawn.
 fn app_approver(pending: Pending, notices: mpsc::UnboundedSender<Event>) -> Approver {
     let next_id = Arc::new(AtomicU64::new(1));
     Arc::new(move |p| {
@@ -234,6 +260,49 @@ fn app_approver(pending: Pending, notices: mpsc::UnboundedSender<Event>) -> Appr
             device_fingerprint: fp(&p.device_fingerprint),
             host_fingerprint: fp(&p.host_fingerprint),
         });
+        let withdraw = notices.clone();
+        let guard = Unanswered {
+            pending: pending.clone(),
+            request_id,
+            on_drop: Some(Box::new(move || {
+                let _ = withdraw.send(Event::PairingWithdrawn { request_id });
+            })),
+        };
+        Box::pin(async move {
+            let _guard = guard;
+            rx.await.unwrap_or(false)
+        })
+    })
+}
+
+/// Logins go to the app, which checks them against the account it runs as. The host
+/// serializes checks, so one is outstanding at a time; only a verdict carrying its id
+/// resolves it.
+fn app_verifier(pending: Pending, requests: mpsc::UnboundedSender<ToApp>) -> Verifier {
+    let next_id = Arc::new(AtomicU64::new(1));
+    Arc::new(move |attempt| {
+        let (tx, rx) = oneshot::channel();
+        let request_id = next_id.fetch_add(1, Ordering::Relaxed);
+        *pending.lock().unwrap() = Some((request_id, tx));
+        // The proto host checks these bounds before calling; never send anything else.
+        let sent = nocomputer_proto::valid_username(&attempt.username)
+            && requests.send(ToApp::VerifyLogin { request_id, username: attempt.username, password: attempt.password }).is_ok();
+        let guard = Unanswered { pending: pending.clone(), request_id, on_drop: None };
+        Box::pin(async move {
+            let _guard = guard;
+            sent && rx.await.unwrap_or(false)
+        })
+    })
+}
+
+/// Replay mode has no account to check: the console allows each login, and the password
+/// is dropped unread.
+fn console_verifier(pending: Pending) -> Verifier {
+    Arc::new(move |attempt| {
+        let (tx, rx) = oneshot::channel();
+        *pending.lock().unwrap() = Some((0, tx));
+        eprintln!();
+        eprintln!("Login from device {} (replay mode: the password is not checked). Allow? [y/N]", attempt.device);
         Box::pin(async move { rx.await.unwrap_or(false) })
     })
 }
@@ -285,26 +354,38 @@ async fn run() -> Result<(), Exit> {
     let input = Arc::new(InputQueue::default());
     let (clipboard_tx, clipboard) = watch::channel(None);
     let pending: Pending = Arc::default();
-    let approver = match o.replay {
-        Some(_) => console_approver(pending.clone()),
-        None => app_approver(pending.clone(), notices_tx.clone()),
+    let logins: Pending = Arc::default();
+    let (requests_tx, requests) = mpsc::unbounded_channel();
+    let (approver, verifier) = match o.replay {
+        // One console answers both; only one question is open at a time.
+        Some(_) => (console_approver(pending.clone()), console_verifier(pending.clone())),
+        None => (app_approver(pending.clone(), notices_tx.clone()), app_verifier(logins.clone(), requests_tx)),
     };
     let mut config = HostConfig::new(o.name.clone());
     config.events = Some(events_tx);
     let clients = PairedClients::at(o.state_dir.join("paired-clients.json"));
-    let host = Arc::new(Host::bind(o.listen, &identity, config, clients, approver).map_err(Exit::startup)?);
+    let host = Arc::new(Host::bind(o.listen, &identity, config, clients, approver, verifier).map_err(Exit::startup)?);
     eprintln!("nocomputer-host: \"{}\" listening on {}", o.name, host.local_addr().map_err(Exit::startup)?);
     eprintln!("nocomputer-host: this host is {}", host.fingerprint());
+    let _ = notices_tx.send(Event::Identity { name: o.name.clone(), host_fingerprint: fp(&host.fingerprint()) });
     tokio::spawn(route_events(events, capture_tx, input.clone(), clipboard_tx, notices_tx));
     let runner = host.clone();
     tokio::spawn(async move { runner.run().await });
 
     let result = match o.replay {
         Some(path) => replay(&host, &path, capture, input, notices, pending).await,
-        None => serve_app(&host, stdin, capture, input, clipboard, notices, pending).await,
+        None => serve_app(&host, stdin, capture, input, clipboard, notices, Questions { pairing: pending, logins, login_requests: requests }).await,
     };
     host.close();
     result
+}
+
+/// What the app is asked: the pairing prompt and the login check awaiting an answer, and
+/// VerifyLogin frames to send.
+struct Questions {
+    pairing: Pending,
+    logins: Pending,
+    login_requests: mpsc::UnboundedReceiver<ToApp>,
 }
 
 /// Normal mode: the app on the other end of stdin/stdout.
@@ -315,8 +396,9 @@ async fn serve_app(
     input: Arc<InputQueue>,
     mut clipboard: watch::Receiver<Option<ClipboardText>>,
     mut notices: mpsc::UnboundedReceiver<Event>,
-    pending: Pending,
+    questions: Questions,
 ) -> Result<(), Exit> {
+    let Questions { pairing: pending, logins, login_requests: mut requests } = questions;
     // One writer owns stdout, so frames never interleave. Control frames go first; input
     // is ordered among itself; clipboard text waits behind both, and only the newest is
     // kept while it waits. On shutdown it writes the control frames already queued, then
@@ -336,7 +418,7 @@ async fn serve_app(
                 },
                 _ = &mut stop => {
                     while let Ok(m) = out.try_recv() {
-                        if stdout.write_all(&m.encode()).await.is_err() {
+                        if stdout.write_all(&Zeroizing::new(m.encode())).await.is_err() {
                             break;
                         }
                     }
@@ -344,7 +426,9 @@ async fn serve_app(
                     return;
                 }
             };
-            if stdout.write_all(&message.encode()).await.is_err() || stdout.flush().await.is_err() {
+            // Cleared after writing, since a VerifyLogin frame holds a password.
+            let frame = Zeroizing::new(message.encode());
+            if stdout.write_all(&frame).await.is_err() || stdout.flush().await.is_err() {
                 return;
             }
         }
@@ -361,6 +445,7 @@ async fn serve_app(
                     Capture::ReleaseAll => ToApp::ReleaseAll,
                 },
                 Some(e) = notices.recv() => ToApp::Event(e),
+                Some(r) = requests.recv() => r,
                 else => return,
             };
             if forward.send(message).is_err() {
@@ -392,6 +477,13 @@ async fn serve_app(
                     let _ = tx.send(approve);
                 } else {
                     eprintln!("nocomputer-host: ignoring a decision for pairing request {request_id}, which is not pending");
+                }
+            }
+            Ok(FromApp::LoginVerdict { request_id, ok }) => {
+                let mut slot = logins.lock().unwrap();
+                if slot.as_ref().is_some_and(|(id, _)| *id == request_id) {
+                    let (_, tx) = slot.take().unwrap();
+                    let _ = tx.send(ok);
                 }
             }
             Ok(FromApp::Hello { .. }) => break Err(Exit(3, "Hello after the handshake".into())),
@@ -507,7 +599,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    /// stdout belongs to local-v3 frames.
+    /// stdout belongs to local-v4 frames.
     #[test]
     fn nothing_prints_to_stdout() {
         for (name, source) in [("main.rs", include_str!("main.rs")), ("local.rs", include_str!("local.rs")), ("h264.rs", include_str!("h264.rs")), ("input.rs", include_str!("input.rs"))] {

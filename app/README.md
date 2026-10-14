@@ -1,9 +1,9 @@
 # Tauri viewer
 
-The Rust + Tauri viewer. It plays one local Annex B `.h264` file, or live video from a paired host (`--connect`), through WebCodecs in the system web view (WebView2 on Windows, WKWebView on macOS). Live mode forwards pointer, wheel and keyboard input (see Remote input) and shares plain-text clipboard both ways (see Clipboard). The C++ viewer in `viewer/` stays as the fallback comparison until this proof passes on native Windows.
+The Rust + Tauri viewer. It plays one local Annex B `.h264` file, or live video from a paired host (through its start screen), through WebCodecs in the system web view (WebView2 on Windows, WKWebView on macOS). Live mode forwards pointer, wheel and keyboard input (see Remote input) and shares plain-text clipboard both ways (see Clipboard). The C++ viewer in `viewer/` stays as the fallback comparison until this proof passes on native Windows.
 
 - `src-tauri/src/annexb.rs` splits the stream into access units (SPS/PPS/SEI kept with their picture) and derives the codec string from the first SPS. Limits: 8 MiB file, 1 MiB per access unit, 10,000 units. The first unit must be an IDR.
-- `src-tauri/src/main.rs` reads only the file named on the command line and sends it to the page as raw bytes.
+- `src-tauri/src/main.rs` reads only the file named on the command line and sends it to the page as raw bytes. With no file, it opens the start screen.
 - `ui/main.js` decodes with no `description` (Annex B, in-band parameter sets), keeps at most 4 chunks queued in the decoder, and closes every `VideoFrame`.
 
 ## Build and check (native Windows)
@@ -30,20 +30,25 @@ Recorded 2026-10-13 on the Windows target client: both fixtures pass in all thre
 ## Live video
 
 ```
-nocomputer-pair pair HOST            # once: compare fingerprints, approve on the host
-nocomputer-viewer.exe --connect HOST[:PORT]
+nocomputer-viewer.exe                                   # the start screen
+nocomputer-viewer.exe --connect HOST[:PORT]             # straight to HOST's login (or pairing)
 nocomputer-viewer.exe --connect HOST --via ADDR[:PORT]
 nocomputer-viewer.exe --check [--require-hardware] --connect HOST
 ```
 
-- **Identity:** the viewer uses the same identity and known-hosts file as `nocomputer-pair` (`%APPDATA%\nocomputer`, or `NOCOMPUTER_STATE_DIR`), and connects only to a pinned host. Pairing in the app comes later.
+- **Start screen (`connect.rs`):** saved hosts with Connect and Forget, and an address field for a name or IP. The host must have Remote access on.
+- **Pairing:** a host this PC hasn't saved goes through pairing first. The screen shows the host's fingerprint and this PC's, which must match what the host shows; then the host's user approves within 60 s. Cancel withdraws the request, and the host closes its prompt. If the host already has this PC paired (this PC lost its saved copy), checking the host's fingerprint is enough. After approval the host is saved, pinned to that fingerprint.
+- **Login (protocol v4):** every connection then needs the host account's username and password; the host checks them (on a Mac, against the signed-in account) and sends nothing else until they pass. A wrong login gets one message whatever was wrong, and the host makes later tries wait longer. After 5 tries, or 2 minutes, the host closes the connection; a timed-out login reconnects and asks again. The password goes to Rust as a command argument and is moved at once into proto's `Password`, which clears it when dropped. It is never saved, logged or put in an event, and the form clears its field as soon as it is sent; the JavaScript string and the IPC buffer can't be cleared. The username is remembered per host in the page's local storage.
+- **Errors in plain words:** can't reach the host (off, or Remote access off), lost connection, not paired, revoked, another viewer connected, connected again from elsewhere, version mismatch, a pairing request already pending, too many logins. A changed host identity is a warning with both fingerprints, and nothing is sent to that host.
+- **Disconnect:** the status-bar button ends the session and returns to the start screen.
+- **Identity:** the viewer uses the same identity and known-hosts file as `nocomputer-pair` (`%APPDATA%\nocomputer`, or `NOCOMPUTER_STATE_DIR`).
 - **`--via`:** dials another address for the same paired host, for example its LAN address when Tailscale is relaying. The pin still comes from HOST's known-hosts entry, so the host at ADDR must present that same identity or the connection is refused.
-- **Delivery:** `live.rs` connects when the page asks for its first frame. The page pulls frames with a long-poll invoke (the pull path from the IPC bench) as raw bytes.
+- **Delivery:** after login, `connect.rs` hands the session to `live.rs`. The page pulls frames with a long-poll invoke (the pull path from the IPC bench) as raw bytes.
 - **Dropping:** if the page or decoder falls behind, frames are dropped up to the next keyframe and one is requested. After a decoder error the page waits for a keyframe.
 - **Timestamps:** decoder timestamps are the host's `host_us`.
 - **No reordering:** each keyframe's SPS is rewritten to say frames are never reordered (`sps.rs`). VideoToolbox's SPS has a VUI without `bitstream_restriction`, so Chromium's decoder held several frames before output, and on a quiet screen, where frames come only on change, each waited for later ones.
 - **Exit:** the session is closed on exit, so the host frees its single-controller slot at once.
-- **Check mode:** `--check` decodes the first 300 frames and prints a JSON summary: frames, keyframes, drops on each side, size, and the largest gap between host timestamps.
+- **Check mode:** `--check` decodes the first 300 frames after login and prints a JSON summary: frames, keyframes, drops on each side, size, and the largest gap between host timestamps.
 
 Loopback check on the target client, 2026-10-13:
 - **Setup:** `nocomputer-host --from-file build/moving-1080p.h264`, paired via `nocomputer-pair`.

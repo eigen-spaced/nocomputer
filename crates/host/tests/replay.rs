@@ -1,9 +1,10 @@
 //! End to end on loopback: the real host binary replaying the fixture, and a viewer
-//! built on nocomputer-proto pairing with it and receiving video.
+//! built on nocomputer-proto pairing with it, logging in through its console, and
+//! receiving video.
 
 #![cfg(not(target_os = "macos"))] // the host identity would be the app's Keychain item
 
-use nocomputer_proto::{Identity, Outcome, Viewer};
+use nocomputer_proto::{Identity, LoginResult, Outcome, Password, Viewer};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -60,7 +61,12 @@ async fn viewer_pairs_and_receives_replayed_video() {
     console.write_all(b"y\n").unwrap();
     assert!(pairing.await.unwrap().unwrap());
 
-    let Outcome::Ready(mut session) = viewer.connect(addr, Some(host_fp)).await.unwrap() else { panic!() };
+    // Replay mode has no account to check: the console allows the login.
+    let Outcome::Login(prompt) = viewer.connect(addr, Some(host_fp)).await.unwrap() else { panic!() };
+    let login = tokio::spawn(prompt.login("replay-user", Password::new("unchecked".into()).unwrap()));
+    wait_for("Allow? [y/N]");
+    console.write_all(b"y\n").unwrap();
+    let LoginResult::Session(mut session) = login.await.unwrap().unwrap() else { panic!("the allowed login failed") };
     session.ping().await.unwrap();
     let mut video = session.video();
     let started = Instant::now();

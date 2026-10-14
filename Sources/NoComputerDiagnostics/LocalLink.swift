@@ -1,16 +1,18 @@
 import Foundation
 
-// local-v3: the private pipe contract between this app and its bundled
+// local-v4: the private pipe contract between this app and its bundled
 // `nocomputer-host` child. crates/host/src/local.rs is the source of truth;
-// crates/host/testdata/local-v3/ holds golden vectors both sides test against.
+// crates/host/testdata/local-v4/ holds golden vectors both sides test against.
 // v2 adds remote input (0x86–0x8A) and InputUnavailable (0x05); v3 adds
-// clipboard text (0x06, 0x8B).
+// clipboard text (0x06, 0x8B); v4 adds the account check (0x8C, 0x07).
 // Frame: [u32 BE len = 1 + payload][u8 type][payload], 1 <= len <= 4 MiB.
 enum LocalLink {
-    static let version: UInt16 = 3
+    static let version: UInt16 = 4
     static let maximumLength = 4 * 1024 * 1024
     static let maximumReason = 1024
     static let maximumClipboard = 1 << 20
+    static let maximumUsername = 255
+    static let maximumPassword = 1024
 
     // Clipboard text as the contract allows it: 1 byte to 1 MiB of UTF-8, no NUL.
     // Descriptions show only the length, so the text never reaches a log.
@@ -26,6 +28,37 @@ enum LocalLink {
         var debugDescription: String { description }
     }
 
+    // A login password from VerifyLogin. Descriptions never show it, and its bytes
+    // are overwritten when it is released. The String handed to OpenDirectory is a
+    // copy this code can't clear, so clearing is best effort.
+    // Sendable: the bytes never change after init, except when cleared in deinit.
+    final class Password: @unchecked Sendable, Equatable, CustomStringConvertible, CustomDebugStringConvertible {
+        private var bytes: [UInt8]
+
+        init(_ bytes: [UInt8]) { self.bytes = bytes }
+
+        deinit {
+            bytes.withUnsafeMutableBytes { buffer in
+                guard let base = buffer.baseAddress else { return }
+                _ = memset_s(base, buffer.count, 0, buffer.count)
+            }
+        }
+
+        func withString<R>(_ body: (String) throws -> R) rethrows -> R {
+            try body(String(decoding: bytes, as: UTF8.self))
+        }
+
+        static func == (a: Password, b: Password) -> Bool { a.bytes == b.bytes }
+        var description: String { "Password(redacted)" }
+        var debugDescription: String { description }
+    }
+
+    struct LoginRequest: Equatable, Sendable {
+        let requestID: UInt64
+        let username: String
+        let password: Password
+    }
+
     enum ProtocolError: Error, Equatable { case invalid(String) }
 
     // Swift → Rust
@@ -36,6 +69,7 @@ enum LocalLink {
         case pairingDecision(requestID: UInt64, approve: Bool)
         case inputUnavailable(reason: String)
         case clipboard(ClipboardText)
+        case loginVerdict(requestID: UInt64, ok: Bool)
     }
 
     // Rust → Swift
@@ -47,6 +81,7 @@ enum LocalLink {
         case event(Data)
         case input(RemoteInput)
         case clipboard(ClipboardText)
+        case verifyLogin(LoginRequest)
     }
 
     static func encode(_ message: Outgoing) throws -> Data {
@@ -75,6 +110,10 @@ enum LocalLink {
         case let .clipboard(text):
             type = 0x06
             payload.append(Data(text.text.utf8))
+        case let .loginVerdict(requestID, ok):
+            type = 0x07
+            append(requestID, to: &payload)
+            payload.append(ok ? 1 : 0)
         }
         let length = 1 + payload.count
         guard length <= maximumLength else { throw ProtocolError.invalid("frame of \(length) bytes exceeds 4 MiB") }
@@ -93,6 +132,8 @@ enum LocalLink {
     }
 
     static func decode(type: UInt8, payload: Data) throws -> Incoming {
+        // Before the general copy below, so the password is copied only once.
+        if type == 0x8C { return .verifyLogin(try loginRequest(payload)) }
         func empty(_ message: Incoming) throws -> Incoming {
             guard payload.isEmpty else { throw ProtocolError.invalid("type \(type) must be empty") }
             return message
@@ -147,6 +188,40 @@ enum LocalLink {
         }
     }
 
+    // u64 BE request_id, u8 username length (1...255), username, password (the rest,
+    // 1...1024 bytes). The username has no control characters; the password no NUL.
+    private static func loginRequest(_ payload: Data) throws -> LoginRequest {
+        let start = payload.startIndex
+        guard payload.count >= 11 else { throw ProtocolError.invalid("VerifyLogin length \(payload.count)") }
+        let requestID = payload[start..<start + 8].reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
+        let length = Int(payload[start + 8])
+        let usernameEnd = start + 9 + length
+        guard length >= 1, usernameEnd < payload.endIndex else { throw ProtocolError.invalid("VerifyLogin username length \(length)") }
+        // Control characters as Rust's char::is_control: general category Cc.
+        guard let username = String(data: payload[(start + 9)..<usernameEnd], encoding: .utf8),
+              !username.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }) else {
+            throw ProtocolError.invalid("VerifyLogin username is not valid")
+        }
+        let password = payload[usernameEnd...]
+        guard password.count <= maximumPassword, !password.contains(0), isUTF8(password) else {
+            throw ProtocolError.invalid("VerifyLogin password is not 1 to 1024 bytes of UTF-8 without NUL")
+        }
+        return LoginRequest(requestID: requestID, username: username, password: Password([UInt8](password)))
+    }
+
+    // Validates without building a String, which would be another copy.
+    private static func isUTF8(_ bytes: Data) -> Bool {
+        var iterator = bytes.makeIterator()
+        var decoder = UTF8()
+        while true {
+            switch decoder.decode(&iterator) {
+            case .scalarValue: continue
+            case .emptyInput: return true
+            case .error: return false
+            }
+        }
+    }
+
     private static func append<T: FixedWidthInteger>(_ value: T, to data: inout Data) {
         withUnsafeBytes(of: value.bigEndian) { data.append(contentsOf: $0) }
     }
@@ -168,8 +243,11 @@ enum LocalLink {
                 guard buffer.count >= 4 + length else { break }
                 let start = buffer.startIndex
                 let type = buffer[start + 4]
-                let payload = Data(buffer[(start + 5)..<(start + 4 + length)])
+                var payload = Data(buffer[(start + 5)..<(start + 4 + length)])
+                // Frames can carry a password; clear consumed bytes before releasing them.
+                buffer.resetBytes(in: start..<(start + 4 + length))
                 buffer = Data(buffer[(start + 4 + length)...])
+                defer { payload.resetBytes(in: payload.startIndex..<payload.endIndex) }
                 messages.append(try LocalLink.decode(type: type, payload: payload))
             }
             return messages
@@ -187,6 +265,17 @@ enum LocalLink {
             case requestID = "request_id", deviceName = "device_name"
             case deviceFingerprint = "device_fingerprint", hostFingerprint = "host_fingerprint"
         }
+    }
+
+    struct Identity: Decodable, Equatable {
+        let name: String
+        let hostFingerprint: String
+        enum CodingKeys: String, CodingKey { case name, hostFingerprint = "host_fingerprint" }
+    }
+
+    struct PairingWithdrawn: Decodable, Equatable {
+        let requestID: UInt64
+        enum CodingKeys: String, CodingKey { case requestID = "request_id" }
     }
 
     static func eventType(_ json: Data) -> String? {

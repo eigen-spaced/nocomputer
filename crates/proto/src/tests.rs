@@ -1,8 +1,8 @@
 //! Loopback tests for pairing, authorization and impersonation.
 
-use crate::host::{Approver, Host, HostConfig};
+use crate::host::{Approver, Host, HostConfig, Verifier};
 use crate::wire::{read_msg, valid_device_name, write_msg, ErrorCode, Message, MAX_CONTROL_MESSAGE};
-use crate::{tls, Error, Fingerprint, Identity, MemoryKeyStore, Outcome, PairedClients, Viewer};
+use crate::{tls, Error, ErrorKind, Fingerprint, Identity, LoginResult, MemoryKeyStore, Outcome, PairedClients, Password, Session, Viewer};
 use rustls::sign::CertifiedKey;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -22,6 +22,27 @@ fn approver(answer: bool, prompts: Arc<Mutex<Vec<crate::PairingPrompt>>>) -> App
     })
 }
 
+const USER: &str = "tester";
+const PASSWORD: &str = "correct horse";
+
+/// Accepts only USER with PASSWORD.
+fn verifier() -> Verifier {
+    Arc::new(|attempt| Box::pin(async move { attempt.username == USER && attempt.password.expose() == PASSWORD }))
+}
+
+fn password(p: &str) -> Password {
+    Password::new(p.into()).unwrap()
+}
+
+/// Logs in to a pinned connection with the right account.
+async fn ready(outcome: Outcome) -> Session {
+    let Outcome::Login(prompt) = outcome else { panic!("expected a login prompt") };
+    match prompt.login(USER, password(PASSWORD)).await.unwrap() {
+        LoginResult::Session(session) => session,
+        LoginResult::Failed { .. } => panic!("the right login failed"),
+    }
+}
+
 fn start(host: Host, prompts: Arc<Mutex<Vec<crate::PairingPrompt>>>) -> TestHost {
     let host = Arc::new(host);
     let addr = host.local_addr().unwrap();
@@ -32,7 +53,7 @@ fn start(host: Host, prompts: Arc<Mutex<Vec<crate::PairingPrompt>>>) -> TestHost
 
 fn host_with(identity: &Identity, answer: bool) -> TestHost {
     let prompts = Arc::new(Mutex::new(Vec::new()));
-    let host = Host::bind(LOOPBACK.into(), identity, HostConfig::new("test-host"), PairedClients::in_memory(), approver(answer, prompts.clone())).unwrap();
+    let host = Host::bind(LOOPBACK.into(), identity, HostConfig::new("test-host"), PairedClients::in_memory(), approver(answer, prompts.clone()), verifier()).unwrap();
     start(host, prompts)
 }
 
@@ -99,7 +120,7 @@ async fn pairs_once_then_reconnects_without_prompt() {
     }
 
     for _ in 0..2 {
-        let Outcome::Ready(mut session) = viewer.connect(host.addr, Some(host_fp)).await.unwrap() else { panic!("expected session") };
+        let mut session = ready(viewer.connect(host.addr, Some(host_fp)).await.unwrap()).await;
         assert_eq!(session.host_name, "test-host");
         session.ping().await.unwrap();
         session.close().await;
@@ -113,7 +134,7 @@ async fn sessions_are_named_from_the_pairing_not_the_hello() {
     let mut config = HostConfig::new("test-host");
     config.events = Some(events);
     let prompts = Arc::new(Mutex::new(Vec::new()));
-    let host = start(Host::bind(LOOPBACK.into(), &Identity::generate().unwrap(), config, PairedClients::in_memory(), approver(true, prompts.clone())).unwrap(), prompts);
+    let host = start(Host::bind(LOOPBACK.into(), &Identity::generate().unwrap(), config, PairedClients::in_memory(), approver(true, prompts.clone()), verifier()).unwrap(), prompts);
     let identity = Identity::generate().unwrap();
     let device = identity.fingerprint();
     let copy = Identity::from_bytes(&identity.to_bytes()).unwrap();
@@ -121,7 +142,7 @@ async fn sessions_are_named_from_the_pairing_not_the_hello() {
 
     // The same paired device later calls itself something else.
     let renamed = Viewer::new(copy, "someone-else").unwrap();
-    let Outcome::Ready(session) = renamed.connect(host.addr, Some(host_fp)).await.unwrap() else { panic!("expected session") };
+    let session = ready(renamed.connect(host.addr, Some(host_fp)).await.unwrap()).await;
     session.close().await;
     let mut events = Vec::new();
     while let Ok(e) = seen.try_recv() {
@@ -138,19 +159,19 @@ async fn one_controller_at_a_time() {
     let host_fp = pair(&first, &host).await;
     pair(&second, &host).await;
 
-    let Outcome::Ready(mut active) = first.connect(host.addr, Some(host_fp)).await.unwrap() else { panic!() };
+    let mut active = ready(first.connect(host.addr, Some(host_fp)).await.unwrap()).await;
     assert_eq!(remote_code(second.connect(host.addr, Some(host_fp)).await), ErrorCode::Busy);
     active.ping().await.unwrap();
 
     // Closing frees the slot.
     active.close().await;
-    let Outcome::Ready(mut active) = second.connect(host.addr, Some(host_fp)).await.unwrap() else { panic!("slot was not freed by close") };
+    let mut active = ready(second.connect(host.addr, Some(host_fp)).await.unwrap()).await;
     active.ping().await.unwrap();
     assert_eq!(remote_code(first.connect(host.addr, Some(host_fp)).await), ErrorCode::Busy);
 
     // So does revocation.
     assert!(host.host.revoke(&second.fingerprint()).unwrap());
-    let Outcome::Ready(mut active) = first.connect(host.addr, Some(host_fp)).await.unwrap() else { panic!("slot was not freed by revocation") };
+    let mut active = ready(first.connect(host.addr, Some(host_fp)).await.unwrap()).await;
     active.ping().await.unwrap();
 }
 
@@ -159,10 +180,10 @@ async fn same_device_reconnecting_replaces_its_session() {
     let host = host_with(&Identity::generate().unwrap(), true);
     let viewer = viewer();
     let host_fp = pair(&viewer, &host).await;
-    let Outcome::Ready(mut old) = viewer.connect(host.addr, Some(host_fp)).await.unwrap() else { panic!() };
+    let mut old = ready(viewer.connect(host.addr, Some(host_fp)).await.unwrap()).await;
     old.ping().await.unwrap();
 
-    let Outcome::Ready(mut new) = viewer.connect(host.addr, Some(host_fp)).await.unwrap() else { panic!("same device was refused") };
+    let mut new = ready(viewer.connect(host.addr, Some(host_fp)).await.unwrap()).await;
     new.ping().await.unwrap();
     match old.ping().await {
         Err(Error::Remote { code: ErrorCode::Replaced, .. }) => {}
@@ -207,7 +228,7 @@ async fn revocation_closes_live_session_and_blocks_reconnect_and_repair() {
     let host = host_with(&Identity::generate().unwrap(), true);
     let viewer = viewer();
     let host_fp = pair(&viewer, &host).await;
-    let Outcome::Ready(mut session) = viewer.connect(host.addr, Some(host_fp)).await.unwrap() else { panic!() };
+    let mut session = ready(viewer.connect(host.addr, Some(host_fp)).await.unwrap()).await;
     session.ping().await.unwrap();
 
     assert!(host.host.revoke(&viewer.fingerprint()).unwrap());
@@ -252,7 +273,7 @@ async fn host_certificate_without_its_key_fails_the_handshake() {
     let attacker_key = Identity::generate().unwrap();
     let tls = tls::server_builder().unwrap().with_cert_resolver(Arc::new(Fixed(mismatched(&real, &attacker_key))));
     let prompts = Arc::new(Mutex::new(Vec::new()));
-    let impostor = Host::bind_with(LOOPBACK.into(), tls, real.fingerprint(), HostConfig::new("impostor"), PairedClients::in_memory(), approver(true, prompts.clone())).unwrap();
+    let impostor = Host::bind_with(LOOPBACK.into(), tls, real.fingerprint(), HostConfig::new("impostor"), PairedClients::in_memory(), approver(true, prompts.clone()), verifier()).unwrap();
     let impostor = start(impostor, prompts);
 
     for pin in [Some(pinned), None] {
@@ -271,7 +292,7 @@ async fn client_certificate_without_its_key_fails_the_handshake() {
     config.events = Some(events);
     let prompts = Arc::new(Mutex::new(Vec::new()));
     let host_id = Identity::generate().unwrap();
-    let host = start(Host::bind(LOOPBACK.into(), &host_id, config, PairedClients::in_memory(), approver(true, prompts.clone())).unwrap(), prompts);
+    let host = start(Host::bind(LOOPBACK.into(), &host_id, config, PairedClients::in_memory(), approver(true, prompts.clone()), verifier()).unwrap(), prompts);
     let paired_id = Identity::generate().unwrap();
     let paired_copy = Identity::from_bytes(&paired_id.to_bytes()).unwrap();
     let paired = Viewer::new(paired_id, "paired").unwrap();
@@ -417,8 +438,12 @@ fn known_hosts_pin_by_address() {
     let dir = std::env::temp_dir().join(format!("nocomputer-proto-hosts-{}", std::process::id()));
     let hosts = crate::KnownHosts::at(dir.join("known-hosts.json"));
     let fp = Identity::generate().unwrap().fingerprint();
+    assert!(hosts.list().unwrap().is_empty());
     hosts.add("MacBook-Air:47900", fp, "mac").unwrap();
+    hosts.add("box:47900", fp, "Linux box").unwrap();
     assert_eq!(hosts.get("macbook-air:47900").unwrap().unwrap().fingerprint, fp);
+    let names: Vec<String> = hosts.list().unwrap().into_iter().map(|h| h.name).collect();
+    assert_eq!(names, ["Linux box", "mac"]);
     assert!(hosts.forget("macbook-air:47900").unwrap());
     assert!(hosts.get("macbook-air:47900").unwrap().is_none());
     std::fs::remove_dir_all(&dir).unwrap();
@@ -453,10 +478,10 @@ async fn video_reaches_the_controller_in_order() {
     let mut config = HostConfig::new("test-host");
     config.events = Some(events);
     let prompts = Arc::new(Mutex::new(Vec::new()));
-    let host = start(Host::bind(LOOPBACK.into(), &Identity::generate().unwrap(), config, PairedClients::in_memory(), approver(true, prompts.clone())).unwrap(), prompts);
+    let host = start(Host::bind(LOOPBACK.into(), &Identity::generate().unwrap(), config, PairedClients::in_memory(), approver(true, prompts.clone()), verifier()).unwrap(), prompts);
     let viewer = viewer();
     let host_fp = pair(&viewer, &host).await;
-    let Outcome::Ready(mut session) = viewer.connect(host.addr, Some(host_fp)).await.unwrap() else { panic!() };
+    let mut session = ready(viewer.connect(host.addr, Some(host_fp)).await.unwrap()).await;
     session.ping().await.unwrap(); // the session loop, and so its video queue, is running
     assert!(drain(&mut seen).contains(&crate::HostEvent::KeyframeNeeded), "a new session needs a keyframe");
 
@@ -623,13 +648,13 @@ async fn input_reaches_the_host_in_order_and_notices_reach_the_viewer() {
     let mut config = HostConfig::new("test-host");
     config.events = Some(events);
     let prompts = Arc::new(Mutex::new(Vec::new()));
-    let host = start(Host::bind(LOOPBACK.into(), &Identity::generate().unwrap(), config, PairedClients::in_memory(), approver(true, prompts.clone())).unwrap(), prompts);
+    let host = start(Host::bind(LOOPBACK.into(), &Identity::generate().unwrap(), config, PairedClients::in_memory(), approver(true, prompts.clone()), verifier()).unwrap(), prompts);
     let viewer = viewer();
     let host_fp = pair(&viewer, &host).await;
 
     // No session yet: nobody to tell.
     host.host.notice(Notice { kind: NoticeKind::CaptureStopped, message: "nobody hears this".into() });
-    let Outcome::Ready(mut session) = viewer.connect(host.addr, Some(host_fp)).await.unwrap() else { panic!() };
+    let mut session = ready(viewer.connect(host.addr, Some(host_fp)).await.unwrap()).await;
     let sent = [
         Input::PointerMove { x: 1, y: 2 },
         Input::PointerButton { button: Button::Left, down: true },
@@ -681,12 +706,12 @@ async fn clipboard_crosses_both_ways_beside_input() {
     let mut config = HostConfig::new("test-host");
     config.events = Some(events);
     let prompts = Arc::new(Mutex::new(Vec::new()));
-    let host = start(Host::bind(LOOPBACK.into(), &Identity::generate().unwrap(), config, PairedClients::in_memory(), approver(true, prompts.clone())).unwrap(), prompts);
+    let host = start(Host::bind(LOOPBACK.into(), &Identity::generate().unwrap(), config, PairedClients::in_memory(), approver(true, prompts.clone()), verifier()).unwrap(), prompts);
     let viewer = viewer();
     let host_fp = pair(&viewer, &host).await;
     // No session yet: dropped.
     host.host.send_clipboard(ClipboardText::new("nobody".into()).unwrap());
-    let Outcome::Ready(mut session) = viewer.connect(host.addr, Some(host_fp)).await.unwrap() else { panic!() };
+    let mut session = ready(viewer.connect(host.addr, Some(host_fp)).await.unwrap()).await;
     session.ping().await.unwrap();
 
     // A full-size paste does not hold up a key behind it.
@@ -809,4 +834,223 @@ async fn clipboard_sent_while_an_earlier_one_waits_still_arrives() {
         last = Some(text);
     }
     assert_eq!(last.as_deref(), Some("B"));
+}
+
+fn login_host(delay: crate::LoginDelay) -> (TestHost, tokio::sync::mpsc::UnboundedReceiver<crate::HostEvent>, Arc<std::sync::atomic::AtomicU32>) {
+    let (events, seen) = tokio::sync::mpsc::unbounded_channel();
+    let mut config = HostConfig::new("test-host");
+    config.events = Some(events);
+    config.login_delay = delay;
+    let checks = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let counted: Verifier = {
+        let checks = checks.clone();
+        let inner = verifier();
+        Arc::new(move |attempt| {
+            checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            inner(attempt)
+        })
+    };
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let host = Host::bind(LOOPBACK.into(), &Identity::generate().unwrap(), config, PairedClients::in_memory(), approver(true, prompts.clone()), counted).unwrap();
+    (start(host, prompts), seen, checks)
+}
+
+async fn login_prompt(viewer: &Viewer, host: &TestHost, pinned: Fingerprint) -> crate::LoginPrompt {
+    match viewer.connect(host.addr, Some(pinned)).await.unwrap() {
+        Outcome::Login(prompt) => prompt,
+        Outcome::FirstContact(_) => panic!("expected a login prompt"),
+    }
+}
+
+async fn fail(prompt: crate::LoginPrompt, username: &str, pass: &str) -> (std::time::Duration, crate::LoginPrompt) {
+    match prompt.login(username, password(pass)).await.unwrap() {
+        LoginResult::Failed { retry_after, prompt } => (retry_after, prompt),
+        LoginResult::Session(_) => panic!("a wrong login succeeded"),
+    }
+}
+
+#[tokio::test]
+async fn wrong_logins_get_one_answer_and_a_growing_delay() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let base = Duration::from_millis(100);
+    let (host, mut events, checks) = login_host(crate::LoginDelay { base, cap: Duration::from_secs(5) });
+    let viewer = viewer();
+    let pinned = pair(&viewer, &host).await;
+    let prompt = login_prompt(&viewer, &host, pinned).await;
+
+    // A wrong password and a wrong account look the same, and the host answers only
+    // after the base delay.
+    let started = std::time::Instant::now();
+    let (first, prompt) = fail(prompt, USER, "wrong").await;
+    assert!(started.elapsed() >= base);
+    assert_eq!(first, Duration::ZERO);
+    let (_, prompt) = fail(prompt, "someone-else", PASSWORD).await;
+    // The third failure waits twice the base, half of it before answering.
+    let (third, prompt) = fail(prompt, USER, "wrong").await;
+    assert!(third > Duration::ZERO && third <= base, "{third:?}");
+    assert_eq!(checks.load(Ordering::SeqCst), 3);
+
+    // Too early: refused without asking the verifier, even with the right password.
+    let (early, prompt) = fail(prompt, USER, PASSWORD).await;
+    assert!(early <= third);
+    assert_eq!(checks.load(Ordering::SeqCst), 3, "an early attempt must not be checked");
+
+    tokio::time::sleep(early).await;
+    let LoginResult::Session(mut session) = prompt.login(USER, password(PASSWORD)).await.unwrap() else { panic!("the right login failed") };
+    session.ping().await.unwrap();
+    session.close().await;
+    let failures: Vec<u32> = drain(&mut events)
+        .into_iter()
+        .filter_map(|e| match e {
+            crate::HostEvent::LoginFailed { device, failures } if device == viewer.fingerprint() => Some(failures),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(failures, [1, 2, 3]);
+
+    // The success reset the count: the next failure costs the base delay again.
+    let prompt = login_prompt(&viewer, &host, pinned).await;
+    let (again, prompt) = fail(prompt, USER, "wrong").await;
+    assert_eq!(again, Duration::ZERO);
+    prompt.close().await;
+}
+
+#[tokio::test]
+async fn the_delay_holds_across_devices_and_connections() {
+    use std::time::Duration;
+    let (host, _events, checks) = login_host(crate::LoginDelay { base: Duration::from_millis(100), cap: Duration::from_secs(60) });
+    let (a, b) = (viewer(), viewer());
+    let (pin_a, pin_b) = (pair(&a, &host).await, pair(&b, &host).await);
+    let mut prompt = login_prompt(&a, &host, pin_a).await;
+    for _ in 0..4 {
+        prompt = fail(prompt, USER, "wrong").await.1;
+    }
+    drop(prompt);
+    let checked = checks.load(std::sync::atomic::Ordering::SeqCst);
+    // A new connection, and another device, both wait out the delay unchecked.
+    let (wait, prompt) = fail(login_prompt(&a, &host, pin_a).await, USER, PASSWORD).await;
+    assert!(wait > Duration::ZERO);
+    drop(prompt);
+    let (wait, prompt) = fail(login_prompt(&b, &host, pin_b).await, USER, PASSWORD).await;
+    assert!(wait > Duration::ZERO);
+    drop(prompt);
+    assert_eq!(checks.load(std::sync::atomic::Ordering::SeqCst), checked);
+}
+
+#[tokio::test]
+async fn five_failed_logins_end_the_connection() {
+    let (host, _events, _) = login_host(crate::LoginDelay { base: std::time::Duration::ZERO, cap: std::time::Duration::ZERO });
+    let viewer = viewer();
+    let pinned = pair(&viewer, &host).await;
+    let mut prompt = login_prompt(&viewer, &host, pinned).await;
+    for _ in 0..4 {
+        prompt = fail(prompt, USER, "wrong").await.1;
+    }
+    let Err(e) = prompt.login(USER, password("wrong")).await else { panic!("a sixth chance on one connection") };
+    assert_eq!(e.kind(), ErrorKind::LoginFailed, "{e}");
+    // Connecting again gives a new prompt.
+    ready(viewer.connect(host.addr, Some(pinned)).await.unwrap()).await.close().await;
+}
+
+#[tokio::test]
+async fn nothing_but_a_login_before_it_succeeds() {
+    let (host, mut events, _) = login_host(crate::LoginDelay::default());
+    let viewer = viewer();
+    let pinned = pair(&viewer, &host).await;
+    let mut prompt = login_prompt(&viewer, &host, pinned).await;
+    host.host.send_access_unit(crate::AccessUnit::keyframe("avc1.42001f", vec![0, 0, 0, 1, 0x65]));
+    let (send, recv) = prompt.channel_mut();
+    write_msg(send, &Message::Ping { seq: 1 }).await.unwrap();
+    match read_msg(recv).await.unwrap() {
+        Message::Error { code: ErrorCode::BadRequest, .. } => {}
+        other => panic!("expected bad_request, got {other:?}"),
+    }
+    assert!(
+        !drain(&mut events).iter().any(|e| matches!(e, crate::HostEvent::Session { .. } | crate::HostEvent::KeyframeNeeded)),
+        "no session before the login"
+    );
+}
+
+#[tokio::test]
+async fn a_device_at_the_login_prompt_does_not_hold_the_host() {
+    let host = host_with(&Identity::generate().unwrap(), true);
+    let (waiting, other) = (viewer(), viewer());
+    let (pin_w, pin_o) = (pair(&waiting, &host).await, pair(&other, &host).await);
+    let prompt = login_prompt(&waiting, &host, pin_w).await;
+    let mut session = ready(other.connect(host.addr, Some(pin_o)).await.unwrap()).await;
+    session.ping().await.unwrap();
+    // Now the slot is taken: the waiting device learns it only after its login.
+    let Err(e) = prompt.login(USER, password(PASSWORD)).await else { panic!("took control from another device") };
+    assert_eq!(e.kind(), ErrorKind::Busy, "{e}");
+    let Err(e) = waiting.connect(host.addr, Some(pin_w)).await else { panic!("busy host offered a login") };
+    assert_eq!(e.kind(), ErrorKind::Busy, "{e}");
+}
+
+#[tokio::test]
+async fn revocation_ends_a_connection_waiting_to_log_in() {
+    let host = host_with(&Identity::generate().unwrap(), true);
+    let viewer = viewer();
+    let pinned = pair(&viewer, &host).await;
+    let prompt = login_prompt(&viewer, &host, pinned).await;
+    host.host.revoke(&viewer.fingerprint()).unwrap();
+    let Err(e) = prompt.login(USER, password(PASSWORD)).await else { panic!("a revoked device logged in") };
+    assert_eq!(e.kind(), ErrorKind::Revoked, "{e}");
+}
+
+#[tokio::test]
+async fn a_device_that_leaves_withdraws_its_pairing_request() {
+    struct Withdrawn(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Withdrawn {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let withdrawn = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = withdrawn.clone();
+    let never: Approver = Arc::new(move |_| {
+        let guard = Withdrawn(flag.clone());
+        Box::pin(async move {
+            let _guard = guard;
+            std::future::pending::<bool>().await
+        })
+    });
+    let host = Host::bind(LOOPBACK.into(), &Identity::generate().unwrap(), HostConfig::new("test-host"), PairedClients::in_memory(), never, verifier()).unwrap();
+    let host = start(host, Arc::default());
+    let Outcome::FirstContact(first) = viewer().connect(host.addr, None).await.unwrap() else { panic!() };
+    // The viewer's user presses Cancel while the host waits for approval.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(200), first.request_pairing()).await;
+    for _ in 0..50 {
+        if withdrawn.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the host kept asking after the device left");
+}
+
+#[test]
+fn login_messages_never_show_the_password() {
+    let message = Message::Login { username: USER.into(), password: password("hunter2") };
+    assert!(!format!("{message:?}").contains("hunter2"));
+    let json = serde_json::to_string(&message).unwrap();
+    assert_eq!(json, r#"{"type":"login","username":"tester","password":"hunter2"}"#);
+    assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), message);
+    let result = serde_json::to_string(&Message::LoginResult { ok: false, retry_after_ms: 1500 }).unwrap();
+    assert_eq!(result, r#"{"type":"login_result","ok":false,"retry_after_ms":1500}"#);
+}
+
+#[tokio::test]
+async fn a_login_after_the_time_limit_reports_a_lost_connection() {
+    let mut config = HostConfig::new("test-host");
+    config.login_timeout = std::time::Duration::from_millis(200);
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let host = start(Host::bind(LOOPBACK.into(), &Identity::generate().unwrap(), config, PairedClients::in_memory(), approver(true, prompts.clone()), verifier()).unwrap(), prompts);
+    let viewer = viewer();
+    let pinned = pair(&viewer, &host).await;
+    let prompt = login_prompt(&viewer, &host, pinned).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let Err(e) = prompt.login(USER, password(PASSWORD)).await else { panic!("logged in after the time limit") };
+    // The viewer connects again and asks for the password again.
+    assert_eq!(e.kind(), ErrorKind::Disconnected, "{e}");
 }

@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
 fn golden(name: &str) -> Vec<u8> {
-    std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/local-v3").join(format!("{name}.bin"))).unwrap()
+    std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/local-v4").join(format!("{name}.bin"))).unwrap()
 }
 
 /// Feeds `input`, closes stdin, and returns (exit code, stdout).
@@ -37,8 +37,8 @@ fn closed_pipe_exits_cleanly() {
 #[test]
 fn version_mismatch_exits_2_without_output() {
     assert_eq!(run(&FromApp::Hello { version: 1 }.encode()), (2, vec![]));
-    assert_eq!(run(&FromApp::Hello { version: 2 }.encode()), (2, vec![]));
-    assert_eq!(run(&FromApp::Hello { version: 4 }.encode()), (2, vec![]));
+    assert_eq!(run(&FromApp::Hello { version: 3 }.encode()), (2, vec![]));
+    assert_eq!(run(&FromApp::Hello { version: 5 }.encode()), (2, vec![]));
 }
 
 #[test]
@@ -59,8 +59,16 @@ mod with_identity {
     fn hello_is_acknowledged_then_eof_exits_cleanly() {
         let (code, out) = run(&golden("01-hello"));
         assert_eq!(code, 0);
-        assert_eq!(out, ToApp::HelloAck { version: 3 }.encode());
-        assert_eq!(out, golden("81-hello-ack"));
+        // HelloAck, then the identity event, then nothing.
+        let ack = golden("81-hello-ack");
+        assert_eq!(ack, ToApp::HelloAck { version: 4 }.encode());
+        assert!(out.starts_with(&ack), "{out:?}");
+        let rest = &out[ack.len()..];
+        let len = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
+        assert_eq!(rest.len(), 4 + len, "exactly one frame after HelloAck");
+        assert_eq!(rest[4], 0x85);
+        let identity: serde_json::Value = serde_json::from_slice(&rest[5..]).unwrap();
+        assert_eq!(identity["type"], "identity");
     }
 
     #[test]
@@ -75,7 +83,7 @@ mod with_identity {
     #[test]
     fn well_formed_frames_are_accepted() {
         let mut input = golden("01-hello");
-        for name in ["02-access-unit-key", "02-access-unit-delta", "03-capture-stopped", "04-pairing-decision-deny", "05-input-unavailable"] {
+        for name in ["02-access-unit-key", "02-access-unit-delta", "03-capture-stopped", "04-pairing-decision-deny", "05-input-unavailable", "07-login-verdict-refused"] {
             input.extend(golden(name));
         }
         assert_eq!(run(&input).0, 0);

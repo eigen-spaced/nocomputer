@@ -8,6 +8,49 @@
 <body>
   <canvas id="video"></canvas>
   <div id="status" role="status"></div>
+  <main id="home">
+    <h1>nocomputer</h1>
+    <section id="list" class="view">
+      <ul id="hosts"></ul>
+      <form id="open-form" autocomplete="off">
+        <label for="address">Host name or IP address</label>
+        <div class="row">
+          <input id="address" spellcheck="false" autocapitalize="off">
+          <button>Connect</button>
+        </div>
+      </form>
+    </section>
+    <section id="busy" class="view">
+      <p id="busy-text"></p>
+      <button class="cancel secondary" type="button">Cancel</button>
+    </section>
+    <section id="pair" class="view">
+      <h2 id="pair-title"></h2>
+      <p id="pair-text"></p>
+      <dl>
+        <dt>Host</dt><dd id="pair-host" class="fingerprint"></dd>
+        <dt>This PC</dt><dd id="pair-this" class="fingerprint"></dd>
+      </dl>
+      <div class="row">
+        <button id="pair-go" type="button"></button>
+        <button class="cancel secondary" type="button">Cancel</button>
+      </div>
+    </section>
+    <section id="login" class="view">
+      <h2 id="login-title"></h2>
+      <form id="login-form" autocomplete="off">
+        <label for="username">Username</label>
+        <input id="username" spellcheck="false" autocapitalize="off">
+        <label for="password">Password</label>
+        <input id="password" type="password">
+        <div class="row">
+          <button id="login-go">Log in</button>
+          <button class="cancel secondary" type="button">Cancel</button>
+        </div>
+      </form>
+    </section>
+    <div id="problem" role="alert"></div>
+  </main>
   <script src="main.js"></script>
 </body>
 </html>

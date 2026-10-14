@@ -12,6 +12,11 @@ final class RemoteHost {
 
     var onLog: ((String) -> Void)?
     var onExit: (() -> Void)?
+    // This Mac's name and fingerprint while remote access is on, for comparing with
+    // what a viewer shows; nil when off.
+    var onIdentity: ((LocalLink.Identity?) -> Void)?
+    // How the last pairing request ended, shown in the window; nil clears it.
+    var onPairingNotice: ((String?) -> Void)?
 
     private weak var window: NSWindow?
     private var link: HostLink?
@@ -25,10 +30,12 @@ final class RemoteHost {
     private var streamWanted = false
     private var starting = false
     private var restartTask: Task<Void, Never>?
-    private var prompt: (alert: NSAlert, requestID: UInt64)?
+    private var prompt: (alert: NSAlert, requestID: UInt64, deviceName: String)?
     // Input is injected on its own queue, never behind UI work. The injector
     // and the fields below are only touched on this queue.
     private let inputQueue = DispatchQueue(label: "dev.nocomputer.input", qos: .userInteractive)
+    // Account checks block on OpenDirectory; one at a time, off the main thread.
+    private let accountQueue = DispatchQueue(label: "dev.nocomputer.account-check", qos: .userInitiated)
     nonisolated(unsafe) private var injector: InputInjector?
     nonisolated(unsafe) private var inputDisplay = CGMainDisplayID()
     nonisolated(unsafe) private var trustCheckedAt: TimeInterval = -.infinity
@@ -60,6 +67,12 @@ final class RemoteHost {
         clipboard.onLocalText = { [weak link] in link?.sendClipboard($0) }
         link.onExit = { [weak self] in self?.exited($0) }
         link.onInput = { [weak self] input in self?.inputQueue.async { self?.inject(input) } }
+        link.onVerifyLogin = { [weak link, accountQueue] request in
+            accountQueue.async {
+                let ok = AccountCheck.verify(username: request.username, password: request.password)
+                link?.loginVerdict(requestID: request.requestID, ok: ok)
+            }
+        }
         try sleep.enable()
         do { try link.start() } catch { sleep.disable(); throw error }
         self.link = link
@@ -161,6 +174,18 @@ final class RemoteHost {
                 return
             }
             showPairingPrompt(request)
+        case "identity":
+            guard let identity = try? JSONDecoder().decode(LocalLink.Identity.self, from: json) else {
+                log("Ignored malformed identity")
+                return
+            }
+            onIdentity?(identity)
+        case "pairing_withdrawn":
+            guard let withdrawn = try? JSONDecoder().decode(LocalLink.PairingWithdrawn.self, from: json),
+                  let current = prompt, current.requestID == withdrawn.requestID else { return }
+            dismissPrompt()
+            onPairingNotice?("Pairing request from \"\(current.deviceName)\" closed: the device cancelled or 60 s passed. Nothing was approved.")
+            log("Pairing request withdrawn: the device left or the request timed out")
         case let type?:
             // Display only. The JSON carries names and fingerprints, never keys.
             log("Host event \(type): \(String(decoding: json, as: UTF8.self))")
@@ -173,6 +198,7 @@ final class RemoteHost {
     // request is pending in the child at a time, so a newer prompt replaces this one.
     private func showPairingPrompt(_ request: LocalLink.PairingPrompt) {
         dismissPrompt()
+        onPairingNotice?(nil)
         let alert = NSAlert()
         alert.messageText = "Allow \"\(request.deviceName)\" to control this Mac?"
         alert.informativeText = """
@@ -186,22 +212,24 @@ final class RemoteHost {
             """
         alert.addButton(withTitle: "Deny")
         alert.addButton(withTitle: "Approve")
-        prompt = (alert, request.requestID)
+        prompt = (alert, request.requestID, request.deviceName)
         let decide: (NSApplication.ModalResponse) -> Void = { [weak self] response in
             guard let self, self.prompt?.requestID == request.requestID else { return }
             self.prompt = nil
             let approve = response == .alertSecondButtonReturn
             self.link?.decide(requestID: request.requestID, approve: approve)
             self.log("Pairing \(approve ? "approved" : "denied"): \(request.deviceName)")
+            self.onPairingNotice?("Pairing request from \"\(request.deviceName)\" \(approve ? "approved" : "denied").")
         }
         if let window { alert.beginSheetModal(for: window, completionHandler: decide) }
         else { decide(alert.runModal()) }
     }
 
     private func dismissPrompt() {
-        guard let (alert, _) = prompt else { return }
+        guard let (alert, _, _) = prompt else { return }
         prompt = nil
         if let sheetParent = alert.window.sheetParent { sheetParent.endSheet(alert.window) }
+        else if NSApp.modalWindow == alert.window { NSApp.abortModal() }
     }
 
     private func exited(_ reason: String) {
@@ -212,6 +240,8 @@ final class RemoteHost {
         restartTask?.cancel()
         Task { await stopCapture() }
         link = nil
+        onIdentity?(nil)
+        onPairingNotice?(nil)
         sleep.disable()
         log("Remote access off: \(reason); sleep assertion released")
         onExit?()
