@@ -40,6 +40,8 @@ pub const DEFAULT_PORT: u16 = 47900;
 pub(crate) const CLOSE_REVOKED: u32 = 0x10;
 /// ... and when a newer session from the same device takes over.
 pub(crate) const CLOSE_REPLACED: u32 = 0x11;
+/// ... and when the host stops sharing, for example when its user turns remote access off.
+pub(crate) const CLOSE_HOST_ENDED: u32 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -90,6 +92,8 @@ pub enum ErrorKind {
     Busy,
     /// This device connected again from elsewhere; this session was closed.
     Replaced,
+    /// The host stopped sharing and closed the connection; not a network fault.
+    HostEnded,
     /// The host and viewer speak different protocol versions; update the older one.
     VersionMismatch,
     /// Another pairing request is pending on the host, or one was just denied.
@@ -119,6 +123,7 @@ impl Error {
                 ErrorCode::PairingUnavailable => ErrorKind::PairingUnavailable,
                 ErrorCode::Busy => ErrorKind::Busy,
                 ErrorCode::Replaced => ErrorKind::Replaced,
+                ErrorCode::HostEnded => ErrorKind::HostEnded,
                 ErrorCode::LoginFailed => ErrorKind::LoginFailed,
                 ErrorCode::BadRequest | ErrorCode::Unknown => ErrorKind::Other,
             },

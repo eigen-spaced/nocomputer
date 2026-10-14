@@ -988,6 +988,18 @@ async fn a_device_at_the_login_prompt_does_not_hold_the_host() {
 }
 
 #[tokio::test]
+async fn closing_the_host_tells_the_live_session_it_ended() {
+    let host = host_with(&Identity::generate().unwrap(), true);
+    let viewer = viewer();
+    let pinned = pair(&viewer, &host).await;
+    let mut session = ready(viewer.connect(host.addr, Some(pinned)).await.unwrap()).await;
+    session.ping().await.unwrap();
+    host.host.close().await;
+    let Err(e) = session.ping().await else { panic!("the session outlived the host") };
+    assert_eq!(e.kind(), ErrorKind::HostEnded, "{e}");
+}
+
+#[tokio::test]
 async fn revocation_ends_a_connection_waiting_to_log_in() {
     let host = host_with(&Identity::generate().unwrap(), true);
     let viewer = viewer();

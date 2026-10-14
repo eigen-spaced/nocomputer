@@ -376,7 +376,7 @@ async fn run() -> Result<(), Exit> {
         Some(path) => replay(&host, &path, capture, input, notices, pending).await,
         None => serve_app(&host, stdin, capture, input, clipboard, notices, Questions { pairing: pending, logins, login_requests: requests }).await,
     };
-    host.close();
+    host.close().await;
     result
 }
 

@@ -298,12 +298,13 @@ async fn next_clipboard(updates: &mut tokio::sync::watch::Receiver<Option<Clipbo
 }
 
 /// A stream error after the host closed the connection says only "connection lost";
-/// report a revocation or takeover as such.
+/// report a revocation, takeover or host shutdown as such.
 pub(crate) fn explain_close(conn: &quinn::Connection, error: Error) -> Error {
     let Some(quinn::ConnectionError::ApplicationClosed(close)) = conn.close_reason() else { return error };
     let (code, message) = match u32::try_from(close.error_code.into_inner()) {
         Ok(crate::CLOSE_REVOKED) => (ErrorCode::Revoked, "the host revoked this device's access"),
         Ok(crate::CLOSE_REPLACED) => (ErrorCode::Replaced, "a newer session from this device took over"),
+        Ok(crate::CLOSE_HOST_ENDED) => (ErrorCode::HostEnded, "the host ended the session"),
         _ => return error,
     };
     Error::Remote { code, message: message.into() }

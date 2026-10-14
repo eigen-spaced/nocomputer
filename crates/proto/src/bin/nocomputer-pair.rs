@@ -175,7 +175,7 @@ async fn host(args: &[String]) -> Result<(), BoxError> {
             _ => println!("commands: clients | revoke FINGERPRINT | quit"),
         }
     }
-    host.close();
+    host.close().await;
     Ok(())
 }
 

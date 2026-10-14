@@ -40,7 +40,7 @@ On macOS, Keychain access control is bound to the code signature of the program 
 
 ## Errors
 
-`Error::kind()` sorts errors for display: `Unreachable` (no answer, for example with Remote access off), `Disconnected` (lost after connecting, including at the 2-minute login limit: connect again and ask for the password again), `HostIdentityChanged` (show both fingerprints as a warning; never offer to pair again from there), `NotPaired`, `Revoked`, `Busy` (another device is in control), `Replaced` (this device connected again from elsewhere; this session was closed), `VersionMismatch`, `PairingUnavailable`, `LoginFailed` (too many attempts on one connection), and `Other`. A single wrong login is `LoginResult::Failed`, not an error.
+`Error::kind()` sorts errors for display: `Unreachable` (no answer, for example with Remote access off), `Disconnected` (lost after connecting, including at the 2-minute login limit: connect again and ask for the password again), `HostIdentityChanged` (show both fingerprints as a warning; never offer to pair again from there), `NotPaired`, `Revoked`, `Busy` (another device is in control), `Replaced` (this device connected again from elsewhere; this session was closed), `HostEnded` (the host stopped sharing, for example when its user turned Remote access off; return to the start screen), `VersionMismatch`, `PairingUnavailable`, `LoginFailed` (too many attempts on one connection), and `Other`. A single wrong login is `LoginResult::Failed`, not an error.
 
 ## Wire format
 

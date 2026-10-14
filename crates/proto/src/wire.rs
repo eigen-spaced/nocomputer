@@ -57,6 +57,8 @@ pub enum ErrorCode {
     Busy,
     /// A newer session from the same device took over this one.
     Replaced,
+    /// The host stopped sharing. Arrives as a QUIC close code, not in a message.
+    HostEnded,
     /// Too many failed logins on this connection; connect again to retry.
     LoginFailed,
     #[serde(other)]

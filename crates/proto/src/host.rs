@@ -22,6 +22,8 @@ use tokio::time::timeout;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const PAIR_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
+/// Under the Mac app's 3 s wait before it terminates the host.
+const CLOSE_FLUSH: Duration = Duration::from_secs(1);
 const LOGIN_ATTEMPTS: usize = 5;
 /// A verifier that takes longer is treated as a failure.
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -186,8 +188,11 @@ impl Host {
         Ok(listed)
     }
 
-    pub fn close(&self) {
-        self.endpoint.close(0u32.into(), b"host closing");
+    /// Closes every connection with [`crate::CLOSE_HOST_ENDED`] and waits, briefly, for
+    /// the close to reach the viewers, so they report the end instead of timing out.
+    pub async fn close(&self) {
+        self.endpoint.close(crate::CLOSE_HOST_ENDED.into(), b"host ended the session");
+        let _ = timeout(CLOSE_FLUSH, self.endpoint.wait_idle()).await;
     }
 
     /// Queues a frame for the controlling session, if any. Never blocks: when the viewer

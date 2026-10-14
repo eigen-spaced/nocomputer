@@ -236,7 +236,7 @@ End to end between machines (2026-10-13): the Mac app's bundled host streamed th
     - connected with the Mac locked and its display off: first frame decoded 0.7 s after login;
     - while locked, the display sleeps about 60 s after the last input (the lock screen's timer). Two mid-session sleeps each woke on the next viewer input; the picture returned 0.7–1.2 s later on a fresh keyframe, with no decode errors and no connection loss;
     - after disconnect, the display slept on its normal timer.
-  - Turning Remote access off ends the session with "connection lost" in the viewer. A distinct host-ended close code is a follow-up.
+  - Turning Remote access off used to end the session with "connection lost" in the viewer. The host now closes every connection with its own code and waits up to 1 s for the close to go out, and the viewer reports `HostEnded` and returns to the start screen with "The host ended the session." (user-confirmed live, under 1 s by eye).
 
 Still pending:
 
