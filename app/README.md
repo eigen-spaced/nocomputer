@@ -58,6 +58,7 @@ Live mode sends input on the authenticated control stream. Nothing typed is logg
 - **Keys are physical:** scan codes become USB HID usages, so the host's keyboard layout decides the characters. Keys with no mapping (media keys) stay local.
 - **Command key:** the status bar selects which key sends Command: Win (default) or right Alt. The choice is saved in the page's local storage.
 - **Windowed:** Ctrl, Shift and Alt combinations go to the host, except Alt+Tab, Alt+Esc, Ctrl+Esc and Alt+F4, which stay with Windows. **Fullscreen:** every mapped key goes to the host.
+- **Pointer off the window:** a key pressed while the pointer is not over the viewer window (or is over a window in front of it) stays with Windows, even with the viewer in front, so Windows shortcuts such as Win+Shift+S work by moving the pointer away. Keys already held when the pointer leaves still finish on the host, so none sticks. Keys that reach the page this way don't work the browser (no reload, print or find); Alt+F4 still closes the viewer.
 - **Viewer shortcuts:** Ctrl+Alt+Shift with F (fullscreen), N (native), H (status), R (reset) or the arrows (pan). These never reach the host.
 - **Release:** held keys and buttons are released when the window loses the foreground, on disconnect, and by the host at every session start and end.
 - **Not capturable:** Ctrl+Alt+Del and Win+L are handled by Windows before any hook and always act locally.
@@ -65,6 +66,8 @@ Live mode sends input on the authenticated control stream. Nothing typed is logg
 - **Foreground:** a WinEvent hook reports the window coming to the front, and a 250 ms poll of `GetForegroundWindow` backs it up; in one run the events never arrived and the keyboard stayed off.
 
 Recorded 2026-10-13 against the Mac host (user-confirmed): pointer, clicks, dragging and typing work, and video keeps updating while dragging. Over Tailscale the path was relayed through DERP (Dubai, about 30 ms) although both machines were on the same Wi-Fi, and typing visibly lagged. With `--via` to the Mac's LAN address the user found it "definitely" snappier. The direct-path failure is not yet diagnosed.
+
+Recorded 2026-10-14 (user-confirmed): with the viewer in front and the pointer off its window, Win+Shift+S opens the Windows screenshot tool; with the pointer over the window, typing goes to the host as before. Tailscale showed a direct path (12 ms) that day.
 
 Key timing over Tailscale (DERP), 2026-10-13, typing into a still Terminal on the Mac, viewer numbers in ms as avg/max:
 

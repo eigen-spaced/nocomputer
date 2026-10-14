@@ -14,8 +14,8 @@
 //! Foreground changes come from a WinEvent hook in the viewer: window focus events
 //! don't do, since the top-level window loses focus to the WebView2 child whenever the
 //! page is clicked. Keys are captured only while the window is in front and a session
-//! is up, so the Windows keys aren't taken for nothing. `keys.rs` decides what each
-//! key does.
+//! is up, so the Windows keys aren't taken for nothing, and a key pressed with the
+//! pointer off the window stays with Windows. `keys.rs` decides what each key does.
 
 use crate::keys::{CommandKey, Shortcut};
 use crate::live::Live;
@@ -157,13 +157,13 @@ mod windows {
     use std::io::{BufRead, Write};
     use std::sync::{mpsc, Mutex};
     use tauri::{Emitter, Manager};
-    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, GetForegroundWindow, GetMessageW, PeekMessageW, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
+        CallNextHookEx, GetAncestor, GetCursorPos, GetForegroundWindow, GetMessageW, WindowFromPoint, GA_ROOT, PeekMessageW, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx,
         EVENT_SYSTEM_FOREGROUND, HC_ACTION, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_UP, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WINEVENT_OUTOFCONTEXT,
         WM_APP,
     };
@@ -332,11 +332,24 @@ mod windows {
         }
     }
 
+    /// Whether the pointer is over the viewer window and not over a window in front of it.
+    fn cursor_over(window: isize) -> bool {
+        let mut point = POINT { x: 0, y: 0 };
+        // SAFETY: a valid POINT to write; WindowFromPoint and GetAncestor take any handle.
+        unsafe { GetCursorPos(&mut point) != 0 && GetAncestor(WindowFromPoint(point), GA_ROOT) as isize == window }
+    }
+
     /// Returns whether to keep the key from Windows.
     fn handle(h: &mut Helper, k: &KBDLLHOOKSTRUCT) -> bool {
         let down = k.flags & LLKHF_UP == 0;
         let extended = k.flags & LLKHF_EXTENDED != 0;
-        let decision = h.keyboard.on_key(RawKey { scan: k.scanCode, extended, vk: k.vkCode, down });
+        let key = RawKey { scan: k.scanCode, extended, vk: k.vkCode, down };
+        // With the pointer off the window, new keys stay with Windows (Win+Shift+S, say);
+        // keys already held finish the way they started, so none is left stuck.
+        if !cursor_over(h.window) && !h.keyboard.holds(&key) {
+            return false;
+        }
+        let decision = h.keyboard.on_key(key);
         if let Some(events) = &h.events {
             if let Some((usage, state)) = decision.send {
                 let _ = events.send(Event::Key { usage, state });

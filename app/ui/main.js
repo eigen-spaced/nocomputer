@@ -208,9 +208,13 @@ const KEY_SHORTCUTS = {
 };
 
 window.addEventListener('keydown', e => {
-  // With the hook, keys belong to the host; the few that reach the page (local combos
-  // such as Alt+Tab) are left to Windows.
-  if (info.hook) return;
+  // With the hook, keys belong to the host. The ones that reach the page (local combos,
+  // or typing with the pointer off the window) mustn't work the browser: no reload,
+  // print or find. Windows' own shortcuts never come here, and Alt+F4 still closes.
+  if (info.hook) {
+    if (!(e.altKey && e.key === 'F4')) e.preventDefault();
+    return;
+  }
   const name = KEY_SHORTCUTS[e.key.toLowerCase()];
   if (name && shortcut(name)) e.preventDefault();
 });

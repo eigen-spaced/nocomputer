@@ -251,6 +251,12 @@ impl Keyboard {
         }
     }
 
+    /// Whether this physical key went down through [`Keyboard::on_key`] and is still held,
+    /// so its repeats and release must go the same way.
+    pub fn holds(&self, key: &RawKey) -> bool {
+        physical_usage(key).is_some_and(|u| self.held.contains_key(&u))
+    }
+
     /// Whether this Alt release must be masked so Windows doesn't open the window menu.
     /// Call after [`Keyboard::on_key`] for an Alt key-up that is not swallowed.
     pub fn take_alt_mask(&mut self) -> bool {
@@ -311,6 +317,17 @@ mod tests {
         assert_eq!(k.on_key(key(A, false, true)).send, Some((0x04, KeyState::Repeat)));
         assert_eq!(k.on_key(key(A, false, false)), Decision { swallow: true, send: Some((0x04, KeyState::Up)), shortcut: None });
         assert_eq!(k.on_key(key(A, false, false)), Decision::default(), "an up we never saw go down stays local");
+    }
+
+    #[test]
+    fn held_keys_are_known_until_released() {
+        let mut k = Keyboard::default();
+        assert!(!k.holds(&key(A, false, true)));
+        k.on_key(key(A, false, true));
+        assert!(k.holds(&key(A, false, true)) && k.holds(&key(A, false, false)), "its repeats and release");
+        assert!(!k.holds(&key(LWIN, true, true)));
+        k.on_key(key(A, false, false));
+        assert!(!k.holds(&key(A, false, false)));
     }
 
     #[test]
