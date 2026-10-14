@@ -14,7 +14,7 @@
 
 use crate::live::Live;
 use nocomputer_proto::{
-    load_or_create_identity, paths, platform_keystore, valid_username, Error, ErrorKind, FirstContact, KnownHosts, LoginPrompt, LoginResult, Outcome,
+    load_or_create_identity, paths, platform_keystore, valid_username, Error, ErrorKind, Fingerprint, FirstContact, KnownHosts, LoginPrompt, LoginResult, Outcome,
     Password, Viewer,
 };
 use serde::Serialize;
@@ -160,20 +160,27 @@ impl Connector {
         }
     }
 
-    async fn open(&self, t: &Ticket, address: &str) -> Result<Step, Problem> {
+    /// Connects to `address`, pinned to `pin` if given. `None` if cancelled or stale.
+    async fn dial(&self, t: &Ticket, address: &str, pin: Option<Fingerprint>) -> Result<Option<(Outcome, Viewer)>, Problem> {
         let dial = match &self.via {
             Some((a, via)) if a == address => via.clone(),
             _ => address.to_string(),
         };
-        let state = paths::default_state_dir();
-        let pinned = KnownHosts::at(state.join("known-hosts.json")).get(address).map_err(|e| problem(&e))?;
         let viewer = viewer()?;
         let connect = async {
             let addr = paths::resolve(&dial).await.map_err(|e| Problem::new("unreachable", format!("Can't find {dial}: {e}")))?;
-            viewer.connect(addr, pinned.map(|h| h.fingerprint)).await.map_err(|e| problem(&e))
+            viewer.connect(addr, pin).await.map_err(|e| problem(&e))
         };
-        let Some(outcome) = self.cancellable(t, connect).await else { return Ok(Step::Cancelled) };
-        let (step, stage) = match outcome? {
+        match self.cancellable(t, connect).await {
+            Some(outcome) => Ok(Some((outcome?, viewer))),
+            None => Ok(None),
+        }
+    }
+
+    async fn open(&self, t: &Ticket, address: &str) -> Result<Step, Problem> {
+        let pinned = known_hosts().get(address).map_err(|e| problem(&e))?;
+        let Some((outcome, viewer)) = self.dial(t, address, pinned.map(|h| h.fingerprint)).await? else { return Ok(Step::Cancelled) };
+        let (step, stage) = match outcome {
             Outcome::Login(prompt) => {
                 let step = Step::Login { address: address.to_string(), host_name: prompt.host_name.clone(), failed: false, retry_after_ms: 0 };
                 (step, Stage::Login { address: address.to_string(), prompt })
@@ -246,6 +253,14 @@ pub async fn connect_pair(connector: tauri::State<'_, Connector>) -> Result<Step
         return Err(Problem::new("other", "Nothing is waiting to pair; connect again."));
     };
     let (fingerprint, name) = (contact.host_fingerprint, contact.host_name.clone());
+    // The host gives an unpaired device 30 s to ask, and the user may have taken longer
+    // to compare fingerprints: ask on a fresh connection, from the same host.
+    drop(contact);
+    let Some((outcome, _)) = connector.dial(&t, &address, None).await? else { return Ok(Step::Cancelled) };
+    let contact = match outcome {
+        Outcome::FirstContact(c) if c.host_fingerprint == fingerprint => c,
+        _ => return Err(Problem::new("identity_changed", "The host's fingerprint changed after you checked it, so nothing was asked. Connect again and compare it once more.")),
+    };
     let Some(approved) = connector.cancellable(&t, contact.request_pairing()).await else { return Ok(Step::Cancelled) };
     if !approved.map_err(|e| problem(&e))? {
         return Err(Problem::new("declined", "The host didn't approve this PC: the request was declined, or no one answered in time."));
