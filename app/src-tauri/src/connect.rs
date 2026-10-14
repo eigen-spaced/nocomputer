@@ -70,6 +70,7 @@ fn problem(e: &Error) -> Problem {
         ErrorKind::NotPaired => ("not_paired", "The host no longer has this PC paired. Forget it below, then connect to pair again.".into()),
         ErrorKind::Revoked => ("revoked", "The host's user has revoked this PC's access.".into()),
         ErrorKind::Busy => ("busy", "Another viewer is connected to the host. Try again when it disconnects.".into()),
+        ErrorKind::HostEnded => ("host_ended", "The host ended the session.".into()),
         ErrorKind::Replaced => ("replaced", "This PC connected to the host again from elsewhere, so this session was closed.".into()),
         ErrorKind::VersionMismatch => ("version", "The host and this viewer run different versions. Update the older one.".into()),
         ErrorKind::PairingUnavailable => {

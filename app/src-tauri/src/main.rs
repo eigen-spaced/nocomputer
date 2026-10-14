@@ -198,6 +198,7 @@ fn main() {
             live::live_settings,
             live::live_clipboard,
             live::live_disconnect,
+            live::live_ended,
             connect::connect_hosts,
             connect::connect_forget,
             connect::connect_open,

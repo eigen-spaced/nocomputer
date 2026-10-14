@@ -102,6 +102,9 @@ type Frames = mpsc::Receiver<Result<Frame, String>>;
 #[derive(Default)]
 pub struct Live {
     current: Mutex<Option<Arc<Conn>>>,
+    /// Why the last session ended, when the host or the network ended it, for the
+    /// start screen.
+    ended: Mutex<Option<String>>,
 }
 
 struct Conn {
@@ -165,6 +168,7 @@ impl Live {
             }
             let _ = closed_tx.send(());
         });
+        self.ended.lock().unwrap().take();
         if let Some(old) = self.current.lock().unwrap().replace(conn) {
             old.shutdown.notify_one();
         }
@@ -361,7 +365,10 @@ pub async fn live_next(live: tauri::State<'_, Live>) -> Result<Response, String>
             }
             Ok(Response::new(frame))
         }
-        Some(Err(e)) => Err(e),
+        Some(Err(e)) => {
+            *live.ended.lock().unwrap() = Some(e.clone());
+            Err(e)
+        }
         None => Err("the connection ended".into()),
     }
 }
@@ -398,6 +405,12 @@ pub fn live_info(live: tauri::State<'_, Live>) -> LiveInfo {
     let (state, keys_sent) = crate::hook::status();
     (info.keyboard_active, info.keyboard_off, info.keys_sent) = (state.is_ok(), state.err(), keys_sent);
     info
+}
+
+/// Why the last session ended, once; `None` when this PC ended it.
+#[tauri::command]
+pub fn live_ended(live: tauri::State<'_, Live>) -> Option<String> {
+    live.ended.lock().unwrap().take()
 }
 
 /// Ends the session; the page then goes back to the start screen.

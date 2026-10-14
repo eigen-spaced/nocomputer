@@ -313,7 +313,7 @@ async function live(launch) {
       buf = await invoke('live_next');
     } catch (e) {
       info.error = String(e);
-      if (!launch.check) { draw(); return; }
+      if (!launch.check) return toStart();
       stats.decodeErrors.push(`connection: ${e}`);
       break;
     }
@@ -524,16 +524,22 @@ async function clipboardSwitch() {
   await apply();
 }
 
+// Ends the session and goes back to the start screen, which shows why, if the host or
+// the network ended it (live_ended).
+async function toStart() {
+  await invoke('live_disconnect').catch(() => {});
+  // A fresh page for the start screen; #start keeps --connect from opening again.
+  location.hash = 'start';
+  location.reload();
+}
+
 function disconnectButton() {
   statusEl.classList.add('interactive');
   const button = document.createElement('button');
   button.textContent = 'Disconnect';
-  button.addEventListener('click', async () => {
+  button.addEventListener('click', () => {
     button.disabled = true;
-    await invoke('live_disconnect').catch(() => {});
-    // A fresh page for the start screen; #start keeps --connect from opening again.
-    location.hash = 'start';
-    location.reload();
+    toStart();
   });
   statusEl.append(button);
 }
@@ -712,7 +718,7 @@ async function home(launch) {
   }
 
   if (launch.connect && location.hash !== '#start') open(launch.connect);
-  else list();
+  else list(await invoke('live_ended').catch(() => null));
 }
 
 (async () => {
