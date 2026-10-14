@@ -1,14 +1,16 @@
 //! WebCodecs viewer: plays one local Annex B .h264 file, or live video from a paired host.
 //!
-//! Usage: nocomputer-viewer [--check] [--require-hardware | --software] <file.h264>
+//! Usage: nocomputer-viewer [--require-hardware | --software]
+//!        nocomputer-viewer [--check] [--require-hardware | --software] <file.h264>
 //!        nocomputer-viewer [--check] [--require-hardware | --software] --connect HOST[:PORT] [--via ADDR[:PORT]]
 //!
-//! The page can only read the file named on the command line. In --check mode the
-//! page decodes every access unit as fast as the decoder accepts them (live: the first
-//! 300 frames), then this process prints a one-line JSON summary (no pixel data) and
-//! exits 0 on pass. Live mode needs the host paired first (see live.rs). --via dials
-//! another address for the same paired host (a LAN address, say); the host must still
-//! present the identity pinned for HOST.
+//! With no file, the viewer opens its start screen (connect.rs): saved hosts, pairing
+//! and login. --connect starts it at HOST's login (or pairing). The page can only read
+//! the file named on the command line. In --check mode the page decodes every access
+//! unit as fast as the decoder accepts them (live: the first 300 frames after login),
+//! then this process prints a one-line JSON summary (no pixel data) and exits 0 on
+//! pass. --via dials another address for the same paired host (a LAN address, say);
+//! the host must still present the identity pinned for HOST.
 //!
 //! nocomputer-viewer --bench-ipc [file.h264] measures Rust-to-page message latency instead,
 //! optionally while decoding the file in a loop (see bench.rs).
@@ -16,6 +18,7 @@
 mod annexb;
 mod bench;
 mod clipboard;
+mod connect;
 mod hook;
 mod keys;
 mod live;
@@ -44,7 +47,9 @@ struct Launch {
     #[serde(skip)]
     path: PathBuf,
     file_name: String,
-    /// Live mode: the host address as given.
+    /// Live mode: the start screen, not a file.
+    live: bool,
+    /// Live mode: the host to open first, as given.
     connect: Option<String>,
     /// Live mode: where to dial instead of `connect`, still pinned to its identity.
     via: Option<String>,
@@ -71,16 +76,18 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Launch, String> {
             _ => return Err("expected exactly one .h264 file".into()),
         }
     }
-    if let Some(host) = connect {
-        if path.is_some() {
-            return Err("give either a file or --connect, not both".into());
-        }
-        return Ok(Launch { check, decode, path: PathBuf::new(), file_name: String::new(), connect: Some(host), via, keyboard_hook: cfg!(windows) && !check });
-    }
-    if via.is_some() {
+    if via.is_some() && connect.is_none() {
         return Err("--via needs --connect".into());
     }
-    let path = path.ok_or("usage: nocomputer-viewer [--check] [--require-hardware | --software] <file.h264>")?;
+    if connect.is_some() && path.is_some() {
+        return Err("give either a file or --connect, not both".into());
+    }
+    let Some(path) = path else {
+        if check && connect.is_none() {
+            return Err("--check needs a file or --connect".into());
+        }
+        return Ok(Launch { check, decode, path: PathBuf::new(), file_name: String::new(), live: true, connect, via, keyboard_hook: cfg!(windows) && !check });
+    };
     if path.extension().and_then(|e| e.to_str()) != Some("h264") {
         return Err("input must be a .h264 file".into());
     }
@@ -92,7 +99,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Launch, String> {
         return Err(format!("{} exceeds {} bytes", path.display(), annexb::MAX_STREAM_BYTES));
     }
     let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    Ok(Launch { check, decode, path, file_name, connect: None, via: None, keyboard_hook: false })
+    Ok(Launch { check, decode, path, file_name, live: false, connect: None, via: None, keyboard_hook: false })
 }
 
 #[tauri::command]
@@ -161,8 +168,10 @@ fn main() {
         .setup(move |app| {
             let page = if bench_ipc { "bench.html" } else { "index.html" };
             if let Some(launch) = launch {
-                if let Some(host) = &launch.connect {
-                    app.manage(live::Live::new(host, launch.via.as_deref()));
+                if launch.live {
+                    let via = launch.connect.clone().zip(launch.via.clone());
+                    app.manage(connect::Connector::new(via));
+                    app.manage(live::Live::default());
                 }
                 app.manage(launch);
             }
@@ -188,6 +197,13 @@ fn main() {
             live::live_input,
             live::live_settings,
             live::live_clipboard,
+            live::live_disconnect,
+            connect::connect_hosts,
+            connect::connect_forget,
+            connect::connect_open,
+            connect::connect_pair,
+            connect::connect_login,
+            connect::connect_cancel,
             bench::bench_now,
             bench::bench_push,
             bench::bench_pull_start,
@@ -216,6 +232,9 @@ mod tests {
     fn via_dials_elsewhere_only_for_a_live_host() {
         let launch = parse_args(args("--connect macbook-air --via 192.168.66.112")).unwrap();
         assert_eq!((launch.connect.as_deref(), launch.via.as_deref()), (Some("macbook-air"), Some("192.168.66.112")));
+        assert!(launch.live);
+        assert!(parse_args(args("")).unwrap().live, "no file opens the start screen");
+        assert!(parse_args(args("--check")).is_err());
         assert!(parse_args(args("--via 192.168.66.112 x.h264")).is_err());
         assert!(parse_args(args("--connect macbook-air --via")).is_err());
     }
