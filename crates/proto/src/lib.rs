@@ -106,6 +106,11 @@ impl Error {
             Error::Connect(_) | Error::Timeout(_) => ErrorKind::Unreachable,
             Error::Connection(quinn::ConnectionError::TimedOut) => ErrorKind::Unreachable,
             Error::Connection(_) => ErrorKind::Disconnected,
+            // A control-stream read or write after the host closed the connection or
+            // its stream, for example at the 2-minute login limit.
+            Error::Io(e) if matches!(e.kind(), std::io::ErrorKind::NotConnected | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof) => {
+                ErrorKind::Disconnected
+            }
             Error::HostIdentityChanged { .. } => ErrorKind::HostIdentityChanged,
             Error::Remote { code, .. } => match code {
                 ErrorCode::VersionUnsupported => ErrorKind::VersionMismatch,

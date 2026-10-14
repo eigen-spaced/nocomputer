@@ -1039,3 +1039,18 @@ fn login_messages_never_show_the_password() {
     let result = serde_json::to_string(&Message::LoginResult { ok: false, retry_after_ms: 1500 }).unwrap();
     assert_eq!(result, r#"{"type":"login_result","ok":false,"retry_after_ms":1500}"#);
 }
+
+#[tokio::test]
+async fn a_login_after_the_time_limit_reports_a_lost_connection() {
+    let mut config = HostConfig::new("test-host");
+    config.login_timeout = std::time::Duration::from_millis(200);
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let host = start(Host::bind(LOOPBACK.into(), &Identity::generate().unwrap(), config, PairedClients::in_memory(), approver(true, prompts.clone()), verifier()).unwrap(), prompts);
+    let viewer = viewer();
+    let pinned = pair(&viewer, &host).await;
+    let prompt = login_prompt(&viewer, &host, pinned).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let Err(e) = prompt.login(USER, password(PASSWORD)).await else { panic!("logged in after the time limit") };
+    // The viewer connects again and asks for the password again.
+    assert_eq!(e.kind(), ErrorKind::Disconnected, "{e}");
+}

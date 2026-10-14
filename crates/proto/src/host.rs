@@ -22,8 +22,6 @@ use tokio::time::timeout;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const PAIR_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
-/// From `Welcome` until the login must have succeeded.
-const LOGIN_TIMEOUT: Duration = Duration::from_secs(120);
 const LOGIN_ATTEMPTS: usize = 5;
 /// A verifier that takes longer is treated as a failure.
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -75,12 +73,17 @@ pub struct HostConfig {
     /// After a denied or unanswered request, all pairing requests are refused this long.
     pub deny_cooldown: Duration,
     pub login_delay: LoginDelay,
+    /// From `Welcome` until the login must have succeeded.
+    pub login_timeout: Duration,
     pub events: Option<tokio::sync::mpsc::UnboundedSender<HostEvent>>,
 }
 
 impl HostConfig {
     pub fn new(name: impl Into<String>) -> Self {
-        HostConfig { name: name.into(), approval_timeout: Duration::from_secs(60), deny_cooldown: Duration::from_secs(10), login_delay: LoginDelay::default(), events: None }
+        HostConfig { name: name.into(), approval_timeout: Duration::from_secs(60), deny_cooldown: Duration::from_secs(10), login_delay: LoginDelay::default(),
+            login_timeout: Duration::from_secs(120),
+            events: None,
+        }
     }
 }
 
@@ -342,7 +345,7 @@ impl Inner {
     /// Reads `Login` messages until one succeeds; the caller answers that one once it
     /// has control. Every failure, whatever its cause, gets the same answer.
     async fn login(&self, send: &mut quinn::SendStream, recv: &mut quinn::RecvStream, device: Fingerprint) -> Result<(), Error> {
-        let deadline = tokio::time::Instant::now() + LOGIN_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + self.config.login_timeout;
         for attempt in 1..=LOGIN_ATTEMPTS {
             let message = tokio::time::timeout_at(deadline, read_msg(recv)).await.map_err(|_| Error::Timeout("login"))??;
             let Message::Login { username, password } = message else {
