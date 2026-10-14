@@ -207,7 +207,24 @@ End to end between machines (2026-10-13): the Mac app's bundled host streamed th
 - **Mac capture for typing (2026-10-13):** capture and the encoder's expected rate are now 60 fps (was 30), so a change waits at most ~17 ms to be captured; the user felt only a small gain on its own. A keyframe request on a still screen now re-encodes the last captured frame as an IDR after 100 ms, since ScreenCaptureKit sends nothing until the screen changes. The status line adds encode time and key-down injected → next complete frame. Measured over DERP while typing in Terminal: encode 15.1 ms avg / 24.9 max, key→frame 40.5 / 62.2 ms (n=89), no pipe or encoder drops. Encode latency is the next Mac-side target.
 - **Encode-latency experiments (2026-10-13), not kept:** VideoToolbox low-latency rate control cut synthetic encodes from 6.3 to 2.3 ms (p50) but live encode stayed 15.9 ms avg and all text looked softer to the user; ScreenCaptureKit delivering 420v instead of BGRA was neutral (15.5 ms). Synthetic frames encode in 6–7 ms whether paced at 60 fps or 5 fps, so the live 15 ms is still unexplained. Key→frame stays about 40 ms, mostly the target app's redraw and the compositor.
 - **Clipboard (2026-10-13):** protocol v3 and local-v3 carry plain text both ways on per-update QUIC side streams (`crates/proto/src/clipboard.rs`), at most 1 MiB, newest wins. The Mac polls the pasteboard during a session, skips password-manager markers, never echoes applied text, and has an on/off switch. Only the viewer sends at session start, so the two clipboards never swap. The Windows viewer (2026-10-14) listens with `AddClipboardFormatListener`, honours the Windows private-copy formats, marks applied text `CanUploadToCloudClipboard` = 0, and has a status-bar switch, on by default; see [app/README.md](../app/README.md#clipboard). Its clipboard handling passed against the real Windows clipboard. Live test at `118d6c6`, user-confirmed 2026-10-14: multi-line text Windows→Mac, ü and emoji Mac→Windows, password-manager copies skipped on both sides, and the switch off on each side; the viewer showed 5 sent, 5 received, 3 skipped, none failed. Text from the Mac appears in local Win+V history, as intended; the cloud-upload flag itself is checked by the viewer's real-clipboard test, not live. Not checked: the macOS paste-permission prompt.
+- **Live session checks (2026-10-14), user-confirmed at `c5a9900`:**
+  - **Lock screen:** locked through the viewer (Apple menu → Lock Screen). The lock screen stayed live in the viewer; typing the password there and pressing Enter unlocked the Mac. The password travels only as ordinary key presses; nothing stores or logs it (acceptance step 4).
+  - **Held key on disconnect:** holding J in a terminal and closing the viewer with Alt+F4 stopped the repeat at once. The relaunched viewer reconnected.
+  - **Remote access off:** turning it off ended the live session. A new connect then timed out, since the host stops listening. After turning it back on, the viewer connected again. The Mac log showed one `pipe write failed` line at the moment of turning off, with no visible effect.
+  - **Path:** Tailscale direct (192.168.66.112), 12 ms ping.
+  - **Pointer off the window:** with the viewer in front, keys pressed while the pointer is off its window stay with Windows, so Win+Shift+S works (see [app/README.md](../app/README.md#remote-input)).
+
 Still pending:
+
+- **Connection screen and account login (user request, 2026-10-14), modelled on NoMachine:**
+  - **Start screen:** the viewer opens to saved hosts and an address field (name or IP), plus Connect. `--connect` stays for testing.
+  - **First connection:** an unknown host goes through the existing pairing approval, shown in the viewer: fingerprints on both screens, approve on the Mac. Pairing stays the device check; the login does not replace it.
+  - **Login:** after pairing, a username and password, checked by the Mac against the account of the signed-in user, over the encrypted connection. Failures get one generic message and a growing delay. Neither side stores or logs the password; there is no "remember password".
+  - **After login:** the screen appears. If the Mac is locked, the user unlocks it at the lock screen as tested above (option A). Automatic unlock is not planned.
+  - **Errors in plain words:** can't reach the Mac or Remote access is off, not paired, revoked, another viewer connected, wrong login.
+  - **Disconnect:** returns to the start screen.
+  - **Work split:** this needs a protocol version bump. Login messages and the Mac's password check are the Mac agent's; the screens are mine.
+  - **Reverse direction (Mac viewer, Windows host):** use the same flow if needed: a Windows host running in the user's session can't capture the secure desktop where Windows shows its lock screen.
 
 Deliverable: authenticated connections by hostname/IP with a documented pairing flow and bounded video transport.
 
