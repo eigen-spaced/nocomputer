@@ -20,7 +20,7 @@ h2 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
 p { margin: 0 0 6px; }
 .intro, .muted { color: var(--muted); }
 .name { font-weight: 600; overflow-wrap: anywhere; }
-.fingerprint { font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; overflow-wrap: anywhere; user-select: text; }
+.fingerprint { display: inline-block; max-width: 100%; font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; overflow-wrap: anywhere; user-select: text; }
 .switch { display: flex; gap: 8px; align-items: center; margin: 6px 0; }
 .warn, .notice { padding: 8px 10px; border: 1px solid; border-radius: 6px; overflow-wrap: anywhere; }
 .warn { background: var(--warn-bg); border-color: var(--warn-line); }
