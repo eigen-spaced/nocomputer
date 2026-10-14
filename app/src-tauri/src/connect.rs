@@ -4,7 +4,9 @@
 //! Each step is one command, and the connection waits here between them: `connect_open`
 //! connects (pinned if the host is saved), then either `connect_pair` asks the host's user
 //! to approve this device or `connect_login` sends the account's username and password.
-//! `connect_cancel` ends whatever is open or in progress.
+//! `connect_cancel` ends whatever is open or in progress. Each command takes a
+//! [`Ticket`] before its first await; cancelling, or a newer command, makes it stale,
+//! and a stale command closes what it got instead of keeping it.
 //!
 //! The password arrives as a command argument and is moved into a [`Password`] at once,
 //! which clears it when dropped. It is never logged, stored, or put in an event or error.
@@ -89,10 +91,17 @@ enum Stage {
     Login { address: String, prompt: LoginPrompt },
 }
 
+/// The latest command. A cancel that comes before the command reaches its first wait
+/// still counts: `Notify` keeps the permit.
+#[derive(Clone)]
+struct Ticket {
+    id: u64,
+    cancel: Arc<Notify>,
+}
+
 pub struct Connector {
     stage: Mutex<Stage>,
-    /// Ends the command in progress; a new one per command.
-    cancel: Mutex<Arc<Notify>>,
+    ticket: Mutex<Ticket>,
     /// `--via`: (address, where to dial instead), still pinned to the address's identity.
     via: Option<(String, String)>,
 }
@@ -100,29 +109,58 @@ pub struct Connector {
 impl Connector {
     pub fn new(via: Option<(String, String)>) -> Self {
         let via = via.map(|(a, v)| (paths::with_default_port(&a), paths::with_default_port(&v)));
-        Connector { stage: Mutex::new(Stage::Idle), cancel: Default::default(), via }
+        Connector { stage: Mutex::new(Stage::Idle), ticket: Mutex::new(Ticket { id: 0, cancel: Default::default() }), via }
+    }
+
+    /// Makes every earlier command stale; call before a command's first await.
+    fn ticket(&self) -> Ticket {
+        let mut t = self.ticket.lock().unwrap();
+        *t = Ticket { id: t.id + 1, cancel: Default::default() };
+        t.clone()
+    }
+
+    fn is_current(&self, t: &Ticket) -> bool {
+        self.ticket.lock().unwrap().id == t.id
+    }
+
+    /// Stores the stage for the next command, or closes it if `t` went stale.
+    async fn keep(&self, t: &Ticket, stage: Stage) -> bool {
+        let kept = {
+            let mut current = self.stage.lock().unwrap();
+            let fresh = self.ticket.lock().unwrap().id == t.id;
+            if fresh {
+                *current = stage;
+                None
+            } else {
+                Some(stage)
+            }
+        };
+        match kept {
+            None => true,
+            Some(stale) => {
+                close(stale).await;
+                false
+            }
+        }
     }
 
     fn take(&self) -> Stage {
         std::mem::replace(&mut *self.stage.lock().unwrap(), Stage::Idle)
     }
 
-    fn set(&self, stage: Stage) {
-        *self.stage.lock().unwrap() = stage;
-    }
-
-    /// Runs `f` until it finishes or `connect_cancel` is called; dropping `f` closes
-    /// whatever connection it holds.
-    async fn cancellable<T>(&self, f: impl Future<Output = T>) -> Option<T> {
-        let cancel = Arc::new(Notify::new());
-        *self.cancel.lock().unwrap() = cancel.clone();
+    /// Runs `f` until it finishes, or until `t` is cancelled or stale; dropping `f`
+    /// closes whatever connection it holds.
+    async fn cancellable<T>(&self, t: &Ticket, f: impl Future<Output = T>) -> Option<T> {
+        if !self.is_current(t) {
+            return None;
+        }
         tokio::select! {
             out = f => Some(out),
-            _ = cancel.notified() => None,
+            _ = t.cancel.notified() => None,
         }
     }
 
-    async fn open(&self, address: &str) -> Result<Step, Problem> {
+    async fn open(&self, t: &Ticket, address: &str) -> Result<Step, Problem> {
         let dial = match &self.via {
             Some((a, via)) if a == address => via.clone(),
             _ => address.to_string(),
@@ -134,12 +172,11 @@ impl Connector {
             let addr = paths::resolve(&dial).await.map_err(|e| Problem::new("unreachable", format!("Can't find {dial}: {e}")))?;
             viewer.connect(addr, pinned.map(|h| h.fingerprint)).await.map_err(|e| problem(&e))
         };
-        let Some(outcome) = self.cancellable(connect).await else { return Ok(Step::Cancelled) };
-        Ok(match outcome? {
+        let Some(outcome) = self.cancellable(t, connect).await else { return Ok(Step::Cancelled) };
+        let (step, stage) = match outcome? {
             Outcome::Login(prompt) => {
-                let host_name = prompt.host_name.clone();
-                self.set(Stage::Login { address: address.to_string(), prompt });
-                Step::Login { address: address.to_string(), host_name, failed: false, retry_after_ms: 0 }
+                let step = Step::Login { address: address.to_string(), host_name: prompt.host_name.clone(), failed: false, retry_after_ms: 0 };
+                (step, Stage::Login { address: address.to_string(), prompt })
             }
             Outcome::FirstContact(contact) => {
                 let step = Step::Pair {
@@ -149,10 +186,10 @@ impl Connector {
                     this_fingerprint: viewer.fingerprint().to_string(),
                     already_paired: contact.already_paired,
                 };
-                self.set(Stage::Pairing { address: address.to_string(), contact });
-                step
+                (step, Stage::Pairing { address: address.to_string(), contact })
             }
-        })
+        };
+        Ok(if self.keep(t, stage).await { step } else { Step::Cancelled })
     }
 }
 
@@ -192,33 +229,36 @@ pub fn connect_forget(address: String) -> Result<(), Problem> {
 /// Connects to `address` (a name or IP, with or without a port), ending anything open.
 #[tauri::command]
 pub async fn connect_open(connector: tauri::State<'_, Connector>, address: String) -> Result<Step, Problem> {
+    let t = connector.ticket();
     let address = address.trim();
     if address.is_empty() || address.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(Problem::new("bad_input", "Enter the host's name or IP address."));
     }
     close(connector.take()).await;
-    connector.open(&paths::with_default_port(address)).await
+    connector.open(&t, &paths::with_default_port(address)).await
 }
 
 /// Asks the host's user to approve this device, then connects again pinned to it.
 #[tauri::command]
 pub async fn connect_pair(connector: tauri::State<'_, Connector>) -> Result<Step, Problem> {
+    let t = connector.ticket();
     let Stage::Pairing { address, contact } = connector.take() else {
         return Err(Problem::new("other", "Nothing is waiting to pair; connect again."));
     };
     let (fingerprint, name) = (contact.host_fingerprint, contact.host_name.clone());
-    let Some(approved) = connector.cancellable(contact.request_pairing()).await else { return Ok(Step::Cancelled) };
+    let Some(approved) = connector.cancellable(&t, contact.request_pairing()).await else { return Ok(Step::Cancelled) };
     if !approved.map_err(|e| problem(&e))? {
         return Err(Problem::new("declined", "The host didn't approve this PC: the request was declined, or no one answered in time."));
     }
     known_hosts().add(&address, fingerprint, &name).map_err(|e| problem(&e))?;
-    connector.open(&address).await
+    connector.open(&t, &address).await
 }
 
 #[tauri::command]
 pub async fn connect_login(connector: tauri::State<'_, Connector>, live: tauri::State<'_, Live>, username: String, password: String) -> Result<Step, Problem> {
     // First, so it is cleared on every path below.
     let password = Password::new(password);
+    let t = connector.ticket();
     let Stage::Login { address, prompt } = connector.take() else {
         return Err(Problem::new("other", "Nothing is waiting for a login; connect again."));
     };
@@ -227,20 +267,26 @@ pub async fn connect_login(connector: tauri::State<'_, Connector>, live: tauri::
         (Some(password), true) => password,
         (password, valid) => {
             drop(password);
-            connector.set(Stage::Login { address, prompt });
+            connector.keep(&t, Stage::Login { address, prompt }).await;
             let message = if valid { "Enter the account's password." } else { "Enter the host account's username." };
             return Err(Problem::new("bad_input", message));
         }
     };
     let host_name = prompt.host_name.clone();
-    let Some(result) = connector.cancellable(prompt.login(username, password)).await else { return Ok(Step::Cancelled) };
+    let Some(result) = connector.cancellable(&t, prompt.login(username, password)).await else { return Ok(Step::Cancelled) };
     match result.map_err(|e| problem(&e))? {
-        LoginResult::Session(session) => {
+        LoginResult::Session(session) if connector.is_current(&t) => {
             live.begin(session, address);
             Ok(Step::Live)
         }
+        LoginResult::Session(session) => {
+            session.close().await;
+            Ok(Step::Cancelled)
+        }
         LoginResult::Failed { retry_after, prompt } => {
-            connector.set(Stage::Login { address: address.clone(), prompt });
+            if !connector.keep(&t, Stage::Login { address: address.clone(), prompt }).await {
+                return Ok(Step::Cancelled);
+            }
             Ok(Step::Login { address, host_name, failed: true, retry_after_ms: retry_after.as_millis() as u64 })
         }
     }
@@ -249,7 +295,12 @@ pub async fn connect_login(connector: tauri::State<'_, Connector>, live: tauri::
 /// Ends the step in progress, or the connection waiting between steps.
 #[tauri::command]
 pub async fn connect_cancel(connector: tauri::State<'_, Connector>) -> Result<(), ()> {
-    connector.cancel.lock().unwrap().notify_one();
+    let stale = {
+        let mut t = connector.ticket.lock().unwrap();
+        let next = Ticket { id: t.id + 1, cancel: Default::default() };
+        std::mem::replace(&mut *t, next)
+    };
+    stale.cancel.notify_one();
     close(connector.take()).await;
     Ok(())
 }
@@ -259,5 +310,34 @@ async fn close(stage: Stage) {
         Stage::Login { prompt, .. } => prompt.close().await,
         Stage::Pairing { contact, .. } => drop(contact),
         Stage::Idle => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block_on<T>(f: impl Future<Output = T>) -> T {
+        tauri::async_runtime::block_on(f)
+    }
+
+    #[test]
+    fn a_newer_command_or_a_cancel_makes_a_command_stale() {
+        let c = Connector::new(None);
+        let first = c.ticket();
+        let second = c.ticket();
+        assert!(!c.is_current(&first) && c.is_current(&second));
+        assert_eq!(block_on(c.cancellable(&first, async { 1 })), None, "a stale command doesn't run on");
+        assert!(!block_on(c.keep(&first, Stage::Idle)), "nor keep what it got");
+        assert!(block_on(c.keep(&second, Stage::Idle)));
+        assert_eq!(block_on(c.cancellable(&second, async { 2 })), Some(2));
+    }
+
+    #[test]
+    fn a_cancel_before_the_wait_still_counts() {
+        let c = Connector::new(None);
+        let t = c.ticket();
+        t.cancel.notify_one(); // as connect_cancel does, before the command reaches select!
+        assert_eq!(block_on(c.cancellable(&t, std::future::pending::<()>())), None);
     }
 }

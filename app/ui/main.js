@@ -634,7 +634,12 @@ async function home(launch) {
     else if (s.step === 'live') { document.body.classList.remove('home'); resizeCanvas(); live(launch); }
     else list();
   };
-  const run = (promise, onError = list) => promise.then(step, onError);
+  // Only the latest command's answer counts; Cancel, or a newer command, drops the rest.
+  let latest = 0;
+  const run = (promise, onError = list) => {
+    const id = ++latest;
+    return promise.then(s => { if (id === latest) step(s); }, e => { if (id === latest) onError(e); });
+  };
   const open = address => {
     busy(`Connecting to ${shortName(address)}…`);
     run(invoke('connect_open', { address }));
@@ -687,8 +692,8 @@ async function home(launch) {
     run(invoke('connect_login', { username, password }), e => {
       if (e.kind === 'bad_input') { login({ ...s, failed: false, retry_after_ms: 0 }); showProblem(e); }
       else if (e.kind === 'disconnected') {
-        // The host gives each connection 2 minutes to log in.
-        note = { message: 'The login timed out. Enter the password again.' };
+        // The host gives each connection 2 minutes to log in; or the network dropped.
+        note = { message: 'The connection closed before the login finished. Enter the password again.' };
         open(s.address);
       } else list(e);
     });
@@ -700,6 +705,7 @@ async function home(launch) {
   });
   for (const b of document.querySelectorAll('#home .cancel')) {
     b.addEventListener('click', async () => {
+      latest++;
       await invoke('connect_cancel').catch(() => {});
       list();
     });
