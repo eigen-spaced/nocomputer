@@ -11,6 +11,7 @@ mod host;
 mod identity;
 mod input;
 mod keystore;
+mod login;
 pub mod paths;
 mod tls;
 mod trust;
@@ -22,14 +23,15 @@ pub mod wire;
 mod tests;
 
 pub use clipboard::{ClipboardText, MAX_CLIPBOARD};
-pub use host::{Approver, Host, HostConfig, HostEvent, PairingPrompt};
+pub use host::{Approver, Host, HostConfig, HostEvent, PairingPrompt, Verifier};
 pub use identity::{Fingerprint, Identity, SERVER_NAME};
 pub use input::{Button, Input, KeyState, Notice, NoticeKind, ScrollUnit, MAX_NOTICE, MAX_SCROLL_LINES, MAX_SCROLL_PIXELS};
+pub use login::{valid_username, LoginAttempt, LoginDelay, Password, MAX_PASSWORD, MAX_USERNAME};
 pub use keystore::{load_or_create_identity, platform_keystore, KeyStore, MemoryKeyStore};
 pub use tls::ALPN;
 pub use trust::{ClientStatus, KnownHost, KnownHosts, PairedClient, PairedClients};
 pub use video::{AccessUnit, VideoFrame, VideoReceiver, MAX_ACCESS_UNIT, VIDEO_STREAM_VERSION};
-pub use viewer::{ClipboardReceiver, FirstContact, Outcome, Session, Viewer};
+pub use viewer::{ClipboardReceiver, FirstContact, LoginPrompt, LoginResult, Outcome, Session, Viewer};
 pub use wire::{ErrorCode, PROTOCOL_VERSION};
 
 pub const DEFAULT_PORT: u16 = 47900;
@@ -67,4 +69,55 @@ pub enum Error {
     BadFingerprint,
     #[error("stored identity is invalid")]
     BadIdentity,
+}
+
+/// What went wrong, in the terms a viewer shows its user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// No answer from the address: the host is off, unreachable, or not listening
+    /// (for example with Remote access turned off).
+    Unreachable,
+    /// The connection was lost or closed after it was made.
+    Disconnected,
+    /// The host presented a different key than the pinned one. Show it as a warning
+    /// with both fingerprints; never offer to pair again from here.
+    HostIdentityChanged,
+    /// The host doesn't have this device paired.
+    NotPaired,
+    /// The host's user revoked this device.
+    Revoked,
+    /// Another device is in control of the host.
+    Busy,
+    /// This device connected again from elsewhere; this session was closed.
+    Replaced,
+    /// The host and viewer speak different protocol versions; update the older one.
+    VersionMismatch,
+    /// Another pairing request is pending on the host, or one was just denied.
+    PairingUnavailable,
+    /// Too many failed logins on one connection; connect again to retry. A single
+    /// failure is [`LoginResult::Failed`], not an error.
+    LoginFailed,
+    Other,
+}
+
+impl Error {
+    pub fn kind(&self) -> ErrorKind {
+        match self {
+            Error::Connect(_) | Error::Timeout(_) => ErrorKind::Unreachable,
+            Error::Connection(quinn::ConnectionError::TimedOut) => ErrorKind::Unreachable,
+            Error::Connection(_) => ErrorKind::Disconnected,
+            Error::HostIdentityChanged { .. } => ErrorKind::HostIdentityChanged,
+            Error::Remote { code, .. } => match code {
+                ErrorCode::VersionUnsupported => ErrorKind::VersionMismatch,
+                ErrorCode::NotPaired => ErrorKind::NotPaired,
+                ErrorCode::Revoked => ErrorKind::Revoked,
+                ErrorCode::PairingUnavailable => ErrorKind::PairingUnavailable,
+                ErrorCode::Busy => ErrorKind::Busy,
+                ErrorCode::Replaced => ErrorKind::Replaced,
+                ErrorCode::LoginFailed => ErrorKind::LoginFailed,
+                ErrorCode::BadRequest | ErrorCode::Unknown => ErrorKind::Other,
+            },
+            _ => ErrorKind::Other,
+        }
+    }
 }

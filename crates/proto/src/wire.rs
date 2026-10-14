@@ -5,12 +5,15 @@
 //! here, so they stay ordered with the rest of the session (`input.rs`).
 
 use crate::input::{Input, Notice};
+use crate::login::Password;
 use crate::Error;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use zeroize::Zeroizing;
 
-/// 2 added input and notices; 3 added clipboard side streams (`clipboard.rs`).
-pub const PROTOCOL_VERSION: u16 = 3;
+/// 2 added input and notices; 3 added clipboard side streams (`clipboard.rs`); 4 added
+/// the account login after `Welcome` for a paired device (`login.rs`).
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_CONTROL_MESSAGE: usize = 64 * 1024;
 pub const MAX_DEVICE_NAME_CHARS: usize = 64;
 
@@ -25,6 +28,11 @@ pub enum Message {
     /// the host pairs the certificate that authenticated this connection.
     PairRequest,
     PairResult { approved: bool },
+    /// Viewer -> host, after `Welcome { paired: true }`, until a `LoginResult` with `ok`.
+    Login { username: String, password: Password },
+    /// Host -> viewer. On failure, the next attempt is refused unchecked until
+    /// `retry_after_ms` has passed.
+    LoginResult { ok: bool, retry_after_ms: u64 },
     Ping { seq: u64 },
     /// Viewer -> host, in a session: the decoder needs a keyframe. No reply.
     RequestKeyframe,
@@ -49,12 +57,20 @@ pub enum ErrorCode {
     Busy,
     /// A newer session from the same device took over this one.
     Replaced,
+    /// Too many failed logins on this connection; connect again to retry.
+    LoginFailed,
     #[serde(other)]
     Unknown,
 }
 
+/// Room for the largest login message, so encoding it never reallocates and leaves
+/// copies of the password behind.
+const LOGIN_CAPACITY: usize = 16 * 1024;
+
 pub async fn write_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &Message) -> Result<(), Error> {
-    let body = serde_json::to_vec(msg)?;
+    let capacity = if matches!(msg, Message::Login { .. }) { LOGIN_CAPACITY } else { 128 };
+    let mut body = Zeroizing::new(Vec::with_capacity(capacity));
+    serde_json::to_writer(&mut *body, msg)?;
     if body.len() > MAX_CONTROL_MESSAGE {
         return Err(Error::Protocol("control message too large to send".into()));
     }
@@ -71,7 +87,7 @@ pub async fn read_msg<R: AsyncRead + Unpin>(r: &mut R) -> Result<Message, Error>
     if len > MAX_CONTROL_MESSAGE {
         return Err(Error::Protocol(format!("control message of {len} bytes exceeds {MAX_CONTROL_MESSAGE}")));
     }
-    let mut body = vec![0; len];
+    let mut body = Zeroizing::new(vec![0; len]);
     r.read_exact(&mut body).await?;
     Ok(serde_json::from_slice(&body)?)
 }

@@ -1,9 +1,11 @@
 //! Host side: accepts connections, authorizes each one against the paired-device list,
-//! and runs locally approved pairing for unknown devices.
+//! logs the paired device's user in to the host's account, and runs locally approved
+//! pairing for unknown devices.
 
 use crate::clipboard::{self, ClipboardText};
 use crate::identity::{Fingerprint, Identity};
 use crate::input::{Input, Notice, MAX_NOTICE};
+use crate::login::{valid_username, LoginAttempt, LoginDelay, LoginGate};
 use crate::tls;
 use crate::trust::{ClientStatus, PairedClients};
 use crate::video::{self, AccessUnit, Pushed, VideoQueue};
@@ -20,6 +22,11 @@ use tokio::time::timeout;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const PAIR_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
+/// From `Welcome` until the login must have succeeded.
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(120);
+const LOGIN_ATTEMPTS: usize = 5;
+/// A verifier that takes longer is treated as a failure.
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What the host's user is asked to approve. The device fingerprint is the one that
 /// authenticated the connection, never a value the device sent in a message.
@@ -30,8 +37,15 @@ pub struct PairingPrompt {
     pub host_fingerprint: Fingerprint,
 }
 
-/// Asks the local user; resolves to true only on explicit approval.
+/// Asks the local user; resolves to true only on explicit approval. The future is
+/// dropped if the device disconnects first, so dropping it should withdraw the prompt.
 pub type Approver = Arc<dyn Fn(PairingPrompt) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
+
+/// Checks a login against the account the host runs for; resolves to true only if the
+/// username names that account and the password is its password. Any other account,
+/// and any error, is false. Must not log or keep the password. The host serializes
+/// calls and applies the delays; the verifier only checks.
+pub type Verifier = Arc<dyn Fn(LoginAttempt) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostEvent {
@@ -41,6 +55,9 @@ pub enum HostEvent {
     SessionEnded { device: Fingerprint },
     Paired { device: Fingerprint, name: String },
     PairingDenied { device: Fingerprint },
+    /// A login from a paired device failed; `failures` is the device's count since its
+    /// last success. Never carries the username or password.
+    LoginFailed { device: Fingerprint, failures: u32 },
     Rejected { device: Option<Fingerprint>, reason: String },
     /// The capture side should encode a keyframe soon: a session started, the viewer
     /// asked, or the host dropped frames for a slow viewer. Rate-limit before acting.
@@ -57,12 +74,13 @@ pub struct HostConfig {
     pub approval_timeout: Duration,
     /// After a denied or unanswered request, all pairing requests are refused this long.
     pub deny_cooldown: Duration,
+    pub login_delay: LoginDelay,
     pub events: Option<tokio::sync::mpsc::UnboundedSender<HostEvent>>,
 }
 
 impl HostConfig {
     pub fn new(name: impl Into<String>) -> Self {
-        HostConfig { name: name.into(), approval_timeout: Duration::from_secs(60), deny_cooldown: Duration::from_secs(10), events: None }
+        HostConfig { name: name.into(), approval_timeout: Duration::from_secs(60), deny_cooldown: Duration::from_secs(10), login_delay: LoginDelay::default(), events: None }
     }
 }
 
@@ -77,7 +95,11 @@ struct Inner {
     config: HostConfig,
     clients: Mutex<PairedClients>,
     approver: Approver,
+    verifier: Verifier,
     gate: Mutex<PairingGate>,
+    logins: Mutex<LoginGate>,
+    /// One login check at a time host-wide, so parallel attempts can't outrun the delay.
+    verifying: tokio::sync::Mutex<()>,
     live: Mutex<HashMap<Fingerprint, Vec<quinn::Connection>>>,
     /// The one controlling session.
     controller: Mutex<Option<(Fingerprint, quinn::Connection)>>,
@@ -98,9 +120,9 @@ pub struct Host {
 }
 
 impl Host {
-    pub fn bind(addr: SocketAddr, identity: &Identity, config: HostConfig, clients: PairedClients, approver: Approver) -> Result<Self, Error> {
+    pub fn bind(addr: SocketAddr, identity: &Identity, config: HostConfig, clients: PairedClients, approver: Approver, verifier: Verifier) -> Result<Self, Error> {
         let tls = tls::server_builder()?.with_single_cert(vec![identity.cert()], identity.key())?;
-        Self::bind_with(addr, tls, identity.fingerprint(), config, clients, approver)
+        Self::bind_with(addr, tls, identity.fingerprint(), config, clients, approver, verifier)
     }
 
     pub(crate) fn bind_with(
@@ -110,12 +132,25 @@ impl Host {
         config: HostConfig,
         clients: PairedClients,
         approver: Approver,
+        verifier: Verifier,
     ) -> Result<Self, Error> {
         if !valid_device_name(&config.name) {
             return Err(Error::Protocol("invalid host name".into()));
         }
         let endpoint = quinn::Endpoint::server(tls::finish_server(tls)?, addr)?;
-        let inner = Inner { fingerprint, config, clients: Mutex::new(clients), approver, gate: Mutex::default(), live: Mutex::default(), controller: Mutex::default(), outputs: Mutex::default() };
+        let inner = Inner {
+            fingerprint,
+            config,
+            clients: Mutex::new(clients),
+            approver,
+            verifier,
+            gate: Mutex::default(),
+            logins: Mutex::default(),
+            verifying: tokio::sync::Mutex::default(),
+            live: Mutex::default(),
+            controller: Mutex::default(),
+            outputs: Mutex::default(),
+        };
         Ok(Host { endpoint, inner: Arc::new(inner) })
     }
 
@@ -230,55 +265,125 @@ impl Inner {
         match status {
             ClientStatus::Revoked => refuse(&mut send, ErrorCode::Revoked, "this device's access was revoked").await,
             ClientStatus::Paired { name } => {
-                if !self.claim_control(device, conn) {
+                // Checked before the login too, so nobody types a password only to be
+                // told the host is busy.
+                if self.controlled_by_other(device) {
                     return refuse(&mut send, ErrorCode::Busy, "another device is connected to this host").await;
                 }
-                let queue = VideoQueue::new();
-                let (notices_tx, notices) = tokio::sync::mpsc::unbounded_channel();
+                write_msg(&mut send, &Message::Welcome { version: PROTOCOL_VERSION, host_name: self.config.name.clone(), paired: true }).await?;
+                // Live from here, so revocation also ends a connection waiting to log in.
+                self.live.lock().unwrap().entry(device).or_default().push(conn.clone());
                 let result = async {
-                    write_msg(&mut send, &Message::Welcome { version: PROTOCOL_VERSION, host_name: self.config.name.clone(), paired: true }).await?;
-                    self.live.lock().unwrap().entry(device).or_default().push(conn.clone());
-                    self.emit(HostEvent::Session { device, name, reported_name: device_name });
-                    let clipboard = clipboard::start_sender(conn.clone());
-                    *self.outputs.lock().unwrap() = Some(Outputs { id: conn.stable_id(), video: queue.clone(), notices: notices_tx, clipboard });
-                    tokio::spawn(video::send_loop(conn.clone(), queue.clone()));
-                    let events = self.config.events.clone();
-                    let side_streams = tokio::spawn(clipboard::receive_loop(conn.clone(), move |text| {
-                        if let Some(tx) = &events {
-                            let _ = tx.send(HostEvent::Clipboard(text));
-                        }
-                    }));
-                    self.emit(HostEvent::KeyframeNeeded);
-                    let result = self.session(&mut send, recv, notices).await;
-                    side_streams.abort();
-                    if let Some(conns) = self.live.lock().unwrap().get_mut(&device) {
-                        conns.retain(|c| c.stable_id() != conn.stable_id());
+                    self.login(&mut send, &mut recv, device).await?;
+                    if !self.claim_control(device, conn) {
+                        return refuse(&mut send, ErrorCode::Busy, "another device is connected to this host").await;
                     }
-                    self.emit(HostEvent::SessionEnded { device });
+                    if let Err(e) = write_msg(&mut send, &Message::LoginResult { ok: true, retry_after_ms: 0 }).await {
+                        self.release_control(conn);
+                        return Err(e);
+                    }
+                    let result = self.controlled(conn, device, name, device_name, &mut send, recv).await;
+                    self.release_control(conn);
                     result
                 }
                 .await;
-                queue.close();
-                {
-                    let mut outputs = self.outputs.lock().unwrap();
-                    if outputs.as_ref().is_some_and(|o| o.id == conn.stable_id()) {
-                        *outputs = None;
-                    }
+                if let Some(conns) = self.live.lock().unwrap().get_mut(&device) {
+                    conns.retain(|c| c.stable_id() != conn.stable_id());
                 }
-                self.release_control(conn);
                 result
             }
             ClientStatus::Unknown => {
                 write_msg(&mut send, &Message::Welcome { version: PROTOCOL_VERSION, host_name: self.config.name.clone(), paired: false }).await?;
                 // An unpaired device may only ask to pair; anything else ends the connection.
                 match timeout(PAIR_REQUEST_TIMEOUT, read_msg(&mut recv)).await {
-                    Ok(Ok(Message::PairRequest)) => self.pair(&mut send, device, device_name).await,
+                    Ok(Ok(Message::PairRequest)) => self.pair(conn, &mut send, device, device_name).await,
                     Ok(Ok(_)) => refuse(&mut send, ErrorCode::NotPaired, "pair with this host first").await,
                     Ok(Err(e)) => Err(e),
                     Err(_) => Err(Error::Timeout("pairing request")),
                 }
             }
         }
+    }
+
+    /// The controlling session, with outputs to it, until the viewer leaves.
+    async fn controlled(
+        &self,
+        conn: &quinn::Connection,
+        device: Fingerprint,
+        name: String,
+        reported_name: String,
+        send: &mut quinn::SendStream,
+        recv: quinn::RecvStream,
+    ) -> Result<(), Error> {
+        let queue = VideoQueue::new();
+        let (notices_tx, notices) = tokio::sync::mpsc::unbounded_channel();
+        self.emit(HostEvent::Session { device, name, reported_name });
+        let clipboard = clipboard::start_sender(conn.clone());
+        *self.outputs.lock().unwrap() = Some(Outputs { id: conn.stable_id(), video: queue.clone(), notices: notices_tx, clipboard });
+        tokio::spawn(video::send_loop(conn.clone(), queue.clone()));
+        let events = self.config.events.clone();
+        let side_streams = tokio::spawn(clipboard::receive_loop(conn.clone(), move |text| {
+            if let Some(tx) = &events {
+                let _ = tx.send(HostEvent::Clipboard(text));
+            }
+        }));
+        self.emit(HostEvent::KeyframeNeeded);
+        let result = self.session(send, recv, notices).await;
+        side_streams.abort();
+        self.emit(HostEvent::SessionEnded { device });
+        queue.close();
+        let mut outputs = self.outputs.lock().unwrap();
+        if outputs.as_ref().is_some_and(|o| o.id == conn.stable_id()) {
+            *outputs = None;
+        }
+        result
+    }
+
+    /// Reads `Login` messages until one succeeds; the caller answers that one once it
+    /// has control. Every failure, whatever its cause, gets the same answer.
+    async fn login(&self, send: &mut quinn::SendStream, recv: &mut quinn::RecvStream, device: Fingerprint) -> Result<(), Error> {
+        let deadline = tokio::time::Instant::now() + LOGIN_TIMEOUT;
+        for attempt in 1..=LOGIN_ATTEMPTS {
+            let message = tokio::time::timeout_at(deadline, read_msg(recv)).await.map_err(|_| Error::Timeout("login"))??;
+            let Message::Login { username, password } = message else {
+                return refuse(send, ErrorCode::BadRequest, "log in first").await;
+            };
+            let retry_after = {
+                let _turn = self.verifying.lock().await;
+                let waiting = self.logins.lock().unwrap().wait(&device, Instant::now());
+                match waiting {
+                    // Refused unchecked, and not counted.
+                    Some(wait) => wait,
+                    None => {
+                        let attempt = LoginAttempt { device, username, password };
+                        let checkable = valid_username(&attempt.username) && attempt.password.is_valid();
+                        let ok = checkable && timeout(VERIFY_TIMEOUT, (self.verifier)(attempt)).await.unwrap_or(false);
+                        if ok {
+                            self.logins.lock().unwrap().succeed(&device);
+                            return Ok(());
+                        }
+                        let (failures, wait) = self.logins.lock().unwrap().fail(device, &self.config.login_delay, Instant::now());
+                        self.emit(HostEvent::LoginFailed { device, failures });
+                        // Answering only after the shortest delay slows a viewer that
+                        // ignores retry_after.
+                        let answer_after = wait.min(self.config.login_delay.base);
+                        tokio::time::sleep(answer_after).await;
+                        wait - answer_after
+                    }
+                }
+            };
+            if attempt == LOGIN_ATTEMPTS {
+                break;
+            }
+            let retry_after_ms = u64::try_from(retry_after.as_millis()).unwrap_or(u64::MAX);
+            write_msg(send, &Message::LoginResult { ok: false, retry_after_ms }).await?;
+        }
+        refuse(send, ErrorCode::LoginFailed, "too many failed logins; connect again to retry").await
+    }
+
+    fn controlled_by_other(&self, device: Fingerprint) -> bool {
+        let slot = self.controller.lock().unwrap();
+        slot.as_ref().is_some_and(|(holder, conn)| *holder != device && conn.close_reason().is_none())
     }
 
     /// One controlling session at a time. A closed session frees the slot at once,
@@ -306,7 +411,7 @@ impl Inner {
         }
     }
 
-    async fn pair(&self, send: &mut quinn::SendStream, device: Fingerprint, device_name: String) -> Result<(), Error> {
+    async fn pair(&self, conn: &quinn::Connection, send: &mut quinn::SendStream, device: Fingerprint, device_name: String) -> Result<(), Error> {
         let available = {
             let mut gate = self.gate.lock().unwrap();
             let cooling = gate.cooldown_until.is_some_and(|t| Instant::now() < t);
@@ -318,7 +423,11 @@ impl Inner {
             return refuse(send, ErrorCode::PairingUnavailable, "pairing is busy or cooling down; try again shortly").await;
         }
         let prompt = PairingPrompt { device_name: device_name.clone(), device_fingerprint: device, host_fingerprint: self.fingerprint };
-        let approved = timeout(self.config.approval_timeout, (self.approver)(prompt)).await.unwrap_or(false);
+        // A device that leaves withdraws its request: the approver's future is dropped.
+        let approved = tokio::select! {
+            approved = timeout(self.config.approval_timeout, (self.approver)(prompt)) => approved.unwrap_or(false),
+            _ = conn.closed() => false,
+        };
         let recorded = approved && self.clients.lock().unwrap().add(device, &device_name).is_ok();
         {
             let mut gate = self.gate.lock().unwrap();

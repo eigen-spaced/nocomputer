@@ -13,7 +13,15 @@ Transport, device identity, pairing and video for nocomputer, shared by the view
   3. The viewer sends `PairRequest`, which carries no identity. The host prompts its local user with the device name, **the fingerprint of the certificate that authenticated this connection**, and the host's own fingerprint.
   4. On approval the host records the device, and the viewer pins the host's fingerprint against the address the user typed.
 
-  There are no short codes; the user compares full fingerprints. One request can be pending at a time host-wide. Unanswered requests time out after 60 s, and a denial or timeout blocks all requests for 10 s. An unpaired device can only send `Hello` and `PairRequest`; anything else ends the connection.
+  There are no short codes; the user compares full fingerprints. One request can be pending at a time host-wide. Unanswered requests time out after 60 s, and a denial or timeout blocks all requests for 10 s. A device that disconnects while waiting withdraws its request: the host drops the `Approver`'s future, which should dismiss the prompt. An unpaired device can only send `Hello` and `PairRequest`; anything else ends the connection.
+- **Login (protocol v4).** Pairing proves which device is connecting. After it, every pinned connection must also log in to the account the host runs for (on the Mac, the signed-in user) before it gets anything else (see `src/login.rs`).
+  1. `Viewer::connect` with a pin returns `Outcome::Login(LoginPrompt)`. The Busy check runs before this, so nobody types a password only to be refused. Nothing else happens on the connection yet: no video, input, clipboard or session, and no claim on the controller slot. Any other message ends the connection with `bad_request`.
+  2. `LoginPrompt::login(username, Password)` sends `{"type":"login","username":...,"password":...}` inside the authenticated TLS connection. The host's `Verifier` checks it. Success gives a `Session`; a busy host still refuses at this point if another device took control meanwhile.
+  3. Every failure, whatever its cause (wrong account, wrong password, a verifier error or timeout), gets the same answer: `LoginResult::Failed { retry_after }`. The connection stays open for another attempt. The 5th failure, or 2 minutes without a success, ends it with `login_failed`, and connecting again gives a new prompt.
+
+  **Delay:** after the 1st and 2nd consecutive failures the delay is 1 s, then it doubles (2, 4, 8 s ...) up to 5 min. It's counted per device and host-wide, the longer applies, and a success resets both. The host waits up to 1 s before answering a failure. An attempt before `retry_after` has passed is refused without asking the verifier. Checks run one at a time host-wide, so parallel connections can't outrun the delay. The counts live in memory and reset when the host restarts.
+
+  **Password handling:** `Password` zeroizes on drop and its `Debug` prints `Password(redacted)`. The control-message buffers are zeroized after use. Copies inside serde_json's error paths, QUIC's send buffers and the UI toolkit can't be cleared, so this is best effort. Nothing is stored or logged; `HostEvent::LoginFailed` carries the device and a count only. The pairing check stays: a password alone never admits an unpaired device.
 - **Revocation.** A revoked device stays listed as revoked, so it can't simply pair again. `Host::revoke` closes its live connections immediately. A revocation written by another process (`nocomputer-pair revoke`) applies from the next connection, because the host reads the list from disk on each one.
 - **One controller.** The host serves one session at a time; a different paired device is refused with `busy` until that session ends, closes or is revoked. The same device connecting again (for example after a network change, before the old connection times out) takes over, and its old session ends with `replaced`. Pairing connections don't count. A session whose network silently dropped holds the slot until the 30 s idle timeout.
 - **Pinned reconnect.** If a pinned host presents a different certificate, the viewer fails with `HostIdentityChanged { expected, presented }` and connects to nothing.
@@ -30,9 +38,13 @@ The JSON lists are authorization data, not secrets, but editing them grants acce
 
 On macOS, Keychain access control is bound to the code signature of the program that created the item, so ad-hoc rebuilds may prompt. This is the same stable-signing problem as the TCC grants.
 
+## Errors
+
+`Error::kind()` sorts errors for display: `Unreachable` (no answer, for example with Remote access off), `Disconnected` (lost after connecting), `HostIdentityChanged` (show both fingerprints as a warning; never offer to pair again from there), `NotPaired`, `Revoked`, `Busy` (another device is in control), `Replaced` (this device connected again from elsewhere; this session was closed), `VersionMismatch`, `PairingUnavailable`, `LoginFailed` (too many attempts on one connection), and `Other`. A single wrong login is `LoginResult::Failed`, not an error.
+
 ## Wire format
 
-The viewer opens one bidirectional control stream. Each message is a 4-byte big-endian length, then one JSON object tagged by `type` (see `src/wire.rs`). Messages are capped at 64 KiB, checked before allocating. Unknown fields are ignored, for forward compatibility; unknown message types are errors. `Hello` carries `min_version`/`max_version`, and the host refuses ranges that exclude its version with `version_unsupported`; the protocol version is 3. Video and clipboard text have their own streams. Input and notices are messages on this channel, so they stay ordered with the session. ALPN is `nocomputer/1`, and the default port is 47900/UDP.
+The viewer opens one bidirectional control stream. Each message is a 4-byte big-endian length, then one JSON object tagged by `type` (see `src/wire.rs`). Messages are capped at 64 KiB, checked before allocating. Unknown fields are ignored, for forward compatibility; unknown message types are errors. `Hello` carries `min_version`/`max_version`, and the host refuses ranges that exclude its version with `version_unsupported`; the protocol version is 4 (3 added clipboard side streams; 4 added the login). Video and clipboard text have their own streams. Input and notices are messages on this channel, so they stay ordered with the session. ALPN is `nocomputer/1`, and the default port is 47900/UDP.
 
 ## Video
 
@@ -62,7 +74,7 @@ Plain text only, in both directions, between the controlling session and the hos
 
 ## Manual test tool
 
-`nocomputer-pair` (in `src/bin`) runs either side. State lives in `NOCOMPUTER_STATE_DIR`, or by default `%APPDATA%\nocomputer`, `~/Library/Application Support/nocomputer` or `~/.config/nocomputer`.
+`nocomputer-pair` (in `src/bin`) runs either side. `connect` and `watch` ask for the host account's username and a password, which is read without echo. Its `host` has no account to check, so its console allows or refuses each login, without seeing the password. State lives in `NOCOMPUTER_STATE_DIR`, or by default `%APPDATA%\nocomputer`, `~/Library/Application Support/nocomputer` or `~/.config/nocomputer`.
 
 ```
 nocomputer-pair whoami
@@ -87,3 +99,4 @@ Not yet verified:
 - Input between machines.
 - Clipboard between machines.
 - Linking into the Tauri viewer and the Swift host.
+- The login (v4) between machines, and the Mac's account check.

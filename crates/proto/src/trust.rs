@@ -197,6 +197,13 @@ impl KnownHosts {
         Ok(file)
     }
 
+    /// Every pinned host, by name and then address. Empty if the file doesn't exist yet.
+    pub fn list(&self) -> Result<Vec<KnownHost>, Error> {
+        let mut hosts = self.read()?.hosts;
+        hosts.sort_by(|a, b| (a.name.to_lowercase(), &a.address).cmp(&(b.name.to_lowercase(), &b.address)));
+        Ok(hosts)
+    }
+
     pub fn get(&self, address: &str) -> Result<Option<KnownHost>, Error> {
         let address = address.to_lowercase();
         Ok(self.read()?.hosts.into_iter().find(|h| h.address == address))
