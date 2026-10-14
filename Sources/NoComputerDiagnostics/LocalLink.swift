@@ -273,6 +273,12 @@ enum LocalLink {
         enum CodingKeys: String, CodingKey { case name, hostFingerprint = "host_fingerprint" }
     }
 
+    struct Session: Decodable, Equatable {
+        let name: String
+        let deviceFingerprint: String
+        enum CodingKeys: String, CodingKey { case name, deviceFingerprint = "device_fingerprint" }
+    }
+
     struct PairingWithdrawn: Decodable, Equatable {
         let requestID: UInt64
         enum CodingKeys: String, CodingKey { case requestID = "request_id" }

@@ -5,140 +5,128 @@ import ApplicationServices
 final class AppController: NSObject, NSApplicationDelegate {
     private var remoteHost: RemoteHost?
     private var window: NSWindow!
-    private let permissionLabel = NSTextField(wrappingLabelWithString: "")
-    private let remoteAccess = NSButton(checkboxWithTitle: "Remote access (paired viewers only)", target: nil, action: nil)
-    private let shareClipboard = NSButton(checkboxWithTitle: "Share clipboard text with the viewer", target: nil, action: nil)
-    private let remoteStatus = NSTextField(wrappingLabelWithString: "Remote access off")
-    // Selectable, so the fingerprint can be read out in full and compared.
-    private let identityLabel = NSTextField(wrappingLabelWithString: "")
-    private let pairingNotice = NSTextField(wrappingLabelWithString: "")
-    private let logView = NSTextView()
+    private var panel: PanelView!
+    // Everything the panel shows; it is sent whole whenever it changes.
+    private var state = Panel.State() {
+        didSet { if state != oldValue { panel.send(state.message) } }
+    }
+    private var status = "Remote access off" {
+        didSet { if status != oldValue { panel.send(Panel.status(status)) } }
+    }
     private var log: [String] = []
     private var timer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 480),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 620),
                           styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
         window.title = "NoComputer"
         window.center()
         window.isReleasedWhenClosed = false
-        let root = NSStackView()
-        root.orientation = .vertical
-        root.alignment = .leading
-        root.spacing = 8
-        root.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
-        window.contentView = root
-        root.addArrangedSubview(NSTextField(wrappingLabelWithString:
-            "Remote access runs the bundled nocomputer-host and accepts paired viewers only. It keeps the system awake while on. No video, typed input, or clipboard is saved or logged."))
-        root.addArrangedSubview(permissionLabel)
-        let row = NSStackView()
-        row.orientation = .horizontal
-        for (title, action) in [
-            ("Request Screen Recording", #selector(requestScreen)),
-            ("Request Accessibility", #selector(requestAccessibility)),
-            ("Refresh permissions", #selector(refreshPermissions))
-        ] { row.addArrangedSubview(NSButton(title: title, target: self, action: action)) }
-        root.addArrangedSubview(row)
-        remoteAccess.target = self
-        remoteAccess.action = #selector(toggleRemoteAccess)
-        root.addArrangedSubview(remoteAccess)
-        shareClipboard.state = .on
-        shareClipboard.target = self
-        shareClipboard.action = #selector(toggleShareClipboard)
-        root.addArrangedSubview(shareClipboard)
-        identityLabel.isSelectable = true
-        identityLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        showIdentity(nil)
-        root.addArrangedSubview(identityLabel)
-        pairingNotice.isHidden = true
-        root.addArrangedSubview(pairingNotice)
-        root.addArrangedSubview(remoteStatus)
-        logView.isEditable = false
-        logView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        let logScroll = NSScrollView()
-        logScroll.documentView = logView
-        logScroll.hasVerticalScroller = true
-        logScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 100).isActive = true
-        root.addArrangedSubview(logScroll)
-        for view in root.arrangedSubviews {
-            view.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -32).isActive = true
-        }
+        let resources = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/panel")
+        panel = PanelView(resources: resources)
+        panel.onAction = { [weak self] in self?.handle($0) }
+        panel.onDropped = { [weak self] type in self?.record("Ignored panel message \(type ?? "without a type")") }
+        window.contentView = panel.webView
         let menu = NSMenu()
-        let item = NSMenuItem()
-        menu.addItem(item)
+        let appItem = NSMenuItem()
+        menu.addItem(appItem)
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "Quit NoComputer", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        item.submenu = appMenu
+        appItem.submenu = appMenu
+        // Copy and Select All reach the web view through the responder chain.
+        let editItem = NSMenuItem()
+        menu.addItem(editItem)
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = editMenu
         NSApplication.shared.mainMenu = menu
         window.makeKeyAndOrderFront(nil)
         NSApplication.shared.activate(ignoringOtherApps: true)
         refreshPermissions()
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                if let host = self?.remoteHost { self?.remoteStatus.stringValue = host.statusLine() }
+                guard let self else { return }
+                self.status = self.remoteHost.flatMap { $0.running ? $0.statusLine() : nil } ?? "Remote access off"
             }
+        }
+    }
+
+    // A grant made in System Settings shows up when the user comes back.
+    func applicationDidBecomeActive(_ notification: Notification) {
+        if panel != nil { refreshPermissions() }
+    }
+
+    private func handle(_ action: Panel.Action) {
+        switch action {
+        case .ready:
+            // A fresh or reloaded page: replay everything it shows.
+            panel.send(state.message)
+            panel.send(Panel.status(status))
+            for line in log { panel.send(Panel.log(line)) }
+        case .setRemoteAccess(let on):
+            setRemoteAccess(on)
+        case .setClipboard(let on):
+            state.clipboardOn = on
+            remoteHost?.clipboardEnabled = on
+        case .requestPermission(.screen):
+            _ = CGRequestScreenCaptureAccess()
+            refreshPermissions()
+            record("Screen Recording requested; relaunch may be required after granting")
+        case .requestPermission(.accessibility):
+            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+            _ = AXIsProcessTrustedWithOptions(options)
+            refreshPermissions()
+            record("Accessibility requested")
+        case .refreshPermissions:
+            refreshPermissions()
         }
     }
 
     // In memory only, for the user to read; never written to disk.
     private func record(_ message: String) {
-        log.append(String(format: "%.3f  ", ProcessInfo.processInfo.systemUptime) + message)
+        let line = String(format: "%.3f  ", ProcessInfo.processInfo.systemUptime) + message
+        log.append(line)
         if log.count > 200 { log.removeFirst(log.count - 200) }
-        logView.string = log.joined(separator: "\n")
-        logView.scrollToEndOfDocument(nil)
+        panel.send(Panel.log(line))
     }
 
-    @objc private func refreshPermissions() {
-        permissionLabel.stringValue = "Screen Recording: \(CGPreflightScreenCaptureAccess() ? "granted" : "not granted")    Accessibility: \(AXIsProcessTrusted() ? "granted" : "not granted")"
+    private func refreshPermissions() {
+        state.permissions = [
+            .init(id: .screen, label: "Screen Recording", granted: CGPreflightScreenCaptureAccess()),
+            .init(id: .accessibility, label: "Accessibility", granted: AXIsProcessTrusted()),
+        ]
     }
 
-    @objc private func requestScreen() {
-        _ = CGRequestScreenCaptureAccess()
-        refreshPermissions()
-        record("Screen Recording requested; relaunch may be required after granting")
-    }
-
-    @objc private func requestAccessibility() {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        _ = AXIsProcessTrustedWithOptions(options)
-        refreshPermissions()
-        record("Accessibility requested")
-    }
-
-    @objc private func toggleRemoteAccess() {
-        if remoteAccess.state == .on {
+    private func setRemoteAccess(_ on: Bool) {
+        guard !state.remoteBusy else { return }
+        if on {
+            guard remoteHost?.running != true else { return }
             let host = remoteHost ?? RemoteHost(window: window)
             host.onLog = { [weak self] in self?.record($0) }
-            host.onIdentity = { [weak self] in self?.showIdentity($0) }
-            host.onPairingNotice = { [weak self] notice in
-                self?.pairingNotice.stringValue = notice ?? ""
-                self?.pairingNotice.isHidden = notice == nil
-            }
+            host.onIdentity = { [weak self] in self?.state.host = $0 }
+            host.onPairingNotice = { [weak self] in self?.state.pairingNotice = $0 }
+            host.onSession = { [weak self] in self?.state.session = $0 }
             host.onExit = { [weak self] in
-                self?.remoteAccess.state = .off
-                self?.remoteStatus.stringValue = "Remote access off"
+                self?.state.remoteOn = false
+                self?.state.remoteBusy = false
             }
-            host.clipboardEnabled = shareClipboard.state == .on
+            host.clipboardEnabled = state.clipboardOn
             remoteHost = host
-            do { try host.enable() } catch {
-                record("Remote access failed: \(error.localizedDescription)")
-                remoteAccess.state = .off
+            do {
+                try host.enable()
+                state.remoteOn = true
+                state.remoteError = nil
+            } catch {
+                let message = "Remote access failed: \(error.localizedDescription)"
+                state.remoteError = message
+                record(message)
             }
-        } else {
+        } else if remoteHost?.running == true {
+            // Off once the host has exited; onExit clears busy.
+            state.remoteBusy = true
             remoteHost?.disable()
         }
-    }
-
-    private func showIdentity(_ identity: LocalLink.Identity?) {
-        guard let identity else {
-            identityLabel.stringValue = "This Mac's fingerprint appears here while Remote access is on."
-            return
-        }
-        identityLabel.stringValue = "This Mac (\(identity.name)) fingerprint, as a viewer should show it:\n\(identity.hostFingerprint)"
-    }
-
-    @objc private func toggleShareClipboard() {
-        remoteHost?.clipboardEnabled = shareClipboard.state == .on
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }

@@ -17,6 +17,8 @@ final class RemoteHost {
     var onIdentity: ((LocalLink.Identity?) -> Void)?
     // How the last pairing request ended, shown in the window; nil clears it.
     var onPairingNotice: ((String?) -> Void)?
+    // The viewer in control, or nil.
+    var onSession: ((LocalLink.Session?) -> Void)?
 
     private weak var window: NSWindow?
     private var link: HostLink?
@@ -34,8 +36,14 @@ final class RemoteHost {
     // Controlling sessions, counted as the child does: a replacing session can
     // start before the one it replaces ends.
     private var sessions = 0 {
-        didSet { if (oldValue > 0) != (sessions > 0), let request = prompt?.request { showPairingPrompt(request) } }
+        didSet {
+            if (oldValue > 0) != (sessions > 0), let request = prompt?.request { showPairingPrompt(request) }
+            onSession?(sessions > 0 ? latestSession : nil)
+        }
     }
+    // The newest session is the one in control: it may start before the one it
+    // replaces ends.
+    private var latestSession: LocalLink.Session?
     // Input is injected on its own queue, never behind UI work. The injector
     // and the fields below are only touched on this queue.
     private let inputQueue = DispatchQueue(label: "dev.nocomputer.input", qos: .userInteractive)
@@ -192,7 +200,9 @@ final class RemoteHost {
             onPairingNotice?("Pairing request from \"\(current.request.deviceName)\" closed: the device cancelled or 60 s passed. Nothing was approved.")
             log("Pairing request withdrawn: the device left or the request timed out")
         case "session", "session_ended":
-            sessions = max(0, sessions + (LocalLink.eventType(json) == "session" ? 1 : -1))
+            let started = LocalLink.eventType(json) == "session"
+            if started { latestSession = try? JSONDecoder().decode(LocalLink.Session.self, from: json) }
+            sessions = max(0, sessions + (started ? 1 : -1))
             log("Host event \(LocalLink.eventType(json) ?? ""): \(String(decoding: json, as: UTF8.self))")
         case let type?:
             // Display only. The JSON carries names and fingerprints, never keys.

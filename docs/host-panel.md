@@ -8,7 +8,7 @@ The host panel is one HTML/JS/CSS page, bundled with the app and never fetched f
 - **Location:** `panel/index.html`, `panel/panel.js`, `panel/panel.css` at the repo root.
   - macOS: `build-macos.sh` copies them into `Contents/Resources/panel`, where codesign seals them.
   - Windows: the future host bundles them the same way.
-- **Load:** `loadFileURL(index.html, allowingReadAccessTo:` the panel dir only`)`. The navigation policy allows that first load and cancels everything else. There is no `window.open` and no file picker. If the web content process dies, the shell reloads the page. The web view has `isInspectable = false` and no default context menu items such as Reload; any menu the page wants goes through actions.
+- **Load:** the Mac app serves the page from a `WKURLSchemeHandler` at `nocomputer-panel://panel/`, which answers only for the three files above. A `file://` page has an opaque origin in WebKit, so CSP `'self'` could not be relied on for it. The navigation policy allows only `index.html` in the main frame and cancels everything else. There is no `window.open` and no file picker. If the web content process dies, the shell reloads the page. The web view has `isInspectable = false` and no default context menu items such as Reload; any menu the page wants goes through actions.
 - **CSP:** `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:`. No inline script or style, and no style attributes set from strings.
 - **Page:** follows `prefers-color-scheme` and uses plain words.
 
@@ -17,7 +17,7 @@ The host panel is one HTML/JS/CSS page, bundled with the app and never fetched f
   - Swift: `callAsyncJavaScript("window.panel.receive(msg)", arguments: ["msg": dict], in: nil, contentWorld: .page)`. Never `evaluateJavaScript` with a built string, because device names come from remote devices.
   - Tauri: the same, through an event payload.
 - **Page → shell:** `panelSend(action)`.
-  - Swift: `window.webkit.messageHandlers.panel.postMessage(action)`. Accept it only from the main frame (`frameInfo.isMainFrame`) and from a `file://` URL inside the bundle's panel dir. Re-serialize the body with `JSONSerialization` and drop it if it isn't a dictionary or is over 4 KiB measured as JSON.
+  - Swift: `window.webkit.messageHandlers.panel.postMessage(action)`. Accept it only from the main frame (`frameInfo.isMainFrame`) with the origin `nocomputer-panel://panel`. Re-serialize the body with `JSONSerialization` and drop it if it isn't a dictionary or is over 4 KiB measured as JSON.
   - Tauri: `invoke("panel_action", {action})`, with the same checks.
 - **Version:** every message carries `v: 1`. A page that gets a newer `v` shows "Update the app" and sends nothing.
 

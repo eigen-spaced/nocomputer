@@ -7,6 +7,10 @@ binary_dir="$(swift build --configuration debug --show-bin-path --cache-path "$P
 app_path="$PWD/build/NoComputer Diagnostics.app"
 mkdir -p "$app_path/Contents/MacOS"
 cp resources/Info.plist "$app_path/Contents/Info.plist"
+# The window's page (docs/host-panel.md); codesign seals it with the bundle.
+rm -rf "$app_path/Contents/Resources/panel"
+mkdir -p "$app_path/Contents/Resources/panel"
+cp panel/index.html panel/panel.js panel/panel.css "$app_path/Contents/Resources/panel/"
 cp "$binary_dir/NoComputerDiagnostics" "$app_path/Contents/MacOS/NoComputerDiagnostics"
 # A stable certificate keeps the designated requirement (and so TCC/Keychain
 # grants) unchanged across rebuilds; ad-hoc signing pins each binary's cdhash.
