@@ -14,7 +14,7 @@ The workspace contains an initial local macOS diagnostic app, not a working remo
 - Prioritize readable text, responsive typing/scrolling, correct input, and bounded video delay.
 - Support fit-to-window, fullscreen, mouse movement, scrolling, right-click, and plain-text clipboard in both directions.
 - Support one-time locally approved pairing and subsequent authenticated, encrypted access without per-session local approval. Provide device revocation.
-- Target an existing logged-in macOS session, including its locked state. A timed public display-wake request followed by fresh capture successfully captured the lock screen on this Mac (2026-10-01). The user also confirmed injected pointer movement at the lock screen. Tab had no visible effect; keyboard/password input remains unproven and must be tested before claiming locked-session control.
+- Target an existing logged-in macOS session, including its locked state. A timed public display-wake request followed by fresh capture successfully captured the lock screen on this Mac (2026-10-01). The user also confirmed injected pointer movement at the lock screen. Keyboard input at the lock screen works: the password typed through the viewer unlocked the Mac (user-confirmed 2026-10-14).
 - For initial planned access, the lid is open and the Mac may stay awake with its display off and session locked. Prefer external power. Use a scoped sleep assertion while remote access is enabled; release it when disabled or the process exits.
 - Actual wake from system sleep remains a future requirement to investigate. Do not claim that the app or VPN alone can wake an unreachable sleeping host.
 - Defer logout/reboot access, audio, file transfer, multiple monitors, and multiple controllers.
