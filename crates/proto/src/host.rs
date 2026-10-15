@@ -62,6 +62,9 @@ pub enum HostEvent {
     /// The capture side should encode a keyframe soon: a session started, the viewer
     /// asked, or the host dropped frames for a slow viewer. Rate-limit before acting.
     KeyframeNeeded,
+    /// From the controlling session: stream at most this size (see `Message::ViewSize`).
+    /// Both at least 1. Coalesce before acting: a resizing window sends many.
+    ViewSize { width: u16, height: u16 },
     /// From the controlling session, sanitized (see [`Input::sanitized`]). Inject it
     /// promptly, and release everything held when the session ends.
     Input(Input),
@@ -462,8 +465,8 @@ async fn refuse(send: &mut quinn::SendStream, code: ErrorCode, message: &str) ->
 const READ_AHEAD: usize = 64;
 
 impl Inner {
-    /// Authorized control loop: keepalive pings, keyframe requests and input from the
-    /// viewer; notices to it.
+    /// Authorized control loop: keepalive pings, keyframe requests, view sizes and input
+    /// from the viewer; notices to it.
     async fn session(
         &self,
         send: &mut quinn::SendStream,
@@ -484,6 +487,9 @@ impl Inner {
                 m = messages.recv() => match m {
                     Some(Message::Ping { seq }) => write_msg(send, &Message::Pong { seq }).await?,
                     Some(Message::RequestKeyframe) => self.emit(HostEvent::KeyframeNeeded),
+                    Some(Message::ViewSize { width, height }) if width > 0 && height > 0 => {
+                        self.emit(HostEvent::ViewSize { width, height })
+                    }
                     Some(Message::Input(input)) => {
                         if let Some(input) = input.sanitized() {
                             self.emit(HostEvent::Input(input));

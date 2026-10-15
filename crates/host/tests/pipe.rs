@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
 fn golden(name: &str) -> Vec<u8> {
-    std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/local-v4").join(format!("{name}.bin"))).unwrap()
+    std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/local-v5").join(format!("{name}.bin"))).unwrap()
 }
 
 /// Feeds `input`, closes stdin, and returns (exit code, stdout).
@@ -38,7 +38,8 @@ fn closed_pipe_exits_cleanly() {
 fn version_mismatch_exits_2_without_output() {
     assert_eq!(run(&FromApp::Hello { version: 1 }.encode()), (2, vec![]));
     assert_eq!(run(&FromApp::Hello { version: 3 }.encode()), (2, vec![]));
-    assert_eq!(run(&FromApp::Hello { version: 5 }.encode()), (2, vec![]));
+    assert_eq!(run(&FromApp::Hello { version: 4 }.encode()), (2, vec![]));
+    assert_eq!(run(&FromApp::Hello { version: 6 }.encode()), (2, vec![]));
 }
 
 #[test]
@@ -61,7 +62,7 @@ mod with_identity {
         assert_eq!(code, 0);
         // HelloAck, then the identity event, then nothing.
         let ack = golden("81-hello-ack");
-        assert_eq!(ack, ToApp::HelloAck { version: 4 }.encode());
+        assert_eq!(ack, ToApp::HelloAck { version: 5 }.encode());
         assert!(out.starts_with(&ack), "{out:?}");
         let rest = &out[ack.len()..];
         let len = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;

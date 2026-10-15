@@ -12,8 +12,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroizing;
 
 /// 2 added input and notices; 3 added clipboard side streams (`clipboard.rs`); 4 added
-/// the account login after `Welcome` for a paired device (`login.rs`).
-pub const PROTOCOL_VERSION: u16 = 4;
+/// the account login after `Welcome` for a paired device (`login.rs`); 5 added `ViewSize`.
+pub const PROTOCOL_VERSION: u16 = 5;
+/// `ViewSize` in both fields: show the stream at the host's native size, panning as
+/// needed, instead of fitting a window.
+pub const VIEW_SIZE_NATIVE: u16 = u16::MAX;
 pub const MAX_CONTROL_MESSAGE: usize = 64 * 1024;
 pub const MAX_DEVICE_NAME_CHARS: usize = 64;
 
@@ -36,6 +39,11 @@ pub enum Message {
     Ping { seq: u64 },
     /// Viewer -> host, in a session: the decoder needs a keyframe. No reply.
     RequestKeyframe,
+    /// Viewer -> host, in a session: the largest picture, in device pixels, the viewer
+    /// can show 1:1. The host streams at most that size, keeping the display's aspect;
+    /// [`VIEW_SIZE_NATIVE`] in both fields asks for the host's own native size. Both at
+    /// least 1. No reply: the new size arrives as a keyframe.
+    ViewSize { width: u16, height: u16 },
     Pong { seq: u64 },
     /// Viewer -> host, controlling session only. No reply.
     Input(Input),

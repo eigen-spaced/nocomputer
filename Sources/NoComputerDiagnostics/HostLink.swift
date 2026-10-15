@@ -46,7 +46,7 @@ struct PipeAdmission {
     mutating func written() { queued -= 1 }
 }
 
-// Owns the bundled `nocomputer-host` child and the local-v4 pipe to it. The pipe is
+// Owns the bundled `nocomputer-host` child and the local-v5 pipe to it. The pipe is
 // inherited, never a socket, so no other local process can reach this channel.
 // Network, pairing state and keys live entirely in the child.
 // Sendable: its mutable state is behind `lock`, and writes go through `writer`.
@@ -59,6 +59,7 @@ final class HostLink: @unchecked Sendable {
     var onRequestKeyframe: (() -> Void)?
     var onEvent: ((Data) -> Void)?
     var onClipboard: ((LocalLink.ClipboardText) -> Void)?
+    var onViewSize: ((UInt16, UInt16) -> Void)?
     var onExit: ((String) -> Void)?
     // Not on the main queue: called in order on the pipe reader's queue, so
     // input never waits behind UI work. The receiver must not block.
@@ -253,6 +254,7 @@ final class HostLink: @unchecked Sendable {
                 case .requestKeyframe: self.expectKeyframe(); self.onRequestKeyframe?()
                 case let .event(json): self.onEvent?(json)
                 case let .clipboard(text): self.onClipboard?(text)
+                case let .viewSize(width, height): self.onViewSize?(width, height)
                 case .input, .verifyLogin: break
                 }
             }

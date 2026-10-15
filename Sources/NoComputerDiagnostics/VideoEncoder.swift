@@ -37,8 +37,8 @@ final class VideoEncoder {
     // Set by requestKeyframe(); consumed by the next frame actually submitted,
     // so repeated requests before then coalesce into one IDR.
     private var keyframeRequested = false
-    private let width: Int
-    private let height: Int
+    let width: Int
+    let height: Int
     private let sampleConsumer: ((CMSampleBuffer) -> Void)?
 
     // Remote access asks for keyframes on demand, so the periodic interval is
@@ -225,6 +225,20 @@ final class VideoEncoder {
         state.totalMilliseconds += milliseconds
         state.maxMilliseconds = max(state.maxMilliseconds, milliseconds)
         deliver = true
+    }
+
+    // Frames of another size would stop the encoder with an error.
+    func accepts(_ buffer: CVPixelBuffer) -> Bool {
+        CVPixelBufferGetWidth(buffer) == width && CVPixelBufferGetHeight(buffer) == height
+    }
+
+    // Delivers every frame already submitted, then closes. Used when a new encoder
+    // takes over, so none of this one's frames arrive after the new one's IDR.
+    func finish() {
+        submissionLock.lock()
+        if let session { VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid) }
+        submissionLock.unlock()
+        close()
     }
 
     func close() {

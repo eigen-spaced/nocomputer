@@ -239,6 +239,12 @@ End to end between machines (2026-10-13): the Mac app's bundled host streamed th
     - after disconnect, the display slept on its normal timer.
   - Turning Remote access off used to end the session with "connection lost" in the viewer. The host now closes every connection with its own code and waits up to 1 s for the close to go out, and the viewer reports `HostEnded` and returns to the start screen with "The host ended the session." (user-confirmed live, under 1 s by eye).
 
+- **Stream sized to the viewer (protocol v5, 2026-10-15):** text in fit mode was soft because it was scaled twice: the 2880×1864 px display was captured at 1600 wide, then the viewer shrank that again to its window (about 940–1366 px). Native (1:1) mode was crisp, which confirmed scaling as the cause.
+  - The viewer sends `ViewSize`, the largest picture in device pixels it can show 1:1, at session start and on every resize, fullscreen or fit/native change. `VIEW_SIZE_NATIVE` asks for the native stream.
+  - The host coalesces sizes (at most one per 250 ms, newest wins). The Mac app fits the display's aspect inside the box, between 320 and 2560 wide and never above the display's pixels; native stays 1600 wide. It resizes in place (`SCStream.updateConfiguration`); a new encoder takes over at the first frame of the new size, after the old one flushes, so that frame is an IDR. A failed resize restarts capture.
+  - The viewer recreates its decoder when the SPS changes and draws 1:1 when the frame matches its canvas.
+  - **Live test, user-confirmed:** on the 1366×768 client, text in fit mode is "much more crisp", with no jitter or other problems.
+
 Still pending:
 
 - **Host panel (b2):** the host window becomes one bundled web page shared by the Mac app and a future Windows host; the contract is in [host-panel.md](host-panel.md). The page is the Windows agent's; the Swift shell is the Mac agent's.

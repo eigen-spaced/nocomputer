@@ -144,7 +144,7 @@ async fn host(args: &[String]) -> Result<(), BoxError> {
                 HostEvent::Rejected { device: None, reason } => println!("rejected: {reason}"),
                 // This host has no capture, input injection or clipboard; input and
                 // clipboard text are never printed.
-                HostEvent::KeyframeNeeded | HostEvent::Input(_) | HostEvent::Clipboard(_) => {}
+                HostEvent::KeyframeNeeded | HostEvent::ViewSize { .. } | HostEvent::Input(_) | HostEvent::Clipboard(_) => {}
             }
         }
     });

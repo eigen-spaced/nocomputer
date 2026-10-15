@@ -2,11 +2,11 @@
 
 The host process. The Mac capture app spawns it from its bundle with no arguments. The app feeds it encoded video over stdin/stdout, and it serves paired viewers with `nocomputer-proto`. The app keeps the Screen Recording and Accessibility permissions; this process needs only the network and its own key.
 
-## Pipe contract (local-v4)
+## Pipe contract (local-v5)
 
-The contract is specified in `src/local.rs`, with golden vectors in `testdata/local-v4/`.
+The contract is specified in `src/local.rs`, with golden vectors in `testdata/local-v5/`.
 - **App to host:** Hello, encoded access units, capture-stopped and input-unavailable notices (both forwarded to the viewer), pairing decisions, clipboard text for the viewer, and login verdicts.
-- **Host to app:** HelloAck; start/stop stream when a controlling session begins or ends; keyframe requests, rate-limited to one per 500 ms; display events; input from the controlling session; clipboard text from it; and logins to check.
+- **Host to app:** HelloAck; start/stop stream when a controlling session begins or ends; keyframe requests, rate-limited to one per 500 ms; the viewer's picture size (protocol v5), at most one per 250 ms with the newest kept; display events; input from the controlling session; clipboard text from it; and logins to check.
 
 Input is ordered. Consecutive pointer moves coalesce while the app is busy; buttons, keys and scrolls are never coalesced. A backlog of 1024 frames first sheds moves, then is discarded and replaced by ReleaseAll; a working app never gets there. The host sends ReleaseAll whenever a session starts or ends, before StopStream, so nothing stays held when a viewer goes away. Input contents are never logged; replay mode prints counts by kind only. Clipboard text waits behind control frames and input, and only the newest is kept while the app is busy; it is never logged, and replay mode drops it.
 
@@ -18,13 +18,13 @@ Logins (protocol v4) go to the app as VerifyLogin with a fresh `request_id`. The
 
 Each access unit is checked against its keyframe flag. A keyframe must be an IDR with an in-band SPS and PPS. The WebCodecs codec string (`avc1.PPCCLL`) is taken from that SPS, so a new resolution simply arrives with the next IDR.
 
-stdout carries only local-v4 frames; logs go to stderr. A test fails if stdout printing appears in the source.
+stdout carries only local-v5 frames; logs go to stderr. A test fails if stdout printing appears in the source.
 
 Exit codes:
 - 0: stdin closed
 - 1: startup error (bind, key storage)
-- 2: local-v4 version mismatch
-- 3: any other local-v4 violation
+- 2: local-v5 version mismatch
+- 3: any other local-v5 violation
 
 ## Defaults
 

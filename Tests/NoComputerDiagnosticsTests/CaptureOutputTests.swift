@@ -1,19 +1,24 @@
 import Testing
+import os
 import ScreenCaptureKit
 @testable import NoComputerDiagnostics
 
 struct CaptureOutputTests {
     @Test @MainActor func streamResolutionUsesBackingPixelsWithoutChangingDisplay() throws {
-        let points = CGSize(width: 1710, height: 1107)
-        #expect(try CaptureSession.streamSize(points: points, pixelScale: 2, maximumWidth: 1600, even: true)
-            == CGSize(width: 1600, height: 1034))
-        #expect(try CaptureSession.streamSize(points: points, pixelScale: 2, maximumWidth: 2560, even: true)
-            == CGSize(width: 2560, height: 1656))
-        #expect(try CaptureSession.streamSize(points: CGSize(width: 1280, height: 720), pixelScale: 1,
-            maximumWidth: 2560, even: true) == CGSize(width: 1280, height: 720))
-        #expect(throws: (any Error).self) {
-            try CaptureSession.streamSize(points: .zero, pixelScale: 2, maximumWidth: 1600, even: true)
+        let points = CGSize(width: 1440, height: 932) // 2880×1864 px
+        func size(_ box: CGSize?, points: CGSize = points, scale: CGFloat = 2) throws -> CGSize {
+            try CaptureSession.streamSize(points: points, pixelScale: scale, box: box)
         }
+        #expect(try size(nil) == CGSize(width: 1600, height: 1034), "native is capped")
+        #expect(try size(CGSize(width: 1366, height: 705)) == CGSize(width: 1088, height: 704), "height-bound box")
+        #expect(try size(CGSize(width: 940, height: 2000)) == CGSize(width: 940, height: 608), "width-bound box")
+        #expect(try size(CGSize(width: 4000, height: 4000)) == CGSize(width: 2560, height: 1656), "at most 2560")
+        #expect(try size(CGSize(width: 100, height: 100)) == CGSize(width: 320, height: 206), "at least 320")
+        #expect(try size(CGSize(width: 4000, height: 4000), points: CGSize(width: 1280, height: 720), scale: 1)
+            == CGSize(width: 1280, height: 720), "never above the display's pixels")
+        #expect(try size(nil, points: CGSize(width: 1280, height: 720), scale: 1) == CGSize(width: 1280, height: 720))
+        #expect(throws: (any Error).self) { try size(nil, points: .zero) }
+        #expect(throws: (any Error).self) { try size(CGSize(width: 0, height: 700)) }
     }
 
     private func frame(_ status: SCFrameStatus, width: Int = 8, height: Int = 8,
@@ -85,6 +90,30 @@ struct CaptureOutputTests {
         #expect(state.encoded == 2)
         #expect(state.keyframes == 2)
         #expect(state.error == nil)
+    }
+
+    @Test func aPreparedEncoderTakesOverAtTheFirstFrameOfItsSize() async throws {
+        let order = OSAllocatedUnfairLock(initialState: [Int32]())
+        let consumer: (CMSampleBuffer) -> Void = { sample in
+            let width = sample.formatDescription.map { CMVideoFormatDescriptionGetDimensions($0).width } ?? 0
+            order.withLock { $0.append(width) }
+        }
+        let old = try VideoEncoder(width: 320, height: 240, sampleConsumer: consumer)
+        let new = try VideoEncoder(width: 640, height: 480, sampleConsumer: consumer)
+        defer { old.close(); new.close() }
+        let output = CaptureOutput(encoder: old)
+        try send(.complete, to: output, width: 320, height: 240, time: 1)
+        output.prepare(new)
+        try send(.complete, to: output, width: 320, height: 240, time: 2)
+        try send(.complete, to: output, width: 640, height: 480, time: 3)
+        try send(.complete, to: output, width: 320, height: 240, time: 4) // late, old size: skipped
+        try await waitFor { new.snapshot().encoded == 1 }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        #expect(output.encoder === new)
+        #expect(order.withLock { $0 } == [320, 320, 640], "the old encoder is flushed first")
+        #expect(old.snapshot().error == nil)
+        #expect(new.snapshot().error == nil)
+        #expect(new.snapshot().keyframes == 1)
     }
 
     @Test func onlyCompleteFramesAreCounted() throws {

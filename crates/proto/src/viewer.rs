@@ -235,6 +235,22 @@ impl Session {
         write_msg(&mut self.send, &Message::RequestKeyframe).await.map_err(|e| self.explain_close(e))
     }
 
+    /// Tells the host the largest picture, in device pixels, this viewer can show 1:1,
+    /// or [`crate::VIEW_SIZE_NATIVE`] in both for the host's native size. Send it at
+    /// session start and on every change. No reply: the new size arrives as a keyframe.
+    pub async fn view_size(&mut self, width: u16, height: u16) -> Result<(), Error> {
+        if width == 0 || height == 0 {
+            return Err(Error::Protocol("view size must be at least 1x1".into()));
+        }
+        write_msg(&mut self.send, &Message::ViewSize { width, height }).await.map_err(|e| self.explain_close(e))
+    }
+
+    /// Writes any control message, bypassing this type's checks.
+    #[cfg(test)]
+    pub(crate) async fn send_raw(&mut self, message: &Message) -> Result<(), Error> {
+        write_msg(&mut self.send, message).await
+    }
+
     /// Sends input to the host, in order. No reply.
     pub async fn input(&mut self, input: Input) -> Result<(), Error> {
         write_msg(&mut self.send, &Message::Input(input)).await.map_err(|e| self.explain_close(e))

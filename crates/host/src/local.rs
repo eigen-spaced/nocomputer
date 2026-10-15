@@ -1,14 +1,14 @@
-//! local-v4: the pipe contract between the capture app (parent) and this host process
+//! local-v5: the pipe contract between the capture app (parent) and this host process
 //! (child), over the child's stdin and stdout. v2 added input (0x86-0x8A) and
 //! InputUnavailable (0x05); v3 added Clipboard (0x06, 0x8B); v4 added the account
-//! check (0x8C, 0x07) and the identity, pairing_withdrawn and login_failed events. Only the
-//! current version is spoken.
+//! check (0x8C, 0x07) and the identity, pairing_withdrawn and login_failed events; v5
+//! added ViewSize (0x8D). Only the current version is spoken.
 //!
 //! ```text
 //! frame: [u32 BE len][u8 type][payload]    len = 1 + payload length, 1..=4 MiB
 //!
 //! app -> host
-//!   0x01 Hello            u16 BE version (= 4); must be the first frame
+//!   0x01 Hello            u16 BE version (= 5); must be the first frame
 //!   0x02 AccessUnit       u8 flags (bit0 keyframe, others 0), u64 BE capture_us,
 //!                         Annex B bytes (at least 1); a keyframe is an IDR with SPS+PPS
 //!   0x03 CaptureStopped   UTF-8 reason, at most 1024 bytes
@@ -42,6 +42,11 @@
 //!                         names the account the app runs as and the password is that
 //!                         account's. At most one is outstanding; a newer request
 //!                         replaces it, and a verdict for any other id is ignored.
+//!   0x8D ViewSize         u16 BE width, u16 BE height, both at least 1: stream at most
+//!                         this many pixels, keeping the display's aspect; 0xFFFF in
+//!                         both means the app's native size. Already coalesced (at most
+//!                         one per 250 ms, newest wins). Applies to this session and to
+//!                         every capture restart in it; StopStream forgets it
 //! ```
 //!
 //! Input comes only from the controlling session, in order. Pointer moves may be
@@ -52,14 +57,14 @@
 //!
 //! Anything else is fatal: lengths out of range (checked before allocating), unknown
 //! frame types, a payload on an empty type, wrong fixed sizes, invalid UTF-8. The
-//! payloads of `testdata/local-v4/*.bin` are the reference encoding for both sides.
+//! payloads of `testdata/local-v5/*.bin` are the reference encoding for both sides.
 //! `capture_us` is the app's monotonic clock and only meaningful within the app.
 
 use nocomputer_proto::{valid_username, Button, ClipboardText, Input, KeyState, Password, ScrollUnit, MAX_SCROLL_LINES, MAX_SCROLL_PIXELS};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 pub const MAX_REASON: usize = 1024;
 
@@ -82,6 +87,7 @@ const KEY: u8 = 0x89;
 const RELEASE_ALL: u8 = 0x8A;
 const CLIPBOARD_TO_APP: u8 = 0x8B;
 const VERIFY_LOGIN: u8 = 0x8C;
+const VIEW_SIZE: u8 = 0x8D;
 const FLAG_KEYFRAME: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +117,8 @@ pub enum ToApp {
     Clipboard(ClipboardText),
     /// `Debug` hides the password. Built only from a valid username and password.
     VerifyLogin { request_id: u64, username: String, password: Password },
+    /// Both at least 1.
+    ViewSize { width: u16, height: u16 },
 }
 
 /// Display-only notices for the app. Fingerprints are full, grouped hex strings.
@@ -149,7 +157,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "local pipe: {e}"),
             Error::Eof => write!(f, "local pipe closed"),
-            Error::Protocol(m) => write!(f, "local-v4: {m}"),
+            Error::Protocol(m) => write!(f, "local-v5: {m}"),
         }
     }
 }
@@ -201,6 +209,7 @@ impl ToApp {
             ToApp::Key { usage, state } => frame(KEY, &[&usage.to_be_bytes()[..], &[*state]].concat()),
             ToApp::ReleaseAll => frame(RELEASE_ALL, &[]),
             ToApp::Clipboard(text) => frame(CLIPBOARD_TO_APP, text.as_str().as_bytes()),
+            ToApp::ViewSize { width, height } => frame(VIEW_SIZE, &[width.to_be_bytes(), height.to_be_bytes()].concat()),
             ToApp::VerifyLogin { request_id, username, password } => {
                 debug_assert!(valid_username(username));
                 let password = password.expose().as_bytes();
@@ -357,7 +366,7 @@ mod tests {
 
     fn from_app() -> Vec<(&'static str, FromApp)> {
         vec![
-            ("01-hello", FromApp::Hello { version: 4 }),
+            ("01-hello", FromApp::Hello { version: 5 }),
             ("02-access-unit-key", FromApp::AccessUnit { keyframe: true, capture_us: 0x0102030405060708, data: SPS_PPS_IDR.to_vec() }),
             ("02-access-unit-delta", FromApp::AccessUnit { keyframe: false, capture_us: 0x0102030405064E20, data: DELTA.to_vec() }),
             ("03-capture-stopped", FromApp::CaptureStopped { reason: "display disconnected – ü".into() }),
@@ -372,7 +381,7 @@ mod tests {
 
     fn to_app() -> Vec<(&'static str, ToApp)> {
         vec![
-            ("81-hello-ack", ToApp::HelloAck { version: 4 }),
+            ("81-hello-ack", ToApp::HelloAck { version: 5 }),
             ("82-start-stream", ToApp::StartStream),
             ("83-stop-stream", ToApp::StopStream),
             ("84-request-keyframe", ToApp::RequestKeyframe),
@@ -395,6 +404,8 @@ mod tests {
             ("89-key-up", ToApp::Key { usage: 0x00E3, state: 0 }),
             ("89-key-repeat", ToApp::Key { usage: 0x0028, state: 2 }),
             ("8a-release-all", ToApp::ReleaseAll),
+            ("8d-view-size", ToApp::ViewSize { width: 1366, height: 0x02C1 }),
+            ("8d-view-size-native", ToApp::ViewSize { width: 0xFFFF, height: 0xFFFF }),
             ("8b-clipboard", ToApp::Clipboard(ClipboardText::new("from the viewer\n– ü 🙂".into()).unwrap())),
             (
                 "8c-verify-login",
@@ -412,7 +423,7 @@ mod tests {
     }
 
     fn golden(name: &str) -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/local-v4").join(format!("{name}.bin"))
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/local-v5").join(format!("{name}.bin"))
     }
 
     /// Compares against the checked-in vectors; NOCOMPUTER_WRITE_GOLDEN=1 rewrites them.

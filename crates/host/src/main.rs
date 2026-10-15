@@ -1,6 +1,6 @@
 //! nocomputer-host: serves paired viewers. Normally spawned by the capture app with no
-//! arguments and fed over stdin/stdout (local-v4, see `local.rs`); stdout carries only
-//! local-v4 frames and all logging goes to stderr.
+//! arguments and fed over stdin/stdout (local-v5, see `local.rs`); stdout carries only
+//! local-v5 frames and all logging goes to stderr.
 //!
 //!   nocomputer-host [--listen ADDR] [--name NAME] [--state-dir DIR] [--from-file X.h264]
 //!
@@ -9,8 +9,8 @@
 //! checked then), for testing without the app. Input from the viewer is then only
 //! counted.
 //!
-//! Exit codes: 0 when stdin closes, 1 on startup errors, 2 on a local-v4 version
-//! mismatch, 3 on any other local-v4 violation.
+//! Exit codes: 0 when stdin closes, 1 on startup errors, 2 on a local-v5 version
+//! mismatch, 3 on any other local-v5 violation.
 
 use nocomputer_host::h264::{self, Kind};
 use nocomputer_host::input::InputQueue;
@@ -31,6 +31,8 @@ use zeroize::Zeroizing;
 
 /// At most one keyframe request to the capture side per this interval.
 const KEYFRAME_INTERVAL: Duration = Duration::from_millis(500);
+/// At most one view size to the capture side per this interval: each restarts the encoder.
+const VIEW_SIZE_INTERVAL: Duration = Duration::from_millis(250);
 const REPLAY_FRAME: Duration = Duration::from_micros(16_667);
 
 struct Exit(i32, String);
@@ -122,6 +124,8 @@ enum Capture {
     Start,
     Stop,
     Keyframe,
+    /// The controlling viewer's picture size, already coalesced (`VIEW_SIZE_INTERVAL`).
+    ViewSize { width: u16, height: u16 },
     /// Release all remote input; sent in order with Start and Stop.
     ReleaseAll,
 }
@@ -130,9 +134,9 @@ fn fp(f: &nocomputer_proto::Fingerprint) -> String {
     f.to_string()
 }
 
-/// Turns host events into capture commands (with keyframe requests rate-limited), input,
-/// clipboard text and display events. Input held by a session is released when any
-/// session starts or ends.
+/// Turns host events into capture commands (with keyframe requests rate-limited and view
+/// sizes coalesced), input, clipboard text and display events. Input held by a session is
+/// released when any session starts or ends.
 async fn route_events(
     mut events: mpsc::UnboundedReceiver<HostEvent>,
     capture: mpsc::UnboundedSender<Capture>,
@@ -150,6 +154,9 @@ async fn route_events(
     // A stream start already begins with a keyframe; the request that follows a new
     // session's start is redundant.
     let mut skip_next_keyframe = false;
+    // Each view size restarts the encoder: send at most one per interval, the newest.
+    let mut last_view_size: Option<Instant> = None;
+    let mut pending_view_size: Option<(Instant, u16, u16)> = None;
     loop {
         let event = tokio::select! {
             event = events.recv() => match event {
@@ -160,6 +167,13 @@ async fn route_events(
                 deferred = None;
                 last_keyframe = Some(Instant::now());
                 let _ = capture.send(Capture::Keyframe);
+                continue;
+            }
+            _ = tokio::time::sleep_until(pending_view_size.map_or_else(Instant::now, |p| p.0)), if pending_view_size.is_some() => {
+                if let Some((_, width, height)) = pending_view_size.take() {
+                    last_view_size = Some(Instant::now());
+                    let _ = capture.send(Capture::ViewSize { width, height });
+                }
                 continue;
             }
         };
@@ -179,6 +193,7 @@ async fn route_events(
                 sessions = sessions.saturating_sub(1);
                 if sessions == 0 {
                     deferred = None;
+                    (last_view_size, pending_view_size) = (None, None);
                     let _ = capture.send(Capture::Stop);
                 }
                 let _ = notices.send(Event::SessionEnded { device_fingerprint: fp(&device) });
@@ -197,6 +212,18 @@ async fn route_events(
                 }
             }
             HostEvent::KeyframeNeeded => {}
+            HostEvent::ViewSize { width, height } if sessions > 0 => {
+                let now = Instant::now();
+                match last_view_size {
+                    Some(t) if now < t + VIEW_SIZE_INTERVAL => pending_view_size = Some((t + VIEW_SIZE_INTERVAL, width, height)),
+                    _ => {
+                        last_view_size = Some(now);
+                        pending_view_size = None;
+                        let _ = capture.send(Capture::ViewSize { width, height });
+                    }
+                }
+            }
+            HostEvent::ViewSize { .. } => {}
             HostEvent::Input(i) if sessions > 0 => {
                 if let Some(frame) = ToApp::from_input(i) {
                     input.push(frame);
@@ -442,6 +469,7 @@ async fn serve_app(
                     Capture::Start => ToApp::StartStream,
                     Capture::Stop => ToApp::StopStream,
                     Capture::Keyframe => ToApp::RequestKeyframe,
+                    Capture::ViewSize { width, height } => ToApp::ViewSize { width, height },
                     Capture::ReleaseAll => ToApp::ReleaseAll,
                 },
                 Some(e) = notices.recv() => ToApp::Event(e),
@@ -550,7 +578,8 @@ async fn replay(
                     next = keyframes[0];
                 }
                 Some(Capture::Stop) => streaming = false,
-                Some(Capture::ReleaseAll) => {}
+                // A recording has one size.
+                Some(Capture::ReleaseAll | Capture::ViewSize { .. }) => {}
                 // Like a forced IDR: jump to the next keyframe in the file.
                 Some(Capture::Keyframe) => next = keyframes.iter().copied().find(|&k| k >= next).unwrap_or(keyframes[0]),
             },
@@ -599,7 +628,44 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    /// stdout belongs to local-v4 frames.
+    use super::*;
+
+    async fn next(rx: &mut mpsc::UnboundedReceiver<Capture>, within: Duration) -> Option<Capture> {
+        tokio::time::timeout(within, rx.recv()).await.ok().flatten()
+    }
+
+    #[tokio::test]
+    async fn view_sizes_are_coalesced_and_the_newest_wins() {
+        let (events, rx) = mpsc::unbounded_channel();
+        let (capture, mut commands) = mpsc::unbounded_channel();
+        let (clipboard, _clipboard_rx) = watch::channel(None);
+        let (notices, _notices_rx) = mpsc::unbounded_channel();
+        tokio::spawn(route_events(rx, capture, Arc::new(InputQueue::default()), clipboard, notices));
+        let device: nocomputer_proto::Fingerprint = "00".repeat(32).parse().unwrap();
+        let short = Duration::from_millis(100);
+
+        events.send(HostEvent::ViewSize { width: 1, height: 1 }).unwrap(); // no session: dropped
+        events.send(HostEvent::Session { device, name: "v".into(), reported_name: "v".into() }).unwrap();
+        assert_eq!(next(&mut commands, short).await, Some(Capture::ReleaseAll));
+        assert_eq!(next(&mut commands, short).await, Some(Capture::Start));
+        for width in [1366, 1200, 1000] {
+            events.send(HostEvent::ViewSize { width, height: 700 }).unwrap();
+        }
+        assert_eq!(next(&mut commands, short).await, Some(Capture::ViewSize { width: 1366, height: 700 }), "the first goes at once");
+        assert_eq!(next(&mut commands, short).await, None, "the rest wait for the interval");
+        assert_eq!(next(&mut commands, VIEW_SIZE_INTERVAL).await, Some(Capture::ViewSize { width: 1000, height: 700 }), "only the newest");
+        assert_eq!(next(&mut commands, VIEW_SIZE_INTERVAL * 2).await, None);
+
+        events.send(HostEvent::ViewSize { width: 800, height: 600 }).unwrap();
+        assert_eq!(next(&mut commands, short).await, Some(Capture::ViewSize { width: 800, height: 600 }), "after a quiet interval, at once");
+        events.send(HostEvent::ViewSize { width: 640, height: 480 }).unwrap();
+        events.send(HostEvent::SessionEnded { device }).unwrap();
+        assert_eq!(next(&mut commands, short).await, Some(Capture::ReleaseAll));
+        assert_eq!(next(&mut commands, short).await, Some(Capture::Stop));
+        assert_eq!(next(&mut commands, VIEW_SIZE_INTERVAL * 2).await, None, "a size still waiting is forgotten with the session");
+    }
+
+    /// stdout belongs to local-v5 frames.
     #[test]
     fn nothing_prints_to_stdout() {
         for (name, source) in [("main.rs", include_str!("main.rs")), ("local.rs", include_str!("local.rs")), ("h264.rs", include_str!("h264.rs")), ("input.rs", include_str!("input.rs"))] {

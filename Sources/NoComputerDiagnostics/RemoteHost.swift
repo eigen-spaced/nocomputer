@@ -35,6 +35,10 @@ final class RemoteHost {
     private var starting = false
     private var waitingForDisplay = false
     private var restartTask: Task<Void, Never>?
+    // The controlling viewer's largest 1:1 picture in pixels, or nil for the
+    // native size. Applied to every capture start until the stream stops.
+    private var viewBox: CGSize?
+    private var resizing = false
     private var prompt: (alert: NSAlert, request: LocalLink.PairingPrompt)?
     // Controlling sessions, counted as the child does: a replacing session can
     // start before the one it replaces ends.
@@ -82,6 +86,7 @@ final class RemoteHost {
         link.onRequestKeyframe = { [weak self] in self?.capture.requestKeyframe() }
         link.onEvent = { [weak self] in self?.event($0) }
         link.onClipboard = { [weak self] in self?.clipboard.apply($0) }
+        link.onViewSize = { [weak self] in self?.viewSizeChanged(width: $0, height: $1) }
         clipboard.onLocalText = { [weak link] in link?.sendClipboard($0) }
         link.onExit = { [weak self] in self?.exited($0) }
         link.onInput = { [weak self] input in self?.inputQueue.async { self?.inject(input) } }
@@ -155,12 +160,14 @@ final class RemoteHost {
         Task {
             defer { starting = false }
             do {
-                try await capture.start(sampleConsumer: { [weak link] in link?.submit($0) },
+                try await capture.start(box: viewBox, sampleConsumer: { [weak link] in link?.submit($0) },
                     onStop: { reason in DispatchQueue.main.async { [weak self] in self?.captureEnded(reason) } })
                 if !streamWanted { await stopCapture() }
                 let output = capture.output
                 if let display = capture.displayID { inputQueue.async { self.inputDisplay = display; self.timedOutput = output } }
                 log("Streaming: \(capture.displayDescription)")
+                // A size that arrived while starting.
+                applyViewBox()
             } catch {
                 captureEnded(error.localizedDescription)
             }
@@ -172,9 +179,35 @@ final class RemoteHost {
         clipboard.stop()
         streamWanted = false
         waitingForDisplay = false
+        viewBox = nil
         restartTask?.cancel()
         Task { await stopCapture() }
         log("Stream stopped: \(reason)")
+    }
+
+    private func viewSizeChanged(width: UInt16, height: UInt16) {
+        let native = width == UInt16.max && height == UInt16.max
+        viewBox = native ? nil : CGSize(width: Int(width), height: Int(height))
+        applyViewBox()
+    }
+
+    // One resize at a time; the newest box wins. A capture start reads the box itself.
+    private func applyViewBox() {
+        guard streamWanted, !resizing, !starting, capture.stream != nil else { return }
+        resizing = true
+        let box = viewBox
+        Task {
+            do {
+                if let description = try await capture.resize(box: box) { log("Resized: \(description)") }
+            } catch {
+                // The stream may be half changed; a fresh one starts at the new size.
+                log("Resize failed, restarting capture: \(error.localizedDescription)")
+                await stopCapture()
+                if streamWanted { startStream() }
+            }
+            resizing = false
+            if box != viewBox { applyViewBox() }
+        }
     }
 
     private func stopCapture() async {

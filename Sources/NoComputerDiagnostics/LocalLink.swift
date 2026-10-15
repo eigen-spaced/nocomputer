@@ -1,13 +1,14 @@
 import Foundation
 
-// local-v4: the private pipe contract between this app and its bundled
+// local-v5: the private pipe contract between this app and its bundled
 // `nocomputer-host` child. crates/host/src/local.rs is the source of truth;
-// crates/host/testdata/local-v4/ holds golden vectors both sides test against.
+// crates/host/testdata/local-v5/ holds golden vectors both sides test against.
 // v2 adds remote input (0x86–0x8A) and InputUnavailable (0x05); v3 adds
-// clipboard text (0x06, 0x8B); v4 adds the account check (0x8C, 0x07).
+// clipboard text (0x06, 0x8B); v4 adds the account check (0x8C, 0x07); v5 adds
+// ViewSize (0x8D).
 // Frame: [u32 BE len = 1 + payload][u8 type][payload], 1 <= len <= 4 MiB.
 enum LocalLink {
-    static let version: UInt16 = 4
+    static let version: UInt16 = 5
     static let maximumLength = 4 * 1024 * 1024
     static let maximumReason = 1024
     static let maximumClipboard = 1 << 20
@@ -82,6 +83,8 @@ enum LocalLink {
         case input(RemoteInput)
         case clipboard(ClipboardText)
         case verifyLogin(LoginRequest)
+        // The viewer's largest 1:1 picture in device pixels; both 0xFFFF means native.
+        case viewSize(width: UInt16, height: UInt16)
     }
 
     static func encode(_ message: Outgoing) throws -> Data {
@@ -183,6 +186,10 @@ enum LocalLink {
                 throw ProtocolError.invalid("Clipboard is not 1 byte to 1 MiB of UTF-8 without NUL")
             }
             return .clipboard(text)
+        case 0x8D:
+            try exactly(4)
+            guard u16(0) > 0, u16(2) > 0 else { throw ProtocolError.invalid("ViewSize \(u16(0))x\(u16(2))") }
+            return .viewSize(width: u16(0), height: u16(2))
         default:
             throw ProtocolError.invalid(String(format: "unknown frame type 0x%02x", type))
         }

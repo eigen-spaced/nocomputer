@@ -141,11 +141,11 @@ struct PipeAdmissionTests {
     }
 }
 
-// crates/host owns local-v4; its golden vectors are the shared reference bytes.
+// crates/host owns local-v5; its golden vectors are the shared reference bytes.
 struct LocalLinkGoldenTests {
     private static let directory = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        .appendingPathComponent("crates/host/testdata/local-v4")
+        .appendingPathComponent("crates/host/testdata/local-v5")
 
     private static func golden(_ name: String) throws -> Data {
         try Data(contentsOf: directory.appendingPathComponent(name))
@@ -157,7 +157,7 @@ struct LocalLinkGoldenTests {
     }
 
     @Test func swiftEncodesTheGoldenOutgoingFrames() throws {
-        #expect(try LocalLink.encode(.hello(version: 4)) == Self.golden("01-hello.bin"))
+        #expect(try LocalLink.encode(.hello(version: 5)) == Self.golden("01-hello.bin"))
         #expect(try LocalLink.encode(.accessUnit(keyframe: true, captureMicroseconds: 0x0102_0304_0506_0708,
             annexB: Self.annexB("02-access-unit-key.bin"))) == Self.golden("02-access-unit-key.bin"))
         let delta = try Self.golden("02-access-unit-delta.bin")
@@ -222,7 +222,7 @@ struct LocalLinkGoldenTests {
                      "85-event-pairing-prompt.bin", "85-event-session.bin"]
         let messages = try reader.feed(names.map { try Self.golden($0) }.reduce(Data(), +))
         try #require(messages.count == 6)
-        #expect(Array(messages[0..<4]) == [.helloAck(version: 4), .startStream, .stopStream, .requestKeyframe])
+        #expect(Array(messages[0..<4]) == [.helloAck(version: 5), .startStream, .stopStream, .requestKeyframe])
         guard case let .event(prompt) = messages[4], case let .event(session) = messages[5] else {
             Issue.record("expected two events")
             return
@@ -250,6 +250,16 @@ struct LocalLinkGoldenTests {
         var reader = LocalLink.Reader()
         let messages = try reader.feed(expected.map { try Self.golden($0.0) }.reduce(Data(), +))
         #expect(messages == expected.map { .input($0.1) })
+    }
+
+    @Test func swiftDecodesTheGoldenViewSizes() throws {
+        var reader = LocalLink.Reader()
+        let messages = try reader.feed(Self.golden("8d-view-size.bin") + Self.golden("8d-view-size-native.bin"))
+        #expect(messages == [.viewSize(width: 1366, height: 0x02C1), .viewSize(width: 0xFFFF, height: 0xFFFF)])
+        for bad in [frame(0x8D, [0, 0, 0, 1]), frame(0x8D, [0, 1, 0, 0]), frame(0x8D, [0, 1, 0]), frame(0x8D, [0, 1, 0, 1, 0])] {
+            var reader = LocalLink.Reader()
+            #expect(throws: LocalLink.ProtocolError.self) { try reader.feed(bad) }
+        }
     }
 
     // Swift→Rust frames must never be accepted coming back the other way.
@@ -297,7 +307,7 @@ struct LocalLinkInputTests {
 
     @Test func encodesInputUnavailable() throws {
         #expect(try LocalLink.encode(.inputUnavailable(reason: "no AX")) == frame(0x05, Array("no AX".utf8)))
-        #expect(try LocalLink.encode(.hello(version: LocalLink.version)) == frame(0x01, [0, 4]))
+        #expect(try LocalLink.encode(.hello(version: LocalLink.version)) == frame(0x01, [0, 5]))
     }
 
     @Test func clipboardTextIsBoundedAndNeverDescribed() throws {

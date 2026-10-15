@@ -685,6 +685,29 @@ async fn input_reaches_the_host_in_order_and_notices_reach_the_viewer() {
     session.close().await;
 }
 
+#[tokio::test]
+async fn view_sizes_reach_the_host_and_an_empty_one_is_refused() {
+    use crate::{HostEvent, VIEW_SIZE_NATIVE};
+    let (events, mut seen) = tokio::sync::mpsc::unbounded_channel();
+    let mut config = HostConfig::new("test-host");
+    config.events = Some(events);
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let host = start(Host::bind(LOOPBACK.into(), &Identity::generate().unwrap(), config, PairedClients::in_memory(), approver(true, prompts.clone()), verifier()).unwrap(), prompts);
+    let viewer = viewer();
+    let host_fp = pair(&viewer, &host).await;
+    let mut session = ready(viewer.connect(host.addr, Some(host_fp)).await.unwrap()).await;
+    session.view_size(1366, 705).await.unwrap();
+    session.view_size(VIEW_SIZE_NATIVE, VIEW_SIZE_NATIVE).await.unwrap();
+    assert!(session.view_size(0, 705).await.is_err(), "checked before sending");
+    session.ping().await.unwrap();
+    let sizes: Vec<(u16, u16)> = drain(&mut seen).into_iter().filter_map(|e| if let HostEvent::ViewSize { width, height } = e { Some((width, height)) } else { None }).collect();
+    assert_eq!(sizes, [(1366, 705), (u16::MAX, u16::MAX)]);
+
+    session.send_raw(&Message::ViewSize { width: 1366, height: 0 }).await.unwrap();
+    assert!(session.ping().await.is_err(), "an empty view size ends the session");
+    assert!(!drain(&mut seen).iter().any(|e| matches!(e, HostEvent::ViewSize { .. })));
+}
+
 #[test]
 fn clipboard_text_is_bounded_and_never_shown() {
     use crate::{ClipboardText, MAX_CLIPBOARD};
