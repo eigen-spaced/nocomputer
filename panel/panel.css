@@ -2,13 +2,13 @@
   color-scheme: light dark;
   --bg: #fff; --text: #1d1d1f; --muted: #6e6e73; --line: #d2d2d7; --panel: #f5f5f7;
   --accent: #0a64d8; --accent-text: #fff; --warn-bg: #fdecec; --warn-line: #e5a3a3;
-  --notice-bg: #eef4fd; --notice-line: #a9c4ee;
+  --notice-bg: #eef4fd; --notice-line: #a9c4ee; --danger: #c4271d; --ok: #1f7a3a;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #1e1e1e; --text: #e8eaed; --muted: #9aa0a6; --line: #3a3d42; --panel: #2a2c30;
     --accent: #3b82f6; --accent-text: #fff; --warn-bg: #3a1d1d; --warn-line: #7f2d2d;
-    --notice-bg: #1c2a3f; --notice-line: #34507a;
+    --notice-bg: #1c2a3f; --notice-line: #34507a; --danger: #ff6b61; --ok: #4ec27a;
   }
 }
 html, body { margin: 0; background: var(--bg); color: var(--text); }
@@ -32,6 +32,15 @@ button {
   border: 1px solid var(--accent); border-radius: 6px; cursor: pointer;
 }
 button.secondary { color: var(--text); background: transparent; border-color: var(--line); }
+button.secondary.danger { color: var(--danger); }
+ul.devices li { justify-content: space-between; padding: 8px 0; margin: 0; border-top: 1px solid var(--line); }
+ul.devices li:first-child { border-top: 0; }
+ul.devices li > div { min-width: 0; }
+ul.devices li p { margin: 0 0 2px; }
+ul.devices button { flex: none; }
+.badge { padding: 0 6px; font-size: 11px; border: 1px solid; border-radius: 9px; }
+.badge.connected { color: var(--ok); }
+.badge.removed { color: var(--danger); }
 button:disabled, input:disabled { opacity: 0.5; cursor: default; }
 pre {
   margin: 0 0 12px; padding: 8px 10px; white-space: pre-wrap; overflow-wrap: anywhere;

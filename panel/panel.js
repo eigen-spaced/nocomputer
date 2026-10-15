@@ -3,7 +3,7 @@
 // set through textContent: device names and log lines come from remote devices.
 "use strict";
 
-const VERSION = 1;
+const VERSION = 2;
 const LOG_LINES = 200;
 const $ = (id) => document.getElementById(id);
 
@@ -57,6 +57,61 @@ function renderPermissions(list) {
   }));
 }
 
+function renderDevices(list, on, connected) {
+  const devices = on && Array.isArray(list) ? list.filter((d) => d && typeof d === "object" && str(d.fingerprint)) : [];
+  show($("devices-off"), !on);
+  show($("devices-none"), on && devices.length === 0);
+  const ul = $("device-list");
+  // Rebuilt only when something in it changed, so a selected fingerprint survives.
+  const key = JSON.stringify([connected, devices.map((d) => [str(d.name), str(d.fingerprint), d.pairedAt, !!d.removed])]);
+  if (ul.dataset.key === key) return;
+  ul.dataset.key = key;
+  ul.replaceChildren(...devices.map((d) => {
+    const fingerprint = str(d.fingerprint);
+    const li = document.createElement("li");
+    const about = document.createElement("div");
+    const name = document.createElement("p");
+    const title = document.createElement("span");
+    title.className = "name";
+    title.textContent = str(d.name) || "unnamed device";
+    name.append(title);
+    const badges = [];
+    if (d.removed) badges.push(["Removed", "badge removed"]);
+    else if (fingerprint === connected) badges.push(["Connected", "badge connected"]);
+    for (const [text, className] of badges) {
+      const badge = document.createElement("span");
+      badge.className = className;
+      badge.textContent = text;
+      name.append(" ", badge);
+    }
+    const fp = document.createElement("p");
+    fp.className = "fingerprint";
+    fp.textContent = fingerprint;
+    about.append(name, fp);
+    const when = typeof d.pairedAt === "number" && Number.isFinite(d.pairedAt) ? new Date(d.pairedAt * 1000) : null;
+    if (when && !Number.isNaN(when.getTime())) {
+      const paired = document.createElement("p");
+      paired.className = "muted";
+      paired.textContent = `Paired ${when.toLocaleDateString(undefined, { dateStyle: "medium" })}`;
+      about.append(paired);
+    }
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "secondary";
+    // The shell asks for confirmation natively; the page only reports the click.
+    if (d.removed) {
+      button.textContent = "Allow pairing again";
+      button.addEventListener("click", () => panelSend({ type: "allowPairingAgain", fingerprint }));
+    } else {
+      button.textContent = "Remove";
+      button.classList.add("danger");
+      button.addEventListener("click", () => panelSend({ type: "removeDevice", fingerprint }));
+    }
+    li.append(about, button);
+    return li;
+  }));
+}
+
 function render(state) {
   last = state;
   renderPermissions(state.permissions);
@@ -84,6 +139,8 @@ function render(state) {
   show($("session-none"), !session);
   setText($("session-device"), session ? `"${str(session.device)}"` : "");
   setText($("session-fingerprint"), session ? str(session.deviceFingerprint) : "");
+
+  renderDevices(state.devices, !!remote.on, session ? str(session.deviceFingerprint) : "");
 }
 
 function appendLog(line) {
