@@ -1,6 +1,6 @@
 //! Runs the real binary over its pipes, as the app does.
 
-use nocomputer_host::local::FromApp;
+use nocomputer_host::local::{FromApp, VERSION};
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
@@ -36,10 +36,9 @@ fn closed_pipe_exits_cleanly() {
 
 #[test]
 fn version_mismatch_exits_2_without_output() {
-    assert_eq!(run(&FromApp::Hello { version: 1 }.encode()), (2, vec![]));
-    assert_eq!(run(&FromApp::Hello { version: 3 }.encode()), (2, vec![]));
-    assert_eq!(run(&FromApp::Hello { version: 4 }.encode()), (2, vec![]));
-    assert_eq!(run(&FromApp::Hello { version: 6 }.encode()), (2, vec![]));
+    for version in [1, VERSION - 1, VERSION + 1] {
+        assert_eq!(run(&FromApp::Hello { version }.encode()), (2, vec![]), "version {version}");
+    }
 }
 
 #[test]
@@ -62,7 +61,7 @@ mod with_identity {
         assert_eq!(code, 0);
         // HelloAck, then the identity event, then nothing.
         let ack = golden("81-hello-ack");
-        assert_eq!(ack, ToApp::HelloAck { version: 5 }.encode());
+        assert_eq!(ack, ToApp::HelloAck { version: VERSION }.encode());
         assert!(out.starts_with(&ack), "{out:?}");
         let rest = &out[ack.len()..];
         let len = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;

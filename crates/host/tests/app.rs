@@ -4,7 +4,7 @@
 
 #![cfg(not(target_os = "macos"))] // the host identity would be the app's Keychain item
 
-use nocomputer_host::local::{FromApp, ToApp};
+use nocomputer_host::local::{FromApp, ToApp, VERSION};
 use nocomputer_proto::{Button, ClipboardText, Identity, Input, KeyState, LoginResult, NoticeKind, Outcome, Password, ScrollUnit, Viewer};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
@@ -82,8 +82,8 @@ async fn input_reaches_the_app_in_order_and_is_released_at_session_end() {
     let mut app = child.0.stdin.take().unwrap();
     let frames = read_frames(child.0.stdout.take().unwrap());
     let stderr = BufReader::new(child.0.stderr.take().unwrap());
-    app.write_all(&FromApp::Hello { version: 4 }.encode()).unwrap();
-    assert_eq!(next(&frames), (0x81, vec![0, 4]));
+    app.write_all(&FromApp::Hello { version: VERSION }.encode()).unwrap();
+    assert_eq!(next(&frames), (0x81, VERSION.to_be_bytes().to_vec()));
     // Then the host's identity, for the app to show.
     let (kind, identity) = next(&frames);
     assert_eq!(kind, 0x85);
