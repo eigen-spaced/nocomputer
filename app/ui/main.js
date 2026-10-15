@@ -10,6 +10,13 @@ const ACCELERATION = { 'default': 'no-preference', 'require-hardware': 'prefer-h
 const FRAME_US = 33_333;
 const MAX_DECODE_QUEUE = 4;
 const PAN_STEP = 64;
+// A frame within this many device pixels of the canvas, in either direction, is drawn
+// 1:1 in fit mode: the host streams at the canvas size, and its even-size and aspect
+// rounding must not turn into a blurring 1.002x scale.
+const SNAP_PX = 4;
+// Live: ask the host for this in both fields for its native size (VIEW_SIZE_NATIVE).
+const VIEW_SIZE_NATIVE = 65535;
+const VIEW_SIZE_DEBOUNCE_MS = 200;
 
 const canvas = document.getElementById('video');
 const ctx = canvas.getContext('2d', { alpha: false });
@@ -95,17 +102,47 @@ let info = { codec: '', decode: '', decoded: 0, total: 0, ended: false, error: n
 const statusText = document.createElement('span');
 statusEl.append(statusText);
 
+// The canvas in device pixels, as the browser laid it out. clientWidth times
+// devicePixelRatio can be a pixel off at 125% scaling, and a 1:1 picture needs it exact.
+let deviceSize = null;
+
 function resizeCanvas() {
   const dpr = window.devicePixelRatio || 1;
-  canvas.width = Math.round(canvas.clientWidth * dpr);
-  canvas.height = Math.round(canvas.clientHeight * dpr);
+  [canvas.width, canvas.height] = deviceSize ?? [Math.round(canvas.clientWidth * dpr), Math.round(canvas.clientHeight * dpr)];
   draw();
+  reportViewSize();
+}
+
+const resizeObserver = new ResizeObserver(([entry]) => {
+  const s = entry.devicePixelContentBoxSize?.[0];
+  deviceSize = s && s.inlineSize > 0 && s.blockSize > 0 ? [s.inlineSize, s.blockSize] : null;
+  resizeCanvas();
+});
+try { resizeObserver.observe(canvas, { box: 'device-pixel-content-box' }); } catch { resizeObserver.observe(canvas); }
+
+// Live: tells the host the size to stream, so the picture is scaled once, on the host,
+// and fit mode shows it 1:1: the canvas, or the host's native size in native mode.
+let viewSizeOn = false, viewSizeTimer = null, sentViewSize = null;
+function reportViewSize() {
+  if (!viewSizeOn) return;
+  clearTimeout(viewSizeTimer);
+  viewSizeTimer = setTimeout(() => {
+    const native = view.mode === 'native';
+    const width = native ? VIEW_SIZE_NATIVE : Math.min(canvas.width, VIEW_SIZE_NATIVE - 1);
+    const height = native ? VIEW_SIZE_NATIVE : Math.min(canvas.height, VIEW_SIZE_NATIVE - 1);
+    if (width < 1 || height < 1 || sentViewSize === `${width}x${height}`) return;
+    sentViewSize = `${width}x${height}`;
+    invoke('live_view_size', { width, height }).catch(() => {});
+  }, sentViewSize === null ? 0 : VIEW_SIZE_DEBOUNCE_MS);
 }
 
 // Destination rectangle in canvas (device) pixels.
 function contentRect(vw, vh) {
   const cw = canvas.width, ch = canvas.height;
   if (view.mode === 'fit') {
+    if (Math.abs(cw - vw) <= SNAP_PX || Math.abs(ch - vh) <= SNAP_PX) {
+      if (vw <= cw + SNAP_PX && vh <= ch + SNAP_PX) return { x: Math.floor((cw - vw) / 2), y: Math.floor((ch - vh) / 2), w: vw, h: vh };
+    }
     const s = Math.min(cw / vw, ch / vh);
     const w = vw * s, h = vh * s;
     return { x: (cw - w) / 2, y: (ch - h) / 2, w, h };
@@ -120,11 +157,14 @@ function contentRect(vw, vh) {
 function draw() {
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
+  let size = '';
   if (current) {
     const r = contentRect(current.displayWidth, current.displayHeight);
-    ctx.imageSmoothingEnabled = view.mode === 'fit';
+    const scaled = r.w !== current.displayWidth || r.h !== current.displayHeight;
+    ctx.imageSmoothingEnabled = scaled;
     ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(current, r.x, r.y, r.w, r.h);
+    size = ` ${current.displayWidth}x${current.displayHeight} ${scaled ? 'scaled' : '1:1'} in ${canvas.width}x${canvas.height}`;
   }
   const keys = info.hook
     ? 'Ctrl+Alt+Shift + F fullscreen  N native  arrows pan  R reset  H hide'
@@ -139,7 +179,7 @@ function draw() {
     const keyboard = info.keyboard ? ` | ${info.keyboard}` : '';
     const timing = info.keyTiming ? ` | ${info.keyTiming}` : '';
     const clipboard = info.clipboard ? ` | ${info.clipboard}` : '';
-    statusText.textContent = `${info.host ?? ''} ${info.codec} ${info.decode} | ${info.decoded} frames | ${view.mode} | ${state} | ${video}${keyboard}${timing}${clipboard}${notice} | ${keys} | `;
+    statusText.textContent = `${info.host ?? ''} ${info.codec} ${info.decode} | ${info.decoded} frames | ${view.mode}${size} | ${state} | ${video}${keyboard}${timing}${clipboard}${notice} | ${keys} | `;
   } else {
     const state = info.error ? `error: ${info.error}` : info.ended ? 'ended (holding last frame)' : 'playing';
     statusText.textContent = `${info.codec} ${info.decode} | ${info.decoded}/${info.total} frames | ${view.mode} | ${state} | ${keys}`;
@@ -188,7 +228,7 @@ async function setFullscreen(on) {
 
 // Returns false for a name that isn't a viewer control.
 function shortcut(name) {
-  if (name === 'native') { view.mode = view.mode === 'fit' ? 'native' : 'fit'; view.panX = view.panY = 0; }
+  if (name === 'native') { view.mode = view.mode === 'fit' ? 'native' : 'fit'; view.panX = view.panY = 0; reportViewSize(); }
   else if (name === 'reset') { view.panX = view.panY = 0; }
   else if (name === 'status') { view.showStatus = !view.showStatus; }
   else if (name === 'fullscreen') { setFullscreen(!view.fullscreen); }
@@ -221,8 +261,6 @@ window.addEventListener('keydown', e => {
   if (name && shortcut(name)) e.preventDefault();
 });
 
-window.addEventListener('resize', resizeCanvas);
-
 // ---- live ----
 
 const LIVE_CHECK_FRAMES = 300;
@@ -233,6 +271,8 @@ function parseLive(buf) {
   const flags = v.getUint8(0), codecLen = v.getUint8(13);
   return {
     key: (flags & 1) === 1,
+    // The SPS changed (a new size, say): start a fresh decoder.
+    newStream: (flags & 4) === 4,
     hostUs: Number(v.getBigUint64(1, true)),
     // Key-down to now (in Rust's hands), for the first frame after a key; else null.
     keyMs: flags & 2 ? v.getUint32(9, true) / 1000 : null,
@@ -252,6 +292,8 @@ async function live(launch) {
   info.decode = ACCELERATION[launch.decode];
   info.live = true;
   if (!launch.check) {
+    viewSizeOn = true;
+    reportViewSize();
     startInput(launch);
     await clipboardSwitch();
     disconnectButton();
@@ -331,7 +373,7 @@ async function live(launch) {
     if (f.key) {
       stats.keyframes++;
       info.lastKeyAt = performance.now();
-      if (!decoder || f.codec !== codec) {
+      if (!decoder || f.codec !== codec || f.newStream) {
         decoder?.close();
         codec = stats.codec = info.codec = f.codec;
         decoder = makeDecoder(codec);

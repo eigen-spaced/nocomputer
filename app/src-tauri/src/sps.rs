@@ -33,6 +33,13 @@ pub fn no_reorder(au: &[u8]) -> Option<Vec<u8>> {
     Some(o)
 }
 
+/// The access unit's first SPS NAL unit (header byte included, no start code), if any.
+/// A keyframe whose SPS differs from the last one starts a new stream, for example at
+/// a new size.
+pub fn find(au: &[u8]) -> Option<&[u8]> {
+    nal_ranges(au).into_iter().find(|&(_, payload, end)| payload < end && au[payload] & 0x1F == NAL_SPS).map(|(_, payload, end)| &au[payload..end])
+}
+
 /// One SPS NAL unit (header byte included, no start code), rewritten if it lacks
 /// `bitstream_restriction`.
 fn rewrite(nal: &[u8]) -> Option<Vec<u8>> {
@@ -399,6 +406,16 @@ mod tests {
         let e = escape(&data);
         assert!(!e.windows(3).any(|w| w[0] == 0 && w[1] == 0 && w[2] <= 2));
         assert_eq!(unescape(&e), data);
+    }
+
+    #[test]
+    fn finds_the_sps() {
+        let mut au = vec![0, 0, 0, 1];
+        au.extend_from_slice(MAC_SPS);
+        au.extend_from_slice(PPS_IDR);
+        assert_eq!(find(&au), Some(MAC_SPS));
+        assert_eq!(find(PPS_IDR), None);
+        assert_eq!(find(&[]), None);
     }
 
     #[test]

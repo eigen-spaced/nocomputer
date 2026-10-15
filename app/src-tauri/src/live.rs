@@ -4,7 +4,7 @@
 //! there is one at a time. Frames are pulled by the page:
 //! `live_next` waits for the next frame and returns it as raw bytes,
 //!
-//!   [u8 flags (bit0 keyframe, bit1 key_us set)][u64 LE host_us][u32 LE key_us]
+//!   [u8 flags (bit0 keyframe, bit1 key_us set, bit2 new stream)][u64 LE host_us][u32 LE key_us]
 //!   [u8 codec_len][codec][Annex B access unit]
 //!
 //! `host_us` is the host's monotonic clock: usable as decoder timestamps and for
@@ -12,7 +12,12 @@
 //! first frame to arrive after a key went down: the time from reading that key-down from
 //! the hook to handing this frame to the page, on this machine's clock (0 otherwise). If the page falls
 //! behind, frames are dropped up to the next keyframe and one is requested, so the
-//! decoder never gets a frame whose keyframe it lacks.
+//! decoder never gets a frame whose keyframe it lacks. A keyframe whose SPS differs from
+//! the last one sent is a new stream (a new size, say), and the page starts a fresh
+//! decoder for it.
+//!
+//! The page reports the size it can show 1:1 with `live_view_size`, and the host streams
+//! at that size (or its native size), so the picture is scaled once, on the host.
 //!
 //! Input goes the other way: the page sends pointer and wheel input with `live_input`,
 //! and on Windows the keyboard hook (`hook.rs`) sends keys. Neither is logged. Notices
@@ -28,7 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::ipc::Response;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 /// Frames buffered for the page before dropping to the next keyframe.
 const QUEUE_FRAMES: usize = 8;
@@ -111,6 +116,8 @@ struct Conn {
     info: Arc<Mutex<LiveInfo>>,
     frames: tokio::sync::Mutex<Frames>,
     keyframe: mpsc::UnboundedSender<()>,
+    /// The latest size from the page, for the host.
+    view: watch::Sender<Option<(u16, u16)>>,
     /// With when each was sent, for timing.
     input: mpsc::UnboundedSender<(Input, Instant)>,
     /// The session is up, so input has somewhere to go.
@@ -120,10 +127,18 @@ struct Conn {
     closed: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
-fn encode(frame: &nocomputer_proto::VideoFrame) -> Vec<u8> {
+/// Requests from the page, for the session task.
+struct FromPage {
+    keyframe: mpsc::UnboundedReceiver<()>,
+    view: watch::Receiver<Option<(u16, u16)>>,
+    /// With when each was sent, for timing.
+    input: mpsc::UnboundedReceiver<(Input, Instant)>,
+}
+
+fn encode(frame: &nocomputer_proto::VideoFrame, new_stream: bool) -> Vec<u8> {
     let codec = frame.codec.as_bytes();
     let mut out = Vec::with_capacity(14 + codec.len() + frame.data.len());
-    out.push(frame.keyframe as u8);
+    out.push(frame.keyframe as u8 | (new_stream as u8) << 2);
     out.extend_from_slice(&frame.host_us.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // key_us, set by live_next
     out.push(codec.len() as u8);
@@ -142,7 +157,9 @@ impl Live {
     pub fn begin(&self, session: Session, address: String) {
         let (tx, rx) = mpsc::channel(QUEUE_FRAMES);
         let (keyframe, keyframe_rx) = mpsc::unbounded_channel();
+        let (view, view_rx) = watch::channel(None);
         let (input, input_rx) = mpsc::unbounded_channel();
+        let page = FromPage { keyframe: keyframe_rx, view: view_rx, input: input_rx };
         let (closed_tx, closed_rx) = std::sync::mpsc::channel();
         let info = LiveInfo {
             address,
@@ -154,6 +171,7 @@ impl Live {
             info: Arc::new(Mutex::new(info)),
             frames: tokio::sync::Mutex::new(rx),
             keyframe,
+            view,
             input,
             connected: Default::default(),
             shutdown: Default::default(),
@@ -161,7 +179,7 @@ impl Live {
         });
         let (info, shutdown, connected) = (conn.info.clone(), conn.shutdown.clone(), conn.connected.clone());
         tauri::async_runtime::spawn(async move {
-            let result = run(session, info, tx.clone(), keyframe_rx, input_rx, connected.clone(), shutdown).await;
+            let result = run(session, info, tx.clone(), page, connected.clone(), shutdown).await;
             connected.store(false, Ordering::Relaxed);
             if let Err(e) = result {
                 let _ = tx.send(Err(e)).await;
@@ -206,8 +224,7 @@ async fn run(
     mut session: Session,
     info: Arc<Mutex<LiveInfo>>,
     tx: mpsc::Sender<Result<Frame, String>>,
-    mut keyframe: mpsc::UnboundedReceiver<()>,
-    mut input: mpsc::UnboundedReceiver<(Input, Instant)>,
+    mut page: FromPage,
     connected: Arc<AtomicBool>,
     shutdown: Arc<tokio::sync::Notify>,
 ) -> Result<(), String> {
@@ -224,10 +241,10 @@ async fn run(
             }
         }
     });
-    while input.try_recv().is_ok() {} // nothing from before the session
+    while page.input.try_recv().is_ok() {} // nothing from before the session
     connected.store(true, Ordering::Relaxed);
     crate::hook::set_connected(true);
-    let result = session_loop(&mut session, &mut video, &info, &tx, &mut keyframe, &mut input, &shutdown).await;
+    let result = session_loop(&mut session, &mut video, &info, &tx, &mut page, &shutdown).await;
     reader.abort();
     info.lock().unwrap().clipboard.on = false; // the watcher went with session_loop
     connected.store(false, Ordering::Relaxed);
@@ -245,11 +262,12 @@ async fn session_loop(
     video: &mut mpsc::Receiver<Result<nocomputer_proto::VideoFrame, Error>>,
     info: &Mutex<LiveInfo>,
     tx: &mpsc::Sender<Result<Frame, String>>,
-    keyframe: &mut mpsc::UnboundedReceiver<()>,
-    input: &mut mpsc::UnboundedReceiver<(Input, Instant)>,
+    page: &mut FromPage,
     shutdown: &tokio::sync::Notify,
 ) -> Result<(), String> {
     let mut gap = false;
+    // The SPS of the last keyframe sent to the page.
+    let mut sps: Option<Vec<u8>> = None;
     // When a key went down with no frame received since.
     let mut key_mark: Option<Instant> = None;
     let (mut key_send, mut key_frame) = (Samples::default(), Samples::default());
@@ -269,7 +287,10 @@ async fn session_loop(
                     continue;
                 }
                 gap = false;
-                match tx.try_send(Ok((encode(&frame), mark))) {
+                let found = frame.keyframe.then(|| crate::sps::find(&frame.data)).flatten();
+                let new_stream = found.is_some_and(|s| sps.as_deref() != Some(s));
+                match tx.try_send(Ok((encode(&frame, new_stream), mark))) {
+                    Ok(()) if new_stream => sps = found.map(<[u8]>::to_vec),
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         // The page is behind: drop up to the next keyframe.
@@ -280,8 +301,14 @@ async fn session_loop(
                     Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
                 }
             }
-            Some(()) = keyframe.recv() => session.request_keyframe().await.map_err(|e| crate::connect::explain(&e))?,
-            Some((i, sent)) = input.recv() => {
+            Ok(()) = page.view.changed() => {
+                let size = *page.view.borrow_and_update();
+                if let Some((width, height)) = size {
+                    session.view_size(width, height).await.map_err(|e| crate::connect::explain(&e))?;
+                }
+            }
+            Some(()) = page.keyframe.recv() => session.request_keyframe().await.map_err(|e| crate::connect::explain(&e))?,
+            Some((i, sent)) = page.input.recv() => {
                 let down = matches!(i, Input::Key { state: KeyState::Down, .. });
                 if down {
                     key_mark.get_or_insert(sent);
@@ -370,6 +397,16 @@ pub async fn live_next(live: tauri::State<'_, Live>) -> Result<Response, String>
             Err(e)
         }
         None => Err("the connection ended".into()),
+    }
+}
+
+/// The largest picture, in device pixels, the page can show 1:1, or
+/// [`nocomputer_proto::VIEW_SIZE_NATIVE`] in both for native mode; the host then streams
+/// at that size. The page sends it at the start and on each change.
+#[tauri::command]
+pub fn live_view_size(live: tauri::State<'_, Live>, width: u16, height: u16) {
+    if let Some(c) = live.conn().filter(|_| width > 0 && height > 0) {
+        c.view.send_replace(Some((width, height)));
     }
 }
 

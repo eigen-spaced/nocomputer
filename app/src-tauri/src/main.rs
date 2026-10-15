@@ -193,6 +193,7 @@ fn main() {
             set_fullscreen,
             live::live_next,
             live::live_request_keyframe,
+            live::live_view_size,
             live::live_info,
             live::live_input,
             live::live_settings,
