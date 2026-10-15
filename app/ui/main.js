@@ -614,11 +614,20 @@ async function home(launch) {
   let retryTimer = null;
   let note = null; // shown with the next login form
 
-  const showProblem = p => {
+  // `address`: the saved host the problem is about, for a "Pair again" button.
+  const showProblem = (p, address = null) => {
     const el = $('problem');
     el.textContent = '';
     if (!p) return;
     el.append(p.message ?? String(p));
+    if (address && (p.kind === 'not_paired' || p.kind === 'revoked')) {
+      const again = document.createElement('button');
+      again.type = 'button';
+      again.className = 'secondary';
+      again.textContent = 'Pair again';
+      again.addEventListener('click', () => pairAgain(address));
+      el.append(again);
+    }
     if (p.expected) {
       for (const [label, fp] of [['Paired: ', p.expected], ['Now: ', p.presented]]) {
         const line = document.createElement('span');
@@ -628,14 +637,14 @@ async function home(launch) {
       }
     }
   };
-  const show = (view, problem = null) => {
+  const show = (view, problem = null, address = null) => {
     clearInterval(retryTimer);
     for (const v of document.querySelectorAll('#home .view')) v.classList.toggle('shown', v.id === view);
-    showProblem(problem);
+    showProblem(problem, address);
   };
   const busy = text => { $('busy-text').textContent = text; show('busy'); };
 
-  const list = async (problem = null) => {
+  const list = async (problem = null, address = null) => {
     loginStep = null;
     const ul = $('hosts');
     ul.textContent = '';
@@ -672,7 +681,7 @@ async function home(launch) {
       li.append(who, connect, forget);
       ul.append(li);
     }
-    show('list', problem);
+    show('list', problem, hosts.some(h => h.address === address) ? address : null);
     if (!hosts.length) $('address').focus();
   };
 
@@ -690,14 +699,20 @@ async function home(launch) {
   };
   const open = address => {
     busy(`Connecting to ${shortName(address)}…`);
-    run(invoke('connect_open', { address }));
+    run(invoke('connect_open', { address }), e => list(e, address));
+  };
+  const pairAgain = address => {
+    busy(`Connecting to ${shortName(address)}…`);
+    run(invoke('connect_pair_again', { address }), e => list(e, address));
   };
 
   const pair = s => {
     $('pair-title').textContent = `Pair with ${s.host_name}`;
     $('pair-text').textContent = s.already_paired
-      ? `${s.host_name} already has this PC paired, but this PC hasn't saved it. Check that the host's fingerprint below matches the one its app shows, then continue.`
-      : `This PC hasn't connected to ${shortName(s.address)} before. Check that the host shows these same two fingerprints before asking it to approve.`;
+      ? `${s.host_name} already has this PC paired${s.saved ? '' : ', but this PC hasn\'t saved it'}. Check that the host's fingerprint below matches the one its app shows, then continue.`
+      : s.saved
+        ? `${s.host_name} no longer has this PC paired. It still has the identity this PC saved. Check that the host shows these same two fingerprints before asking it to approve again.`
+        : `This PC hasn't connected to ${shortName(s.address)} before. Check that the host shows these same two fingerprints before asking it to approve.`;
     $('pair-host').textContent = s.host_fingerprint;
     $('pair-this').textContent = s.this_fingerprint;
     $('pair-go').textContent = s.already_paired ? 'Continue' : 'Ask the host to approve';

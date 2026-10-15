@@ -61,3 +61,4 @@ body.home #home {
   background: var(--warn-bg); overflow-wrap: anywhere;
 }
 #problem .fingerprint { display: block; margin-top: 6px; }
+#problem button { display: block; margin-top: 8px; }

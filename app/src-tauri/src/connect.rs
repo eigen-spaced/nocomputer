@@ -26,8 +26,9 @@ use tokio::sync::Notify;
 #[derive(Debug, Serialize)]
 #[serde(tag = "step", rename_all = "snake_case")]
 pub enum Step {
-    /// A host this device hasn't pinned. Both fingerprints must match what the host shows.
-    Pair { address: String, host_name: String, host_fingerprint: String, this_fingerprint: String, already_paired: bool },
+    /// A host this device hasn't pinned, or (`saved`) one it pinned that no longer has it
+    /// paired, presenting the pinned identity. Both fingerprints must match what the host shows.
+    Pair { address: String, host_name: String, host_fingerprint: String, this_fingerprint: String, already_paired: bool, saved: bool },
     /// `failed`: the last attempt was wrong; the next can go after `retry_after_ms`.
     Login { address: String, host_name: String, failed: bool, retry_after_ms: u64 },
     /// The session is up; `live_next` has frames.
@@ -67,8 +68,11 @@ fn problem(e: &Error) -> Problem {
              If you reset the host yourself, forget it below and pair again; otherwise don't."
                 .into(),
         ),
-        ErrorKind::NotPaired => ("not_paired", "The host no longer has this PC paired. Forget it below, then connect to pair again.".into()),
-        ErrorKind::Revoked => ("revoked", "The host's user has revoked this PC's access.".into()),
+        ErrorKind::NotPaired => ("not_paired", "The host no longer has this PC paired. Choose Pair again to ask its user to approve this PC.".into()),
+        ErrorKind::Revoked => (
+            "revoked",
+            "The host's user has removed this PC. To use it again, ask them to choose Allow pairing again on the host, then choose Pair again.".into(),
+        ),
         ErrorKind::Busy => ("busy", "Another viewer is connected to the host. Try again when it disconnects.".into()),
         ErrorKind::HostEnded => ("host_ended", "The host ended the session.".into()),
         ErrorKind::Replaced => ("replaced", "This PC connected to the host again from elsewhere, so this session was closed.".into()),
@@ -193,6 +197,7 @@ impl Connector {
                     host_fingerprint: contact.host_fingerprint.to_string(),
                     this_fingerprint: viewer.fingerprint().to_string(),
                     already_paired: contact.already_paired,
+                    saved: false,
                 };
                 (step, Stage::Pairing { address: address.to_string(), contact })
             }
@@ -244,6 +249,37 @@ pub async fn connect_open(connector: tauri::State<'_, Connector>, address: Strin
     }
     close(connector.take()).await;
     connector.open(&t, &paths::with_default_port(address)).await
+}
+
+/// Starts pairing again with a saved host that no longer has this device paired. The
+/// host must still present the saved identity; the saved entry is replaced only once
+/// `connect_pair` gets the host's approval.
+#[tauri::command]
+pub async fn connect_pair_again(connector: tauri::State<'_, Connector>, address: String) -> Result<Step, Problem> {
+    let t = connector.ticket();
+    close(connector.take()).await;
+    let address = paths::with_default_port(address.trim());
+    let Some(saved) = known_hosts().get(&address).map_err(|e| problem(&e))? else {
+        return connector.open(&t, &address).await;
+    };
+    let Some((outcome, viewer)) = connector.dial(&t, &address, None).await? else { return Ok(Step::Cancelled) };
+    let Outcome::FirstContact(contact) = outcome else {
+        return Err(Problem::new("other", "The host answered unexpectedly; connect again."));
+    };
+    if contact.host_fingerprint != saved.fingerprint {
+        let presented = contact.host_fingerprint;
+        drop(contact);
+        return Err(problem(&Error::HostIdentityChanged { expected: saved.fingerprint, presented }));
+    }
+    let step = Step::Pair {
+        address: address.clone(),
+        host_name: contact.host_name.clone(),
+        host_fingerprint: contact.host_fingerprint.to_string(),
+        this_fingerprint: viewer.fingerprint().to_string(),
+        already_paired: contact.already_paired,
+        saved: true,
+    };
+    Ok(if connector.keep(&t, Stage::Pairing { address, contact }).await { step } else { Step::Cancelled })
 }
 
 /// Asks the host's user to approve this device, then connects again pinned to it.

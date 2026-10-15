@@ -202,6 +202,7 @@ fn main() {
             live::live_ended,
             connect::connect_hosts,
             connect::connect_forget,
+            connect::connect_pair_again,
             connect::connect_open,
             connect::connect_pair,
             connect::connect_login,
