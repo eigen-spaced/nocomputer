@@ -180,7 +180,7 @@ On Windows, 24 loopback tests pass, covering:
 - DPAPI storage
 
 Paired across machines over the tailnet (2026-10-13), with `nocomputer-pair`:
-- **Devices:** the Windows client (Dell Latitude 5400, paired as "latitude", `1111 2222 3333 4444 5555 6666 7777 8888 9999 AAAA BBBB CCCC DDDD EEEE FFFF 0000`) and the MacBook Air host (`0102 0304 0506 0708 090A 0B0C 0D0E 0F10 1112 1314 1516 1718 191A 1B1C 1D1E 1F20`).
+- **Devices:** the Windows client (Dell Latitude 5400, paired as "latitude") and the MacBook Air host.
 - **Pairing:** both screens showed the same two fingerprints, and the user approved on the Mac. The Mac's paired list holds exactly that device fingerprint, and the Windows pin matches the host fingerprint on its screen.
 - **Reconnect:** pinned connects opened sessions with no prompt and closed cleanly. Control-channel ping round trip was 26–28 ms, with one 56 ms outlier in 5.
 - **Bug found and fixed:** the host showed session names from the device's `Hello` ("DESKTOP-V89P2R0") rather than the approved name. Sessions now carry the stored name, and the self-reported one is shown only as unverified. After a host restart on the fixed build, the session showed as "latitude".
@@ -245,9 +245,14 @@ End to end between machines (2026-10-13): the Mac app's bundled host streamed th
   - The viewer recreates its decoder when the SPS changes and draws 1:1 when the frame matches its canvas.
   - **Live test, user-confirmed:** on the 1366×768 client, text in fit mode is "much more crisp", with no jitter or other problems.
 
+- **Paired devices and Pair again (2026-10-16), on main at `c5fdc49`:** the Mac window lists paired devices and can remove them. Before this, the only way out of a revocation was to delete the saved host in the viewer and connect again.
+  - **Mac:** local-v6 adds `RemoveDevice` and `ForgetDevice` from the app, and a `paired_devices` event (name, fingerprint, pairing time, removed). The host sends the event at startup and after every pairing, remove or forget. Panel contract v2 ([host-panel.md](host-panel.md)) shows the list while Remote access is on. Remove is offered for an active device and "Allow pairing again" for a removed one. The app checks each action and confirms it in a native sheet showing the full fingerprint. Remove is sticky revocation, as before. Allow pairing again forgets only a removed device, so it can ask to pair again, still with fresh approval on the Mac.
+  - **Viewer:** after `NotPaired` or `Revoked` for a saved host, the start screen offers Pair again. For `Revoked` it asks the host's user to choose Allow pairing again. Pair again makes first contact without the pin and refuses with the identity-changed warning if the host's fingerprint differs from the saved one. Otherwise it shows the two-fingerprint screen and replaces the saved entry only after the Mac approves.
+  - **Live test, user-confirmed:** removed "latitude" on the Mac; the viewer showed the removed message and Pair again; Pair again was still refused; after Allow pairing again, Pair again brought up the Mac's prompt; approved, then logged in.
+
 Still pending:
 
-- **Host panel (b2):** the host window becomes one bundled web page shared by the Mac app and a future Windows host; the contract is in [host-panel.md](host-panel.md). The page is the Windows agent's; the Swift shell is the Mac agent's.
+- **Host panel on a Windows host:** the Mac app's window is the shared bundled page (contract in [host-panel.md](host-panel.md)); a future Windows host should use the same page. The page is the Windows agent's; the Swift shell is the Mac agent's.
 - **Reverse direction (Mac viewer, Windows host):** use the same flow. A Windows host running in the user's session can't capture the secure desktop where Windows shows its lock screen.
 
 Deliverable: authenticated connections by hostname/IP with a documented pairing flow and bounded video transport.
