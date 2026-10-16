@@ -3,7 +3,7 @@
 // set through textContent: device names and log lines come from remote devices.
 "use strict";
 
-const VERSION = 2;
+const VERSION = 3;
 const LOG_LINES = 200;
 const $ = (id) => document.getElementById(id);
 
@@ -112,6 +112,115 @@ function renderDevices(list, on, connected) {
   }));
 }
 
+const REASONS = {
+  declined: "Declined",
+  timeout: "Not answered in time",
+  receiving_off: "Refused: receiving files was off",
+  busy: "Refused: another file was arriving",
+  too_large: "Refused: larger than 2 GB",
+  no_space: "Not enough space",
+  bad_name: "Refused: the file name isn't allowed",
+  checksum: "Failed: the file changed or was damaged on the way",
+  short: "Failed: the file ended early",
+  disk: "Failed: couldn't write to the folder",
+  disconnected: "The viewer disconnected",
+  cancelled_here: "Cancelled here",
+  cancelled_by_viewer: "Cancelled on the viewer",
+};
+
+function bytes(n) {
+  if (typeof n !== "number" || !Number.isFinite(n) || n < 0) return "?";
+  if (n < 1000) return `${n} bytes`;
+  const units = ["KB", "MB", "GB"];
+  let value = n / 1000;
+  let unit = 0;
+  while (value >= 1000 && unit < units.length - 1) { value /= 1000; unit += 1; }
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
+}
+
+function active(t) {
+  return t.status === "waiting" || t.status === "receiving";
+}
+
+function transferText(t) {
+  if (t.status === "waiting") return `${bytes(t.size)}, waiting for you to accept`;
+  if (t.status === "receiving") return `${bytes(t.received)} of ${bytes(t.size)}`;
+  if (t.status === "saved") return `${bytes(t.size)}, saved`;
+  return REASONS[str(t.reason)] || "Failed";
+}
+
+// Rows by transfer id, so progress updates touch only their own row.
+let rows = new Map();
+
+function updateRow(t) {
+  const row = rows.get(t.id);
+  if (!row) return;
+  setText(row.detail, transferText(t));
+  if (t.status === "receiving") {
+    row.bar.max = typeof t.size === "number" && t.size > 0 ? t.size : 1;
+    row.bar.value = typeof t.received === "number" ? Math.min(t.received, row.bar.max) : 0;
+  }
+}
+
+function renderFiles(files) {
+  const f = files && typeof files === "object" ? files : {};
+  const folder = str(f.folder);
+  $("files").checked = !!f.on && !!folder;
+  $("files").disabled = !folder;
+  setText($("folder"), folder);
+  show($("folder"), !!folder);
+  show($("folder-none"), !folder);
+
+  const list = Array.isArray(f.transfers) ? f.transfers.filter((t) => t && typeof t === "object" && Number.isInteger(t.id)) : [];
+  show($("clear-transfers"), list.some((t) => !active(t)));
+  const ul = $("transfer-list");
+  // Rebuilt only when a row is added, removed or changes status; byte counts update in place.
+  const key = JSON.stringify(list.map((t) => [t.id, str(t.device), str(t.name), str(t.status), str(t.reason)]));
+  if (ul.dataset.key !== key) {
+    ul.dataset.key = key;
+    rows = new Map();
+    ul.replaceChildren(...list.map((t) => {
+      const li = document.createElement("li");
+      const about = document.createElement("div");
+      const name = document.createElement("p");
+      const title = document.createElement("span");
+      title.className = "name";
+      title.textContent = str(t.name) || "unnamed file";
+      name.append(title);
+      if (str(t.device)) name.append(` from ${str(t.device)}`);
+      const detail = document.createElement("p");
+      // Red only for failures and refusals, not for a choice someone made.
+      const chosen = t.status === "cancelled" || ["declined", "timeout"].includes(str(t.reason));
+      detail.className = t.status === "saved" ? "ok" : active(t) || chosen ? "muted" : "failed";
+      about.append(name, detail);
+      const bar = document.createElement("progress");
+      bar.hidden = t.status !== "receiving";
+      about.append(bar);
+      li.append(about);
+      if (active(t)) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "secondary";
+        button.textContent = "Cancel";
+        const id = t.id;
+        button.addEventListener("click", () => panelSend({ type: "cancelTransfer", id }));
+        li.append(button);
+      }
+      rows.set(t.id, { detail, bar });
+      return li;
+    }));
+  }
+  for (const t of list) updateRow(t);
+}
+
+function progress(id, received) {
+  if (!Number.isInteger(id) || typeof received !== "number") return;
+  const t = last && last.files && Array.isArray(last.files.transfers) ? last.files.transfers.find((x) => x && x.id === id) : null;
+  if (!t || t.status !== "receiving") return;
+  t.received = received;
+  updateRow(t);
+}
+
 function render(state) {
   last = state;
   renderPermissions(state.permissions);
@@ -141,6 +250,7 @@ function render(state) {
   setText($("session-fingerprint"), session ? str(session.deviceFingerprint) : "");
 
   renderDevices(state.devices, !!remote.on, session ? str(session.deviceFingerprint) : "");
+  renderFiles(state.files);
 }
 
 function appendLog(line) {
@@ -164,6 +274,7 @@ window.panel = {
       return;
     }
     if (msg.type === "state" && msg.state && typeof msg.state === "object") render(msg.state);
+    else if (msg.type === "progress") progress(msg.id, msg.received);
     else if (msg.type === "status") setText($("status"), str(msg.text));
     else if (msg.type === "log") appendLog(str(msg.line));
   },
@@ -180,6 +291,9 @@ function onSwitch(id, type) {
 }
 onSwitch("remote", "setRemoteAccess");
 onSwitch("clipboard", "setClipboard");
+onSwitch("files", "setReceiveFiles");
+$("choose-folder").addEventListener("click", () => panelSend({ type: "chooseFolder" }));
+$("clear-transfers").addEventListener("click", () => panelSend({ type: "clearTransfers" }));
 $("refresh").addEventListener("click", () => panelSend({ type: "refreshPermissions" }));
 
 if (window.__TAURI__) window.__TAURI__.event.listen("panel", (event) => window.panel.receive(event.payload));

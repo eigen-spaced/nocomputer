@@ -25,6 +25,15 @@
     </section>
 
     <section>
+      <h2>Receiving files</h2>
+      <label class="switch"><input id="files" type="checkbox" disabled> Receive files from the viewer (you accept each one)</label>
+      <p class="folder">Folder: <span id="folder" class="name"></span><span id="folder-none" class="muted">none chosen</span>
+        <button id="choose-folder" type="button" class="secondary">Choose folder…</button></p>
+      <ul id="transfer-list" class="transfers"></ul>
+      <button id="clear-transfers" type="button" class="secondary" hidden>Clear finished</button>
+    </section>
+
+    <section>
       <h2>This computer</h2>
       <p id="host-off" class="muted">Its name and fingerprint appear here while Remote access is on.</p>
       <div id="host" hidden>
