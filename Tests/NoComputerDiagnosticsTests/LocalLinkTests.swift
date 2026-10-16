@@ -141,11 +141,11 @@ struct PipeAdmissionTests {
     }
 }
 
-// crates/host owns local-v5; its golden vectors are the shared reference bytes.
+// crates/host owns local-v6; its golden vectors are the shared reference bytes.
 struct LocalLinkGoldenTests {
     private static let directory = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        .appendingPathComponent("crates/host/testdata/local-v5")
+        .appendingPathComponent("crates/host/testdata/local-v6")
 
     private static func golden(_ name: String) throws -> Data {
         try Data(contentsOf: directory.appendingPathComponent(name))
@@ -157,7 +157,7 @@ struct LocalLinkGoldenTests {
     }
 
     @Test func swiftEncodesTheGoldenOutgoingFrames() throws {
-        #expect(try LocalLink.encode(.hello(version: 5)) == Self.golden("01-hello.bin"))
+        #expect(try LocalLink.encode(.hello(version: 6)) == Self.golden("01-hello.bin"))
         #expect(try LocalLink.encode(.accessUnit(keyframe: true, captureMicroseconds: 0x0102_0304_0506_0708,
             annexB: Self.annexB("02-access-unit-key.bin"))) == Self.golden("02-access-unit-key.bin"))
         let delta = try Self.golden("02-access-unit-delta.bin")
@@ -181,6 +181,31 @@ struct LocalLinkGoldenTests {
         #expect(try LocalLink.encode(.loginVerdict(requestID: 0x0A0B_0C0D_0E0F_1011, ok: true))
             == Self.golden("07-login-verdict-ok.bin"))
         #expect(try LocalLink.encode(.loginVerdict(requestID: 7, ok: false)) == Self.golden("07-login-verdict-refused.bin"))
+        let device = "1111 2222 3333 4444 5555 6666 7777 8888 9999 AAAA BBBB CCCC DDDD EEEE FFFF 0000"
+        #expect(try LocalLink.encode(.removeDevice(fingerprint: device)) == Self.golden("08-remove-device.bin"))
+        #expect(try LocalLink.encode(.forgetDevice(fingerprint: device)) == Self.golden("09-forget-device.bin"))
+        #expect(throws: LocalLink.ProtocolError.self) { try LocalLink.encode(.removeDevice(fingerprint: "")) }
+        #expect(throws: LocalLink.ProtocolError.self) {
+            try LocalLink.encode(.forgetDevice(fingerprint: String(repeating: "A", count: 129)))
+        }
+    }
+
+    @Test func swiftDecodesTheGoldenPairedDevices() throws {
+        var reader = LocalLink.Reader()
+        let messages = try reader.feed(Self.golden("85-event-paired-devices.bin") + Self.golden("85-event-paired-devices-empty.bin"))
+        guard messages.count == 2, case let .event(json) = messages[0], case let .event(empty) = messages[1] else {
+            Issue.record("expected two events")
+            return
+        }
+        #expect(LocalLink.eventType(json) == "paired_devices")
+        let list = try JSONDecoder().decode(LocalLink.PairedDevices.self, from: json)
+        #expect(list.devices == [
+            .init(name: "latitude", deviceFingerprint: "1111 2222 3333 4444 5555 6666 7777 8888 9999 AAAA BBBB CCCC DDDD EEEE FFFF 0000",
+                  pairedAt: 1_760_000_000, revoked: false),
+            .init(name: "old – ü", deviceFingerprint: "0102 0304 0506 0708 090A 0B0C 0D0E 0F10 1112 1314 1516 1718 191A 1B1C 1D1E 1F20",
+                  pairedAt: 1_750_000_000, revoked: true),
+        ])
+        #expect(try JSONDecoder().decode(LocalLink.PairedDevices.self, from: empty).devices.isEmpty)
     }
 
     @Test func swiftDecodesTheGoldenLoginFrames() throws {
@@ -222,7 +247,7 @@ struct LocalLinkGoldenTests {
                      "85-event-pairing-prompt.bin", "85-event-session.bin"]
         let messages = try reader.feed(names.map { try Self.golden($0) }.reduce(Data(), +))
         try #require(messages.count == 6)
-        #expect(Array(messages[0..<4]) == [.helloAck(version: 5), .startStream, .stopStream, .requestKeyframe])
+        #expect(Array(messages[0..<4]) == [.helloAck(version: 6), .startStream, .stopStream, .requestKeyframe])
         guard case let .event(prompt) = messages[4], case let .event(session) = messages[5] else {
             Issue.record("expected two events")
             return
@@ -307,7 +332,7 @@ struct LocalLinkInputTests {
 
     @Test func encodesInputUnavailable() throws {
         #expect(try LocalLink.encode(.inputUnavailable(reason: "no AX")) == frame(0x05, Array("no AX".utf8)))
-        #expect(try LocalLink.encode(.hello(version: LocalLink.version)) == frame(0x01, [0, 5]))
+        #expect(try LocalLink.encode(.hello(version: LocalLink.version)) == frame(0x01, [0, 6]))
     }
 
     @Test func clipboardTextIsBoundedAndNeverDescribed() throws {

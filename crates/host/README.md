@@ -2,10 +2,10 @@
 
 The host process. The Mac capture app spawns it from its bundle with no arguments. The app feeds it encoded video over stdin/stdout, and it serves paired viewers with `nocomputer-proto`. The app keeps the Screen Recording and Accessibility permissions; this process needs only the network and its own key.
 
-## Pipe contract (local-v5)
+## Pipe contract (local-v6)
 
-The contract is specified in `src/local.rs`, with golden vectors in `testdata/local-v5/`.
-- **App to host:** Hello, encoded access units, capture-stopped and input-unavailable notices (both forwarded to the viewer), pairing decisions, clipboard text for the viewer, and login verdicts.
+The contract is specified in `src/local.rs`, with golden vectors in `testdata/local-v6/`.
+- **App to host:** Hello, encoded access units, capture-stopped and input-unavailable notices (both forwarded to the viewer), pairing decisions, clipboard text for the viewer, login verdicts, and devices to remove or forget.
 - **Host to app:** HelloAck; start/stop stream when a controlling session begins or ends; keyframe requests, rate-limited to one per 500 ms; the viewer's picture size (protocol v5), at most one per 250 ms with the newest kept; display events; input from the controlling session; clipboard text from it; and logins to check.
 
 Input is ordered. Consecutive pointer moves coalesce while the app is busy; buttons, keys and scrolls are never coalesced. A backlog of 1024 frames first sheds moves, then is discarded and replaced by ReleaseAll; a working app never gets there. The host sends ReleaseAll whenever a session starts or ends, before StopStream, so nothing stays held when a viewer goes away. Input contents are never logged; replay mode prints counts by kind only. Clipboard text waits behind control frames and input, and only the newest is kept while the app is busy; it is never logged, and replay mode drops it.
@@ -14,17 +14,19 @@ Pairing prompts go to the app with a fresh `request_id`. Only a decision carryin
 
 Right after HelloAck the host sends an `identity` event with its name and fingerprint. The app shows it in its window while Remote access is on, so a user can compare it with a viewer's screen even when no pairing prompt appears (a device the host already knows).
 
+A `paired_devices` event follows it and is sent again after every pairing, removal or forget. It lists every device in pairing order, removed ones included. RemoveDevice revokes a device and closes its connections, and its session ends as usual. A removed device stays listed so it can't simply pair again. ForgetDevice deletes a removed device, and after that it may ask to pair, with the usual approval. The app confirms both with its user before sending them.
+
 Logins (protocol v4) go to the app as VerifyLogin with a fresh `request_id`. The app answers with LoginVerdict: ok only if the username is its own account's short or full name, OpenDirectory finds that record with this process's UID, and `ODRecord.verifyPassword` accepts the password. The proto host applies the delays and runs one check at a time; the app only checks. The host clears its frame buffer after writing, and the app clears the consumed pipe bytes and its copy of the password when done. The String handed to OpenDirectory can't be cleared, so this is best effort. Neither side logs the username or password; the app sees `login_failed` events with a device fingerprint and a count.
 
 Each access unit is checked against its keyframe flag. A keyframe must be an IDR with an in-band SPS and PPS. The WebCodecs codec string (`avc1.PPCCLL`) is taken from that SPS, so a new resolution simply arrives with the next IDR.
 
-stdout carries only local-v5 frames; logs go to stderr. A test fails if stdout printing appears in the source.
+stdout carries only local-v6 frames; logs go to stderr. A test fails if stdout printing appears in the source.
 
 Exit codes:
 - 0: stdin closed
 - 1: startup error (bind, key storage)
-- 2: local-v5 version mismatch
-- 3: any other local-v5 violation
+- 2: local-v6 version mismatch
+- 3: any other local-v6 violation
 
 ## Defaults
 

@@ -1,14 +1,15 @@
-//! local-v5: the pipe contract between the capture app (parent) and this host process
+//! local-v6: the pipe contract between the capture app (parent) and this host process
 //! (child), over the child's stdin and stdout. v2 added input (0x86-0x8A) and
 //! InputUnavailable (0x05); v3 added Clipboard (0x06, 0x8B); v4 added the account
 //! check (0x8C, 0x07) and the identity, pairing_withdrawn and login_failed events; v5
-//! added ViewSize (0x8D). Only the current version is spoken.
+//! added ViewSize (0x8D); v6 added RemoveDevice (0x08), ForgetDevice (0x09) and the
+//! paired_devices event. Only the current version is spoken.
 //!
 //! ```text
 //! frame: [u32 BE len][u8 type][payload]    len = 1 + payload length, 1..=4 MiB
 //!
 //! app -> host
-//!   0x01 Hello            u16 BE version (= 5); must be the first frame
+//!   0x01 Hello            u16 BE version (= 6); must be the first frame
 //!   0x02 AccessUnit       u8 flags (bit0 keyframe, others 0), u64 BE capture_us,
 //!                         Annex B bytes (at least 1); a keyframe is an IDR with SPS+PPS
 //!   0x03 CaptureStopped   UTF-8 reason, at most 1024 bytes
@@ -17,6 +18,13 @@
 //!   0x06 Clipboard        UTF-8 text for the controlling viewer: 1 byte to 1 MiB, no
 //!                         U+0000; dropped when no session is running
 //!   0x07 LoginVerdict     u64 BE request_id, u8 ok (0 or 1); exactly 9 bytes
+//!   0x08 RemoveDevice     UTF-8 device fingerprint as the events show it, at most
+//!                         128 bytes: revoke the device and close its connections. The
+//!                         app asks its user first.
+//!   0x09 ForgetDevice     as 0x08: delete a revoked device so it can ask to pair again
+//!                         (which needs approval as usual). Ignored for any other device.
+//!   Either way the host answers with a paired_devices event. Unlisted devices are
+//!   ignored.
 //! host -> app
 //!   0x81 HelloAck         u16 BE version
 //!   0x82 StartStream      empty: a controlling session began; start capture, IDR first
@@ -57,14 +65,14 @@
 //!
 //! Anything else is fatal: lengths out of range (checked before allocating), unknown
 //! frame types, a payload on an empty type, wrong fixed sizes, invalid UTF-8. The
-//! payloads of `testdata/local-v5/*.bin` are the reference encoding for both sides.
+//! payloads of `testdata/local-v6/*.bin` are the reference encoding for both sides.
 //! `capture_us` is the app's monotonic clock and only meaningful within the app.
 
-use nocomputer_proto::{valid_username, Button, ClipboardText, Input, KeyState, Password, ScrollUnit, MAX_SCROLL_LINES, MAX_SCROLL_PIXELS};
+use nocomputer_proto::{valid_username, Button, ClipboardText, Fingerprint, Input, KeyState, Password, ScrollUnit, MAX_SCROLL_LINES, MAX_SCROLL_PIXELS};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-pub const VERSION: u16 = 5;
+pub const VERSION: u16 = 6;
 pub const MAX_FRAME: usize = 4 * 1024 * 1024;
 pub const MAX_REASON: usize = 1024;
 
@@ -75,6 +83,9 @@ const PAIRING_DECISION: u8 = 0x04;
 const INPUT_UNAVAILABLE: u8 = 0x05;
 const CLIPBOARD: u8 = 0x06;
 const LOGIN_VERDICT: u8 = 0x07;
+const REMOVE_DEVICE: u8 = 0x08;
+const FORGET_DEVICE: u8 = 0x09;
+const MAX_FINGERPRINT_TEXT: usize = 128;
 const HELLO_ACK: u8 = 0x81;
 const START_STREAM: u8 = 0x82;
 const STOP_STREAM: u8 = 0x83;
@@ -100,6 +111,8 @@ pub enum FromApp {
     /// `Debug` shows only the length.
     Clipboard(ClipboardText),
     LoginVerdict { request_id: u64, ok: bool },
+    RemoveDevice(Fingerprint),
+    ForgetDevice(Fingerprint),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +155,19 @@ pub enum Event {
     PairingWithdrawn { request_id: u64 },
     /// A paired device's login failed; `failures` is its count since its last success.
     LoginFailed { device_fingerprint: String, failures: u32 },
+    /// Every listed device in pairing order, removed ones included. Sent after Identity
+    /// and after every change to the list.
+    PairedDevices { devices: Vec<PairedDevice> },
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct PairedDevice {
+    /// The one approved at pairing.
+    pub name: String,
+    pub device_fingerprint: String,
+    /// Unix seconds.
+    pub paired_at: u64,
+    pub revoked: bool,
 }
 
 #[derive(Debug)]
@@ -157,7 +183,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "local pipe: {e}"),
             Error::Eof => write!(f, "local pipe closed"),
-            Error::Protocol(m) => write!(f, "local-v5: {m}"),
+            Error::Protocol(m) => write!(f, "local-v6: {m}"),
         }
     }
 }
@@ -173,6 +199,14 @@ fn reason(frame: &str, payload: Vec<u8>) -> Result<String, Error> {
         return Err(bad(format!("{frame} reason exceeds 1024 bytes")));
     }
     String::from_utf8(payload).map_err(|_| bad(format!("{frame} reason is not UTF-8")))
+}
+
+fn fingerprint(frame: &str, payload: &[u8]) -> Result<Fingerprint, Error> {
+    if payload.len() > MAX_FINGERPRINT_TEXT {
+        return Err(bad(format!("{frame} exceeds {MAX_FINGERPRINT_TEXT} bytes")));
+    }
+    let text = std::str::from_utf8(payload).map_err(|_| bad(format!("{frame} is not UTF-8")))?;
+    text.parse().map_err(|_| bad(format!("{frame} is not a fingerprint")))
 }
 
 fn id_and_flag(frame: &str, payload: &[u8]) -> Result<(u64, bool), Error> {
@@ -290,6 +324,8 @@ impl FromApp {
                 payload.push(*ok as u8);
                 frame(LOGIN_VERDICT, &payload)
             }
+            FromApp::RemoveDevice(device) => frame(REMOVE_DEVICE, device.to_string().as_bytes()),
+            FromApp::ForgetDevice(device) => frame(FORGET_DEVICE, device.to_string().as_bytes()),
         }
     }
 
@@ -323,6 +359,8 @@ impl FromApp {
                 let (request_id, ok) = id_and_flag("LoginVerdict", &payload)?;
                 Ok(FromApp::LoginVerdict { request_id, ok })
             }
+            REMOVE_DEVICE => Ok(FromApp::RemoveDevice(fingerprint("RemoveDevice", &payload)?)),
+            FORGET_DEVICE => Ok(FromApp::ForgetDevice(fingerprint("ForgetDevice", &payload)?)),
             other => Err(bad(format!("unknown frame type 0x{other:02x}"))),
         }
     }
@@ -363,10 +401,11 @@ mod tests {
         0, 0, 1, 0x65, 0x88, 0x84, 0x00, // IDR slice
     ];
     const DELTA: &[u8] = &[0, 0, 0, 1, 0x41, 0x9A, 0x02, 0x10];
+    const DEVICE: &str = "1111 2222 3333 4444 5555 6666 7777 8888 9999 AAAA BBBB CCCC DDDD EEEE FFFF 0000";
 
     fn from_app() -> Vec<(&'static str, FromApp)> {
         vec![
-            ("01-hello", FromApp::Hello { version: 5 }),
+            ("01-hello", FromApp::Hello { version: 6 }),
             ("02-access-unit-key", FromApp::AccessUnit { keyframe: true, capture_us: 0x0102030405060708, data: SPS_PPS_IDR.to_vec() }),
             ("02-access-unit-delta", FromApp::AccessUnit { keyframe: false, capture_us: 0x0102030405064E20, data: DELTA.to_vec() }),
             ("03-capture-stopped", FromApp::CaptureStopped { reason: "display disconnected – ü".into() }),
@@ -376,12 +415,14 @@ mod tests {
             ("06-clipboard", FromApp::Clipboard(ClipboardText::new("line one\nzwei – ü 🙂".into()).unwrap())),
             ("07-login-verdict-ok", FromApp::LoginVerdict { request_id: 0x0A0B0C0D0E0F1011, ok: true }),
             ("07-login-verdict-refused", FromApp::LoginVerdict { request_id: 7, ok: false }),
+            ("08-remove-device", FromApp::RemoveDevice(DEVICE.parse().unwrap())),
+            ("09-forget-device", FromApp::ForgetDevice(DEVICE.parse().unwrap())),
         ]
     }
 
     fn to_app() -> Vec<(&'static str, ToApp)> {
         vec![
-            ("81-hello-ack", ToApp::HelloAck { version: 5 }),
+            ("81-hello-ack", ToApp::HelloAck { version: 6 }),
             ("82-start-stream", ToApp::StartStream),
             ("83-stop-stream", ToApp::StopStream),
             ("84-request-keyframe", ToApp::RequestKeyframe),
@@ -413,6 +454,21 @@ mod tests {
             ),
             ("85-event-pairing-withdrawn", ToApp::Event(Event::PairingWithdrawn { request_id: 7 })),
             (
+                "85-event-paired-devices",
+                ToApp::Event(Event::PairedDevices {
+                    devices: vec![
+                        PairedDevice { name: "latitude".into(), device_fingerprint: DEVICE.into(), paired_at: 1_760_000_000, revoked: false },
+                        PairedDevice {
+                            name: "old – ü".into(),
+                            device_fingerprint: "0102 0304 0506 0708 090A 0B0C 0D0E 0F10 1112 1314 1516 1718 191A 1B1C 1D1E 1F20".into(),
+                            paired_at: 1_750_000_000,
+                            revoked: true,
+                        },
+                    ],
+                }),
+            ),
+            ("85-event-paired-devices-empty", ToApp::Event(Event::PairedDevices { devices: vec![] })),
+            (
                 "85-event-identity",
                 ToApp::Event(Event::Identity {
                     name: "MacBook Air".into(),
@@ -423,7 +479,7 @@ mod tests {
     }
 
     fn golden(name: &str) -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/local-v5").join(format!("{name}.bin"))
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/local-v6").join(format!("{name}.bin"))
     }
 
     /// Compares against the checked-in vectors; NOCOMPUTER_WRITE_GOLDEN=1 rewrites them.
@@ -484,6 +540,20 @@ mod tests {
         assert!(matches!(read(&[0, 0, 0, 10, 0x07, 0, 0, 0, 0, 0, 0, 0, 1, 2]).await, Err(Error::Protocol(_))), "ok not 0/1");
         assert!(matches!(read(&[0, 0, 0, 9, 0x07, 0, 0, 0, 0, 0, 0, 0, 1]).await, Err(Error::Protocol(_))), "short LoginVerdict");
         assert!(matches!(read(&[0, 0, 0, 1, 0x8C]).await, Err(Error::Protocol(_))), "app-bound VerifyLogin");
+        assert!(matches!(read(&[0, 0, 0, 1, 0x08]).await, Err(Error::Protocol(_))), "empty RemoveDevice");
+        assert!(matches!(read(&[0, 0, 0, 4, 0x09, b'A', b'B', b'C']).await, Err(Error::Protocol(_))), "short ForgetDevice");
+        let padded = |len: usize| FromApp::RemoveDevice(DEVICE.parse().unwrap()).encode()[..4 + 1 + DEVICE.len()]
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n(b' ', len - DEVICE.len()))
+            .collect::<Vec<_>>();
+        let framed = |mut f: Vec<u8>| {
+            let len = (f.len() - 4) as u32;
+            f[..4].copy_from_slice(&len.to_be_bytes());
+            f
+        };
+        assert!(matches!(read(&framed(padded(128))).await, Ok(FromApp::RemoveDevice(_))), "fingerprint text of exactly 128 bytes");
+        assert!(matches!(read(&framed(padded(129))).await, Err(Error::Protocol(_))), "fingerprint text over 128 bytes");
         let mut long = vec![0, 0, 0x04, 0x02, 0x03];
         long.extend(std::iter::repeat_n(b'a', 1025));
         assert!(matches!(read(&long).await, Err(Error::Protocol(_))), "reason over 1024 bytes");

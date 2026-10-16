@@ -1,6 +1,6 @@
 //! nocomputer-host: serves paired viewers. Normally spawned by the capture app with no
-//! arguments and fed over stdin/stdout (local-v5, see `local.rs`); stdout carries only
-//! local-v5 frames and all logging goes to stderr.
+//! arguments and fed over stdin/stdout (local-v6, see `local.rs`); stdout carries only
+//! local-v6 frames and all logging goes to stderr.
 //!
 //!   nocomputer-host [--listen ADDR] [--name NAME] [--state-dir DIR] [--from-file X.h264]
 //!
@@ -9,12 +9,12 @@
 //! checked then), for testing without the app. Input from the viewer is then only
 //! counted.
 //!
-//! Exit codes: 0 when stdin closes, 1 on startup errors, 2 on a local-v5 version
-//! mismatch, 3 on any other local-v5 violation.
+//! Exit codes: 0 when stdin closes, 1 on startup errors, 2 on a local-v6 version
+//! mismatch, 3 on any other local-v6 violation.
 
 use nocomputer_host::h264::{self, Kind};
 use nocomputer_host::input::InputQueue;
-use nocomputer_host::local::{self, Event, FromApp, ToApp};
+use nocomputer_host::local::{self, Event, FromApp, PairedDevice, ToApp};
 use nocomputer_proto::{
     load_or_create_identity, platform_keystore, wire::valid_device_name, AccessUnit, Approver, ClipboardText, Host, HostConfig, HostEvent, Notice, NoticeKind,
     PairedClients, Verifier, DEFAULT_PORT,
@@ -134,15 +134,33 @@ fn fp(f: &nocomputer_proto::Fingerprint) -> String {
     f.to_string()
 }
 
+/// The paired_devices event, or None (logged) if the list can't be read.
+fn paired_devices(host: &Host) -> Option<Event> {
+    match host.paired_clients() {
+        Ok(clients) => Some(Event::PairedDevices {
+            devices: clients
+                .into_iter()
+                .map(|c| PairedDevice { name: c.name, device_fingerprint: fp(&c.fingerprint), paired_at: c.paired_at, revoked: c.revoked })
+                .collect(),
+        }),
+        Err(e) => {
+            eprintln!("nocomputer-host: paired devices: {e}");
+            None
+        }
+    }
+}
+
 /// Turns host events into capture commands (with keyframe requests rate-limited and view
 /// sizes coalesced), input, clipboard text and display events. Input held by a session is
-/// released when any session starts or ends.
+/// released when any session starts or ends. `listed` gives the paired_devices event sent
+/// after each pairing.
 async fn route_events(
     mut events: mpsc::UnboundedReceiver<HostEvent>,
     capture: mpsc::UnboundedSender<Capture>,
     input: Arc<InputQueue>,
     clipboard: watch::Sender<Option<ClipboardText>>,
     notices: mpsc::UnboundedSender<Event>,
+    listed: impl Fn() -> Option<Event> + Send + 'static,
 ) {
     let release = || {
         input.clear();
@@ -236,6 +254,9 @@ async fn route_events(
             HostEvent::Clipboard(_) => {}
             HostEvent::Paired { device, name } => {
                 let _ = notices.send(Event::Paired { name, device_fingerprint: fp(&device) });
+                if let Some(list) = listed() {
+                    let _ = notices.send(list);
+                }
             }
             HostEvent::PairingDenied { device } => {
                 let _ = notices.send(Event::PairingDenied { device_fingerprint: fp(&device) });
@@ -395,7 +416,11 @@ async fn run() -> Result<(), Exit> {
     eprintln!("nocomputer-host: \"{}\" listening on {}", o.name, host.local_addr().map_err(Exit::startup)?);
     eprintln!("nocomputer-host: this host is {}", host.fingerprint());
     let _ = notices_tx.send(Event::Identity { name: o.name.clone(), host_fingerprint: fp(&host.fingerprint()) });
-    tokio::spawn(route_events(events, capture_tx, input.clone(), clipboard_tx, notices_tx));
+    if let Some(list) = paired_devices(&host) {
+        let _ = notices_tx.send(list);
+    }
+    let lister = host.clone();
+    tokio::spawn(route_events(events, capture_tx, input.clone(), clipboard_tx, notices_tx, move || paired_devices(&lister)));
     let runner = host.clone();
     tokio::spawn(async move { runner.run().await });
 
@@ -512,6 +537,26 @@ async fn serve_app(
                 if slot.as_ref().is_some_and(|(id, _)| *id == request_id) {
                     let (_, tx) = slot.take().unwrap();
                     let _ = tx.send(ok);
+                }
+            }
+            Ok(FromApp::RemoveDevice(device)) => {
+                match host.revoke(&device) {
+                    Ok(true) => eprintln!("nocomputer-host: removed device {device}"),
+                    Ok(false) => eprintln!("nocomputer-host: ignoring removal of {device}, which is not listed"),
+                    Err(e) => eprintln!("nocomputer-host: removing {device}: {e}"),
+                }
+                if let Some(list) = paired_devices(host) {
+                    let _ = out_tx.send(ToApp::Event(list));
+                }
+            }
+            Ok(FromApp::ForgetDevice(device)) => {
+                match host.forget(&device) {
+                    Ok(true) => eprintln!("nocomputer-host: device {device} may ask to pair again"),
+                    Ok(false) => eprintln!("nocomputer-host: ignoring forget of {device}, which is not a removed device"),
+                    Err(e) => eprintln!("nocomputer-host: forgetting {device}: {e}"),
+                }
+                if let Some(list) = paired_devices(host) {
+                    let _ = out_tx.send(ToApp::Event(list));
                 }
             }
             Ok(FromApp::Hello { .. }) => break Err(Exit(3, "Hello after the handshake".into())),
@@ -640,7 +685,7 @@ mod tests {
         let (capture, mut commands) = mpsc::unbounded_channel();
         let (clipboard, _clipboard_rx) = watch::channel(None);
         let (notices, _notices_rx) = mpsc::unbounded_channel();
-        tokio::spawn(route_events(rx, capture, Arc::new(InputQueue::default()), clipboard, notices));
+        tokio::spawn(route_events(rx, capture, Arc::new(InputQueue::default()), clipboard, notices, || None));
         let device: nocomputer_proto::Fingerprint = "00".repeat(32).parse().unwrap();
         let short = Duration::from_millis(100);
 
@@ -665,7 +710,7 @@ mod tests {
         assert_eq!(next(&mut commands, VIEW_SIZE_INTERVAL * 2).await, None, "a size still waiting is forgotten with the session");
     }
 
-    /// stdout belongs to local-v5 frames.
+    /// stdout belongs to local-v6 frames.
     #[test]
     fn nothing_prints_to_stdout() {
         for (name, source) in [("main.rs", include_str!("main.rs")), ("local.rs", include_str!("local.rs")), ("h264.rs", include_str!("h264.rs")), ("input.rs", include_str!("input.rs"))] {

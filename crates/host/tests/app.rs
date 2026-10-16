@@ -1,6 +1,7 @@
 //! End to end on loopback, as the app sees it: the real host binary over its pipes, a
 //! viewer pairing through an app-side approval, logging in through the app's account
-//! check, input arriving on stdout in order, and clipboard text in both directions.
+//! check, input arriving on stdout in order, clipboard text in both directions, and the
+//! app removing the device mid-session.
 
 #![cfg(not(target_os = "macos"))] // the host identity would be the app's Keychain item
 
@@ -54,6 +55,19 @@ fn next_command(frames: &Receiver<(u8, Vec<u8>)>) -> Vec<u8> {
     }
 }
 
+/// The next event of this type, skipping everything else.
+fn next_event(frames: &Receiver<(u8, Vec<u8>)>, kind: &str) -> serde_json::Value {
+    loop {
+        let (frame, payload) = next(frames);
+        if frame == 0x85 {
+            let event: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            if event["type"] == kind {
+                return event;
+            }
+        }
+    }
+}
+
 /// The next VerifyLogin frame, as (request_id, username, password).
 fn verify_login(frames: &Receiver<(u8, Vec<u8>)>) -> (u64, String, String) {
     let frame = next_command(frames);
@@ -89,6 +103,10 @@ async fn input_reaches_the_app_in_order_and_is_released_at_session_end() {
     assert_eq!(kind, 0x85);
     let identity: serde_json::Value = serde_json::from_slice(&identity).unwrap();
     assert_eq!((identity["type"].as_str(), identity["name"].as_str()), (Some("identity"), Some("app-host")));
+    // And the paired devices: none yet.
+    let (kind, devices) = next(&frames);
+    assert_eq!(kind, 0x85);
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&devices).unwrap(), serde_json::json!({"type": "paired_devices", "devices": []}));
     // Keep draining stderr: the host must never block or fail on its logging.
     let (addr_tx, addr) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -113,6 +131,10 @@ async fn input_reaches_the_app_in_order_and_is_released_at_session_end() {
     let request_id = prompt["request_id"].as_u64().unwrap();
     app.write_all(&FromApp::PairingDecision { request_id, approve: true }.encode()).unwrap();
     assert!(pairing.await.unwrap().unwrap());
+    let devices = next_event(&frames, "paired_devices");
+    assert_eq!(devices["devices"].as_array().unwrap().len(), 1);
+    assert_eq!(devices["devices"][0]["device_fingerprint"], viewer.fingerprint().to_string());
+    assert_eq!((devices["devices"][0]["name"].as_str(), devices["devices"][0]["revoked"].as_bool()), (Some("app-viewer"), Some(false)));
 
     // Log in: the app refuses the first password and accepts the second.
     let Outcome::Login(prompt) = viewer.connect(addr, Some(host_fp)).await.unwrap() else { panic!() };
@@ -181,6 +203,35 @@ async fn input_reaches_the_app_in_order_and_is_released_at_session_end() {
     session.close().await;
     assert_eq!(next_command(&frames), ToApp::ReleaseAll.encode());
     assert_eq!(next_command(&frames), ToApp::StopStream.encode());
+
+    // Removing the device ends its live session and blocks it; forgetting it lets it ask
+    // to pair again.
+    let Outcome::Login(prompt) = viewer.connect(addr, Some(host_fp)).await.unwrap() else { panic!() };
+    let attempt = tokio::spawn(prompt.login("app-user", Password::new("right – ü".into()).unwrap()));
+    let (request_id, _, _) = verify_login(&frames);
+    app.write_all(&FromApp::LoginVerdict { request_id, ok: true }.encode()).unwrap();
+    let LoginResult::Session(mut session) = attempt.await.unwrap().unwrap() else { panic!("an accepted login failed") };
+    assert_eq!(next_command(&frames), ToApp::ReleaseAll.encode());
+    assert_eq!(next_command(&frames), ToApp::StartStream.encode());
+    app.write_all(&FromApp::RemoveDevice(viewer.fingerprint()).encode()).unwrap();
+    // The list and the end of the session travel separately, so in either order.
+    let (mut commands, mut events) = (Vec::new(), Vec::new());
+    while !(commands.contains(&0x83) && events.iter().any(|e: &serde_json::Value| e["type"] == "session_ended") && events.iter().any(|e| e["type"] == "paired_devices")) {
+        match next(&frames) {
+            (0x85, payload) => events.push(serde_json::from_slice(&payload).unwrap()),
+            (0x84, _) => {}
+            (kind, _) => commands.push(kind),
+        }
+    }
+    assert_eq!(commands, [0x8A, 0x83], "ReleaseAll, then StopStream");
+    let devices = events.iter().find(|e| e["type"] == "paired_devices").unwrap();
+    assert_eq!(devices["devices"][0]["revoked"], true);
+    let ended = events.iter().find(|e| e["type"] == "session_ended").unwrap();
+    assert_eq!(ended["device_fingerprint"], viewer.fingerprint().to_string());
+    assert!(tokio::time::timeout(Duration::from_secs(5), session.ping()).await.unwrap().is_err());
+    assert!(matches!(viewer.connect(addr, Some(host_fp)).await, Err(nocomputer_proto::Error::Remote { code: nocomputer_proto::ErrorCode::Revoked, .. })));
+    app.write_all(&FromApp::ForgetDevice(viewer.fingerprint()).encode()).unwrap();
+    assert_eq!(next_event(&frames, "paired_devices")["devices"], serde_json::json!([]));
 
     drop(app);
     assert_eq!(child.0.wait().unwrap().code(), Some(0));

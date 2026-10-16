@@ -5,10 +5,11 @@ import WebKit
 // docs/host-panel.md. The page renders what it is sent and reports clicks; every
 // decision stays here.
 enum Panel {
-    static let version = 1
+    static let version = 2
     static let scheme = "nocomputer-panel"
     static let indexURL = URL(string: "\(scheme)://panel/index.html")!
     static let maximumActionBytes = 4096
+    static let maximumFingerprint = 128
     static let files: [String: String] = [
         "/index.html": "text/html", "/panel.js": "text/javascript", "/panel.css": "text/css",
     ]
@@ -21,6 +22,9 @@ enum Panel {
         case setClipboard(Bool)
         case requestPermission(Permission)
         case refreshPermissions
+        // Only a fingerprint: the controller checks it against its list.
+        case removeDevice(fingerprint: String)
+        case allowPairingAgain(fingerprint: String)
     }
 
     enum Parsed: Equatable {
@@ -45,6 +49,10 @@ enum Panel {
         case "requestPermission":
             guard let id = dict["id"] as? String, let permission = Permission(rawValue: id) else { break }
             return .action(.requestPermission(permission))
+        case "removeDevice", "allowPairingAgain":
+            guard Set(dict.keys) == ["v", "type", "fingerprint"], let fingerprint = dict["fingerprint"] as? String,
+                  !fingerprint.isEmpty, fingerprint.count <= maximumFingerprint else { break }
+            return .action(type == "removeDevice" ? .removeDevice(fingerprint: fingerprint) : .allowPairingAgain(fingerprint: fingerprint))
         default: break
         }
         return .dropped(type: type)
@@ -75,6 +83,7 @@ enum Panel {
         var session: LocalLink.Session?
         var pairingNotice: String?
         var clipboardOn = true
+        var devices: [LocalLink.PairedDevices.Device] = []
 
         // Contract field names, with explicit nulls.
         var message: [String: Any] {
@@ -89,6 +98,9 @@ enum Panel {
                 "session": session.map { ["device": $0.name, "deviceFingerprint": $0.deviceFingerprint] } ?? null,
                 "pairingNotice": pairingNotice ?? null,
                 "clipboard": ["on": clipboardOn],
+                "devices": devices.map {
+                    ["name": $0.name, "fingerprint": $0.deviceFingerprint, "pairedAt": $0.pairedAt, "removed": $0.revoked] as [String: Any]
+                },
             ]
             return ["v": version, "type": "state", "state": state]
         }

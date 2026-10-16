@@ -1,6 +1,6 @@
-# local-v5 golden vectors
+# local-v6 golden vectors
 
-Reference encodings of every local-v5 frame. Each file is one complete frame: length, type and payload. The specification is the module doc of `src/local.rs`. Both sides test against these bytes: the Rust host in `local::tests`, and the Swift app in its own tests.
+Reference encodings of every local-v6 frame. Each file is one complete frame: length, type and payload. The specification is the module doc of `src/local.rs`. Both sides test against these bytes: the Rust host in `local::tests`, and the Swift app in its own tests.
 
 | File | Frame |
 | --- | --- |

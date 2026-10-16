@@ -156,6 +156,20 @@ impl PairedClients {
         self.write(file)?;
         Ok(true)
     }
+
+    /// Deletes a revoked device, so it can request pairing again, which still needs
+    /// the host's approval. Returns false, changing nothing, if the device is not
+    /// listed or not revoked.
+    pub fn forget(&mut self, fingerprint: &Fingerprint) -> Result<bool, Error> {
+        let mut file = self.read()?;
+        let before = file.clients.len();
+        file.clients.retain(|c| !(c.revoked && &c.fingerprint == fingerprint));
+        if file.clients.len() == before {
+            return Ok(false);
+        }
+        self.write(file)?;
+        Ok(true)
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

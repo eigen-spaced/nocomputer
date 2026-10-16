@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
 fn golden(name: &str) -> Vec<u8> {
-    std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/local-v5").join(format!("{name}.bin"))).unwrap()
+    std::fs::read(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/local-v6").join(format!("{name}.bin"))).unwrap()
 }
 
 /// Feeds `input`, closes stdin, and returns (exit code, stdout).
@@ -55,20 +55,45 @@ mod with_identity {
     use super::*;
     use nocomputer_host::local::ToApp;
 
+    /// The event frames after HelloAck, as JSON.
+    fn events_after_ack(out: &[u8]) -> Vec<serde_json::Value> {
+        let ack = golden("81-hello-ack");
+        assert_eq!(ack, ToApp::HelloAck { version: VERSION }.encode());
+        assert!(out.starts_with(&ack), "{out:?}");
+        let mut rest = &out[ack.len()..];
+        let mut events = Vec::new();
+        while !rest.is_empty() {
+            let len = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
+            assert_eq!(rest[4], 0x85, "only events follow HelloAck");
+            events.push(serde_json::from_slice(&rest[5..4 + len]).unwrap());
+            rest = &rest[4 + len..];
+        }
+        events
+    }
+
     #[test]
     fn hello_is_acknowledged_then_eof_exits_cleanly() {
         let (code, out) = run(&golden("01-hello"));
         assert_eq!(code, 0);
-        // HelloAck, then the identity event, then nothing.
-        let ack = golden("81-hello-ack");
-        assert_eq!(ack, ToApp::HelloAck { version: VERSION }.encode());
-        assert!(out.starts_with(&ack), "{out:?}");
-        let rest = &out[ack.len()..];
-        let len = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
-        assert_eq!(rest.len(), 4 + len, "exactly one frame after HelloAck");
-        assert_eq!(rest[4], 0x85);
-        let identity: serde_json::Value = serde_json::from_slice(&rest[5..]).unwrap();
-        assert_eq!(identity["type"], "identity");
+        // HelloAck, the identity, the (empty) paired devices, then nothing.
+        let events = events_after_ack(&out);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["type"], "identity");
+        assert_eq!(events[1], serde_json::json!({"type": "paired_devices", "devices": []}));
+    }
+
+    #[test]
+    fn removing_or_forgetting_an_unlisted_device_answers_with_the_list() {
+        let mut input = golden("01-hello");
+        input.extend(golden("08-remove-device"));
+        input.extend(golden("09-forget-device"));
+        let (code, out) = run(&input);
+        assert_eq!(code, 0);
+        let events = events_after_ack(&out);
+        assert_eq!(events.len(), 4, "{events:?}");
+        for list in &events[1..] {
+            assert_eq!(list, &serde_json::json!({"type": "paired_devices", "devices": []}));
+        }
     }
 
     #[test]

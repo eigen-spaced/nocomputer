@@ -46,7 +46,7 @@ struct PipeAdmission {
     mutating func written() { queued -= 1 }
 }
 
-// Owns the bundled `nocomputer-host` child and the local-v5 pipe to it. The pipe is
+// Owns the bundled `nocomputer-host` child and the local-v6 pipe to it. The pipe is
 // inherited, never a socket, so no other local process can reach this channel.
 // Network, pairing state and keys live entirely in the child.
 // Sendable: its mutable state is behind `lock`, and writes go through `writer`.
@@ -140,6 +140,11 @@ final class HostLink: @unchecked Sendable {
     func decide(requestID: UInt64, approve: Bool) { send(.pairingDecision(requestID: requestID, approve: approve)) }
 
     func loginVerdict(requestID: UInt64, ok: Bool) { send(.loginVerdict(requestID: requestID, ok: ok)) }
+
+    // Only after the user confirmed it here.
+    func removeDevice(fingerprint: String) { send(.removeDevice(fingerprint: fingerprint)) }
+
+    func forgetDevice(fingerprint: String) { send(.forgetDevice(fingerprint: fingerprint)) }
 
     func sendClipboard(_ text: LocalLink.ClipboardText) {
         lock.lock()

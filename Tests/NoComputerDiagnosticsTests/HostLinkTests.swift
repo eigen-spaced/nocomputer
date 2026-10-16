@@ -9,10 +9,10 @@ import Testing
 struct HostLinkTests {
     private static func fakeChild(in directory: URL, received: URL) throws -> URL {
         let script = directory.appendingPathComponent("fake-host")
-        // HelloAck(5) = [0 0 0 3][0x81][0 5]
+        // HelloAck(6) = [0 0 0 3][0x81][0 6]
         try """
             #!/bin/sh
-            printf '\\000\\000\\000\\003\\201\\000\\005'
+            printf '\\000\\000\\000\\003\\201\\000\\006'
             exec cat > '\(received.path)'
             """.write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
@@ -69,7 +69,7 @@ struct HostLinkTests {
         let messages = try Self.frames(try Data(contentsOf: received))
         try #require(messages.count >= 3)
         #expect(messages.first?.0 == 0x01)
-        #expect(messages.first?.1 == Data([0, 5]))
+        #expect(messages.first?.1 == Data([0, 6]))
         let units = messages.filter { $0.0 == 0x02 }
         #expect(units.count == 20)
         #expect(link.snapshot().accessUnits == 20)

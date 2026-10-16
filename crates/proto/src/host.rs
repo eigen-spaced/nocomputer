@@ -191,6 +191,11 @@ impl Host {
         Ok(listed)
     }
 
+    /// Deletes a revoked device so it can request pairing again.
+    pub fn forget(&self, device: &Fingerprint) -> Result<bool, Error> {
+        self.inner.clients.lock().unwrap().forget(device)
+    }
+
     /// Closes every connection with [`crate::CLOSE_HOST_ENDED`] and waits, briefly, for
     /// the close to reach the viewers, so they report the end instead of timing out.
     pub async fn close(&self) {

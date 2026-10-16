@@ -1,19 +1,21 @@
 import Foundation
 
-// local-v5: the private pipe contract between this app and its bundled
+// local-v6: the private pipe contract between this app and its bundled
 // `nocomputer-host` child. crates/host/src/local.rs is the source of truth;
-// crates/host/testdata/local-v5/ holds golden vectors both sides test against.
+// crates/host/testdata/local-v6/ holds golden vectors both sides test against.
 // v2 adds remote input (0x86–0x8A) and InputUnavailable (0x05); v3 adds
 // clipboard text (0x06, 0x8B); v4 adds the account check (0x8C, 0x07); v5 adds
-// ViewSize (0x8D).
+// ViewSize (0x8D); v6 adds RemoveDevice (0x08), ForgetDevice (0x09) and the
+// paired_devices event.
 // Frame: [u32 BE len = 1 + payload][u8 type][payload], 1 <= len <= 4 MiB.
 enum LocalLink {
-    static let version: UInt16 = 5
+    static let version: UInt16 = 6
     static let maximumLength = 4 * 1024 * 1024
     static let maximumReason = 1024
     static let maximumClipboard = 1 << 20
     static let maximumUsername = 255
     static let maximumPassword = 1024
+    static let maximumFingerprint = 128
 
     // Clipboard text as the contract allows it: 1 byte to 1 MiB of UTF-8, no NUL.
     // Descriptions show only the length, so the text never reaches a log.
@@ -71,6 +73,9 @@ enum LocalLink {
         case inputUnavailable(reason: String)
         case clipboard(ClipboardText)
         case loginVerdict(requestID: UInt64, ok: Bool)
+        // A fingerprint as the paired_devices event shows it.
+        case removeDevice(fingerprint: String)
+        case forgetDevice(fingerprint: String)
     }
 
     // Rust → Swift
@@ -117,6 +122,12 @@ enum LocalLink {
             type = 0x07
             append(requestID, to: &payload)
             payload.append(ok ? 1 : 0)
+        case let .removeDevice(fingerprint), let .forgetDevice(fingerprint):
+            guard !fingerprint.isEmpty, fingerprint.utf8.count <= maximumFingerprint else {
+                throw ProtocolError.invalid("fingerprint of \(fingerprint.utf8.count) bytes")
+            }
+            if case .removeDevice = message { type = 0x08 } else { type = 0x09 }
+            payload.append(Data(fingerprint.utf8))
         }
         let length = 1 + payload.count
         guard length <= maximumLength else { throw ProtocolError.invalid("frame of \(length) bytes exceeds 4 MiB") }
@@ -289,6 +300,19 @@ enum LocalLink {
     struct PairingWithdrawn: Decodable, Equatable {
         let requestID: UInt64
         enum CodingKeys: String, CodingKey { case requestID = "request_id" }
+    }
+
+    struct PairedDevices: Decodable, Equatable {
+        struct Device: Decodable, Equatable {
+            let name: String
+            let deviceFingerprint: String
+            let pairedAt: UInt64
+            let revoked: Bool
+            enum CodingKeys: String, CodingKey {
+                case name, deviceFingerprint = "device_fingerprint", pairedAt = "paired_at", revoked
+            }
+        }
+        let devices: [Device]
     }
 
     static func eventType(_ json: Data) -> String? {

@@ -1,7 +1,7 @@
 import AppKit
 import CoreGraphics
 
-// Remote input, already validated by nocomputer-host and decoded from local-v5.
+// Remote input, already validated by nocomputer-host and decoded from local-v6.
 enum RemoteInput: Equatable {
     enum Button: UInt8, CaseIterable { case left = 0, right, middle, back, forward }
     enum ScrollUnit: UInt8 { case pixel = 0, line }

@@ -224,7 +224,7 @@ async fn denial_is_not_paired_and_starts_cooldown() {
 }
 
 #[tokio::test]
-async fn revocation_closes_live_session_and_blocks_reconnect_and_repair() {
+async fn revocation_closes_live_session_and_blocks_repair_until_forgotten() {
     let host = host_with(&Identity::generate().unwrap(), true);
     let viewer = viewer();
     let host_fp = pair(&viewer, &host).await;
@@ -240,6 +240,12 @@ async fn revocation_closes_live_session_and_blocks_reconnect_and_repair() {
     assert_eq!(remote_code(viewer.connect(host.addr, Some(host_fp)).await), ErrorCode::Revoked);
     assert_eq!(remote_code(viewer.connect(host.addr, None).await), ErrorCode::Revoked);
     assert_eq!(host.prompts.lock().unwrap().len(), 1);
+
+    // Forgetting a removed device lets it ask again, and asking needs approval again.
+    assert!(host.host.forget(&viewer.fingerprint()).unwrap());
+    assert_eq!(pair(&viewer, &host).await, host_fp);
+    assert_eq!(host.prompts.lock().unwrap().len(), 2);
+    ready(viewer.connect(host.addr, Some(host_fp)).await.unwrap()).await.ping().await.unwrap();
 }
 
 #[tokio::test]
@@ -430,6 +436,14 @@ fn paired_clients_persist_and_revocation_sticks() {
     assert_eq!(reopened.status(&fp), crate::ClientStatus::Paired { name: "laptop".into() });
     assert!(reopened.revoke(&fp).unwrap());
     assert_eq!(PairedClients::at(&path).status(&fp), crate::ClientStatus::Revoked);
+    let other = Identity::generate().unwrap().fingerprint();
+    reopened.add(other, "phone").unwrap();
+    assert!(!reopened.forget(&other).unwrap(), "only revoked devices are forgotten");
+    assert!(reopened.forget(&fp).unwrap());
+    assert!(!reopened.forget(&fp).unwrap());
+    let left = PairedClients::at(&path);
+    assert_eq!(left.status(&fp), crate::ClientStatus::Unknown);
+    assert_eq!(left.list().unwrap().iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["phone"]);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

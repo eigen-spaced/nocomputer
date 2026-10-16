@@ -21,6 +21,8 @@ final class RemoteHost {
     var onPairingNotice: ((String?) -> Void)?
     // The viewer in control, or nil.
     var onSession: ((LocalLink.Session?) -> Void)?
+    // Every paired device, removed ones included; empty while remote access is off.
+    var onPairedDevices: (([LocalLink.PairedDevices.Device]) -> Void)?
 
     private weak var window: NSWindow?
     private var link: HostLink?
@@ -40,6 +42,9 @@ final class RemoteHost {
     private var viewBox: CGSize?
     private var resizing = false
     private var prompt: (alert: NSAlert, request: LocalLink.PairingPrompt)?
+    // The open Remove / Allow-pairing-again confirmation; a second request while
+    // one is open is ignored.
+    private var deviceConfirmation: NSAlert?
     // Controlling sessions, counted as the child does: a replacing session can
     // start before the one it replaces ends.
     private var sessions = 0 {
@@ -254,6 +259,12 @@ final class RemoteHost {
                 return
             }
             onIdentity?(identity)
+        case "paired_devices":
+            guard let list = try? JSONDecoder().decode(LocalLink.PairedDevices.self, from: json) else {
+                log("Ignored malformed paired devices")
+                return
+            }
+            onPairedDevices?(list.devices)
         case "pairing_withdrawn":
             guard let withdrawn = try? JSONDecoder().decode(LocalLink.PairingWithdrawn.self, from: json),
                   let current = prompt, current.request.requestID == withdrawn.requestID else { return }
@@ -282,7 +293,7 @@ final class RemoteHost {
         onPairingNotice?(nil)
         let controlled = sessions > 0
         let alert = NSAlert()
-        alert.messageText = "Allow \"\(request.deviceName)\" to control this Mac?"
+        alert.messageText = "Allow \"\(Self.displayName(request.deviceName))\" to control this Mac?"
         alert.informativeText = (controlled ? "Disconnect the viewer first to approve a new device.\n\n" : "") + """
             Only approve if the viewer shows these same fingerprints.
 
@@ -309,6 +320,71 @@ final class RemoteHost {
         else { decide(alert.runModal()) }
     }
 
+    // Removing ends the device's session at once and blocks it; allowing it to
+    // pair again only lets it ask, and asking still needs approval here. Either is
+    // confirmed in a native dialog, so the page alone can't change who may connect.
+    func confirmRemove(_ device: LocalLink.PairedDevices.Device) {
+        confirm(device, remove: true)
+    }
+
+    func confirmAllowPairingAgain(_ device: LocalLink.PairedDevices.Device) {
+        confirm(device, remove: false)
+    }
+
+    private func confirm(_ device: LocalLink.PairedDevices.Device, remove: Bool) {
+        guard link != nil, deviceConfirmation == nil else { return }
+        let name = Self.displayName(device.name)
+        let alert = NSAlert()
+        if remove {
+            alert.messageText = "Remove \"\(name)\"?"
+            alert.informativeText = """
+                It is disconnected now and can't connect again until you allow it to pair again.
+
+                Device:
+                \(device.deviceFingerprint)
+                """
+        } else {
+            alert.messageText = "Allow \"\(name)\" to pair again?"
+            alert.informativeText = """
+                It can then ask to pair, and you will be asked to approve it here.
+
+                Device:
+                \(device.deviceFingerprint)
+                """
+        }
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: remove ? "Remove" : "Allow").hasDestructiveAction = remove
+        deviceConfirmation = alert
+        let finish: (NSApplication.ModalResponse) -> Void = { [weak self, weak alert] response in
+            guard let self, let alert, self.deviceConfirmation === alert else { return }
+            self.deviceConfirmation = nil
+            guard response == .alertSecondButtonReturn, let link = self.link else { return }
+            if remove { link.removeDevice(fingerprint: device.deviceFingerprint) }
+            else { link.forgetDevice(fingerprint: device.deviceFingerprint) }
+            self.log(remove ? "Removed device \(name)" : "Allowed \(name) to pair again")
+        }
+        if let window { alert.beginSheetModal(for: window, completionHandler: finish) }
+        else { finish(alert.runModal()) }
+    }
+
+    // A remote device chose this name: drop control, format (bidi) and line
+    // separator characters before showing it in a dialog, and keep it short.
+    nonisolated static func displayName(_ name: String) -> String {
+        let hidden: Set<Unicode.GeneralCategory> = [.control, .format, .lineSeparator, .paragraphSeparator]
+        var scalars = String.UnicodeScalarView()
+        scalars.append(contentsOf: name.unicodeScalars.filter { !hidden.contains($0.properties.generalCategory) })
+        let shown = String(scalars).trimmingCharacters(in: .whitespaces)
+        if shown.isEmpty { return "unnamed device" }
+        return shown.count > 64 ? String(shown.prefix(64)) + "…" : shown
+    }
+
+    private func dismissConfirmation() {
+        guard let alert = deviceConfirmation else { return }
+        deviceConfirmation = nil
+        if let sheetParent = alert.window.sheetParent { sheetParent.endSheet(alert.window) }
+        else if NSApp.modalWindow == alert.window { NSApp.abortModal() }
+    }
+
     private func dismissPrompt() {
         guard let (alert, _) = prompt else { return }
         prompt = nil
@@ -320,6 +396,7 @@ final class RemoteHost {
         releaseInput()
         clipboard.stop()
         dismissPrompt()
+        dismissConfirmation()
         streamWanted = false
         restartTask?.cancel()
         Task { await stopCapture() }
@@ -327,6 +404,7 @@ final class RemoteHost {
         sessions = 0
         onIdentity?(nil)
         onPairingNotice?(nil)
+        onPairedDevices?([])
         sleep.disable()
         log("Remote access off: \(reason); sleep assertion released")
         onExit?()

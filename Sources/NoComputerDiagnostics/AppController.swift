@@ -80,6 +80,18 @@ final class AppController: NSObject, NSApplicationDelegate {
             record("Accessibility requested")
         case .refreshPermissions:
             refreshPermissions()
+        case .removeDevice(let fingerprint):
+            guard let device = state.devices.first(where: { $0.deviceFingerprint == fingerprint && !$0.revoked }) else {
+                record("Ignored panel message removeDevice for a device that isn't listed as active")
+                return
+            }
+            remoteHost?.confirmRemove(device)
+        case .allowPairingAgain(let fingerprint):
+            guard let device = state.devices.first(where: { $0.deviceFingerprint == fingerprint && $0.revoked }) else {
+                record("Ignored panel message allowPairingAgain for a device that isn't listed as removed")
+                return
+            }
+            remoteHost?.confirmAllowPairingAgain(device)
         }
     }
 
@@ -107,6 +119,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             host.onIdentity = { [weak self] in self?.state.host = $0 }
             host.onPairingNotice = { [weak self] in self?.state.pairingNotice = $0 }
             host.onSession = { [weak self] in self?.state.session = $0 }
+            host.onPairedDevices = { [weak self] in self?.state.devices = $0 }
             host.onExit = { [weak self] in
                 self?.state.remoteOn = false
                 self?.state.remoteBusy = false
