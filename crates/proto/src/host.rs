@@ -336,7 +336,12 @@ impl Inner {
         self.emit(HostEvent::Session { device, name, reported_name });
         let clipboard = clipboard::start_sender(conn.clone());
         *self.outputs.lock().unwrap() = Some(Outputs { id: conn.stable_id(), video: queue.clone(), notices: notices_tx, clipboard });
-        tokio::spawn(video::send_loop(conn.clone(), queue.clone()));
+        let events = self.config.events.clone();
+        tokio::spawn(video::send_loop(conn.clone(), queue.clone(), move || {
+            if let Some(tx) = &events {
+                let _ = tx.send(HostEvent::KeyframeNeeded);
+            }
+        }));
         let events = self.config.events.clone();
         let side_streams = tokio::spawn(clipboard::receive_loop(conn.clone(), move |text| {
             if let Some(tx) = &events {

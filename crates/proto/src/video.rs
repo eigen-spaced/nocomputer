@@ -23,22 +23,24 @@ use tokio::sync::Notify;
 
 pub const VIDEO_STREAM_VERSION: u8 = 1;
 pub const MAX_ACCESS_UNIT: usize = 4 * 1024 * 1024;
-/// Frames queued for the controller before the host gives up on the current GOP.
-pub(crate) const QUEUE_FRAMES: usize = 8;
-/// Age of the oldest queued frame, beyond one round trip, at which the host gives up on the
-/// current GOP, so a stalled path at a low frame rate can't build seconds of backlog in a
-/// few frames.
-pub(crate) const QUEUE_AGE_US: u64 = 250_000;
+/// Frames queued for the controller before the host gives up on the current GOP (or, while
+/// a keyframe is being written, on the frames behind it).
+pub(crate) const QUEUE_FRAMES: usize = 120;
+/// Age of the oldest queued frame at which the host gives up on the current GOP, however
+/// the path is doing: the most video a slow path may fall behind.
+pub(crate) const QUEUE_AGE_US: u64 = 2_000_000;
+/// Silence from the viewer, beyond one round trip, while frames are waiting, at which the
+/// host treats the path as stalled: it drops what is queued and anything captured until the
+/// viewer is heard again, then asks for a keyframe. Frame age alone can't tell a stall from
+/// a slow or jittery relay, where a fresh keyframe after each pause costs more than it
+/// saves (live test over DERP, 2026-10-16). Acknowledgements keep arriving on a slow path.
+pub(crate) const STALL_US: u64 = 500_000;
 /// Bytes the host may buffer beyond quinn's congestion window. Quinn's default send window
 /// (about 1.25 MB per stream) let a stalled path absorb over a second of video that then
 /// arrived as a burst. Tracking the congestion window keeps a full path at any round trip
-/// while a stall soon blocks writes, so the queue overflows and skips to a fresh keyframe.
+/// while little is left buffered when a stall resets the GOP.
 pub(crate) const SEND_MARGIN: u64 = 256 * 1024;
 const MAX_SEND_WINDOW: u64 = 4 * 1024 * 1024;
-/// While a keyframe is still being written, deltas may queue up to this many: abandoning
-/// the GOP would discard the keyframe and ask for another just as large, which on a slow
-/// link never finishes.
-pub(crate) const QUEUE_FRAMES_BEHIND_KEYFRAME: usize = 60;
 /// Stream reset code when the host abandons a GOP.
 pub(crate) const RESET_GOP: u32 = 1;
 /// Stop code when the viewer abandons a GOP superseded by a newer one.
@@ -92,10 +94,15 @@ struct QueueState {
     items: VecDeque<Item>,
     /// Dropping deltas until the next keyframe.
     gap: bool,
-    /// The send loop is writing a keyframe.
+    /// The send loop is writing a keyframe. Abandoning it would discard it and ask for
+    /// another just as large, which on a slow link never finishes.
     keyframe_in_flight: bool,
-    /// The connection's latest round-trip estimate.
-    rtt_us: u64,
+    /// The send loop is writing a frame.
+    busy: bool,
+    /// The path is stalled: frames are dropped as they arrive.
+    stalled: bool,
+    /// Ask for a keyframe at the next push: frames were dropped for a stall.
+    want_keyframe: bool,
     closed: bool,
 }
 
@@ -105,13 +112,10 @@ impl QueueState {
             Item::Frame(_, at) => Some(*at),
             Item::Reset => None,
         });
-        let oldest = frames.next();
-        let count = oldest.map_or(0, |_| 1 + frames.count());
-        if self.keyframe_in_flight {
-            return count >= QUEUE_FRAMES_BEHIND_KEYFRAME;
-        }
-        count >= QUEUE_FRAMES || oldest.is_some_and(|at| host_us().saturating_sub(at) > QUEUE_AGE_US + self.rtt_us)
+        let Some(oldest) = frames.next() else { return false };
+        1 + frames.count() >= QUEUE_FRAMES || host_us().saturating_sub(oldest) > QUEUE_AGE_US
     }
+
 }
 
 /// Frames waiting to be sent to one controlling session.
@@ -142,13 +146,24 @@ impl VideoQueue {
             return Pushed::Dropped;
         }
         let keyframe = au.is_keyframe();
-        if s.gap && !keyframe {
+        if s.stalled {
             return Pushed::Dropped;
         }
+        if s.gap && !keyframe {
+            return match std::mem::take(&mut s.want_keyframe) {
+                true => Pushed::NeedKeyframe,
+                false => Pushed::Dropped,
+            };
+        }
         if s.overflowing() {
-            s.items.clear();
-            s.items.push_back(Item::Reset);
-            self.reset.notify_one();
+            // While a keyframe is being written, keep it and drop only what is behind it.
+            if s.keyframe_in_flight {
+                s.items.clear();
+            } else {
+                s.items.clear();
+                s.items.push_back(Item::Reset);
+                self.reset.notify_one();
+            }
             if !keyframe {
                 s.gap = true;
                 self.ready.notify_one();
@@ -157,18 +172,40 @@ impl VideoQueue {
         }
         if keyframe {
             s.gap = false;
+            s.want_keyframe = false;
         }
         s.items.push_back(Item::Frame(au, host_us()));
         self.ready.notify_one();
         Pushed::Queued
     }
 
-    fn rtt(&self, rtt: std::time::Duration) {
-        self.state.lock().unwrap().rtt_us = rtt.as_micros() as u64;
+    /// Enters or leaves a stall. Returns true when leaving one, when the caller should ask
+    /// for a keyframe in case nothing new is captured.
+    fn stalled(&self, on: bool) -> bool {
+        let mut s = self.state.lock().unwrap();
+        let was = std::mem::replace(&mut s.stalled, on);
+        if on && !was {
+            // Resetting the GOP also discards what quinn still buffers for it.
+            s.items.clear();
+            s.items.push_back(Item::Reset);
+            s.gap = true;
+            s.want_keyframe = true;
+            self.reset.notify_one();
+            self.ready.notify_one();
+        }
+        was && !on
     }
 
-    fn keyframe_in_flight(&self, on: bool) {
-        self.state.lock().unwrap().keyframe_in_flight = on;
+    /// Frames are waiting or being written, so the viewer should be acknowledging them.
+    fn sending(&self) -> bool {
+        let s = self.state.lock().unwrap();
+        s.busy || s.items.iter().any(|i| matches!(i, Item::Frame(..)))
+    }
+
+    fn writing(&self, on: bool, keyframe: bool) {
+        let mut s = self.state.lock().unwrap();
+        s.busy = on;
+        s.keyframe_in_flight = on && keyframe;
     }
 
     pub(crate) fn close(&self) {
@@ -211,7 +248,37 @@ pub(crate) async fn write_frame(stream: &mut quinn::SendStream, au: &AccessUnit,
 }
 
 /// Sends queued frames to the viewer until the queue is closed or the connection ends.
-pub(crate) async fn send_loop(conn: quinn::Connection, queue: Arc<VideoQueue>) -> Result<(), Error> {
+/// `keyframe_needed` is called after a stall, in case the screen doesn't change again.
+pub(crate) async fn send_loop(conn: quinn::Connection, queue: Arc<VideoQueue>, keyframe_needed: impl Fn() + Send + 'static) -> Result<(), Error> {
+    let watch = tokio::spawn(watch_for_stalls(conn.clone(), queue.clone(), keyframe_needed));
+    let result = send_frames(conn, queue).await;
+    watch.abort();
+    result
+}
+
+/// Marks the path stalled when the viewer has been silent for [`STALL_US`] beyond a round
+/// trip while frames are waiting, and recovered when it is heard again.
+async fn watch_for_stalls(conn: quinn::Connection, queue: Arc<VideoQueue>, keyframe_needed: impl Fn()) {
+    let mut heard = (conn.stats().udp_rx.datagrams, Instant::now());
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
+    loop {
+        tick.tick().await;
+        let stats = conn.stats();
+        if stats.udp_rx.datagrams != heard.0 {
+            heard = (stats.udp_rx.datagrams, Instant::now());
+            if queue.stalled(false) {
+                keyframe_needed();
+            }
+        } else if !queue.sending() {
+            // Nothing to acknowledge: silence means nothing.
+            heard.1 = Instant::now();
+        } else if heard.1.elapsed() > std::time::Duration::from_micros(STALL_US) + stats.path.rtt {
+            queue.stalled(true);
+        }
+    }
+}
+
+async fn send_frames(conn: quinn::Connection, queue: Arc<VideoQueue>) -> Result<(), Error> {
     let mut current: Option<quinn::SendStream> = None;
     while let Some(item) = queue.pop().await {
         let (au, at) = match item {
@@ -223,13 +290,8 @@ pub(crate) async fn send_loop(conn: quinn::Connection, queue: Arc<VideoQueue>) -
             }
             Item::Frame(au, at) => (au, at),
         };
-        let path = conn.stats().path;
-        conn.set_send_window((path.cwnd + SEND_MARGIN).min(MAX_SEND_WINDOW));
-        queue.rtt(path.rtt);
-        let keyframe = au.is_keyframe();
-        if keyframe {
-            queue.keyframe_in_flight(true);
-        }
+        conn.set_send_window((conn.stats().path.cwnd + SEND_MARGIN).min(MAX_SEND_WINDOW));
+        queue.writing(true, au.is_keyframe());
         let write = async {
             if let Some(codec) = &au.codec {
                 if let Some(mut s) = current.take() {
@@ -250,9 +312,7 @@ pub(crate) async fn send_loop(conn: quinn::Connection, queue: Arc<VideoQueue>) -
             r = write => r,
             _ = queue.reset.notified() => Ok(()),
         };
-        if keyframe {
-            queue.keyframe_in_flight(false);
-        }
+        queue.writing(false, false);
         written?;
     }
     if let Some(mut s) = current.take() {

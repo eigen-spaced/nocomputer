@@ -719,8 +719,9 @@ struct Run {
 
 /// Streams about 8 Mbit/s at 60 fps through a relay, like a scrolling desktop, sending a
 /// keyframe of `keyframe_bytes` whenever the queue asks for one, and holds the path for
-/// `stall` after one second.
-async fn stream_through_stall(rate: Rate, delay: std::time::Duration, keyframe_bytes: usize, stall: std::time::Duration) -> Run {
+/// `stall` after one second, then `hiccups` times for 300 ms with 300 ms between, like a
+/// jittery relay.
+async fn stream_through_stall(rate: Rate, delay: std::time::Duration, keyframe_bytes: usize, stall: std::time::Duration, hiccups: usize) -> Run {
     use crate::video::{host_us, send_loop, Pushed, VideoQueue};
     use std::time::Duration;
     let host_id = Identity::generate().unwrap();
@@ -736,7 +737,7 @@ async fn stream_through_stall(rate: Rate, delay: std::time::Duration, keyframe_b
 
     let queue = VideoQueue::new();
     let keyframes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    tokio::spawn(send_loop(host, queue.clone()));
+    tokio::spawn(send_loop(host, queue.clone(), || {}));
     let encoder = {
         let (queue, keyframes) = (queue.clone(), keyframes.clone());
         tokio::spawn(async move {
@@ -769,6 +770,12 @@ async fn stream_through_stall(rate: Rate, delay: std::time::Duration, keyframe_b
     tokio::time::sleep(stall).await;
     relay.hold(false);
     let resumed = host_us();
+    for _ in 0..hiccups {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        relay.hold(true);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        relay.hold(false);
+    }
     tokio::time::sleep(Duration::from_secs(2)).await;
     encoder.abort();
     reader.abort();
@@ -788,7 +795,7 @@ fn fresh(run: &Run) -> usize {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stalled_path_resumes_without_replaying_stale_video() {
-    let run = stream_through_stall(None, std::time::Duration::ZERO, 120_000, std::time::Duration::from_millis(1500)).await;
+    let run = stream_through_stall(None, std::time::Duration::ZERO, 120_000, std::time::Duration::from_millis(1500), 0).await;
     let stale = run.after.iter().filter(|(at, sent)| at - sent > 300_000).count();
     assert!(run.before > 30, "video flowed before the stall");
     assert!(fresh(&run) > 30, "video is live again after the stall");
@@ -799,12 +806,21 @@ async fn a_stalled_path_resumes_without_replaying_stale_video() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_large_keyframe_on_a_modest_link_does_not_loop() {
     // 300 KB keyframes over 12 Mbit/s: each takes about 200 ms to send.
-    let run = stream_through_stall(Some(1_500_000), std::time::Duration::ZERO, 300_000, std::time::Duration::ZERO).await;
+    let run = stream_through_stall(Some(1_500_000), std::time::Duration::ZERO, 300_000, std::time::Duration::ZERO, 0).await;
     // The link is nearly full, so some delay is expected; a backlog must not keep growing.
     let oldest = run.after.iter().map(|(at, sent)| at - sent).max().unwrap_or(u64::MAX);
     assert!(run.after.len() > 60, "video keeps flowing: {} frames", run.after.len());
     assert!(oldest < 600_000, "video fell {} ms behind", oldest / 1000);
     assert!(run.keyframes <= 3, "{} keyframes: the host keeps abandoning its own keyframe", run.keyframes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_jittery_path_keeps_video_flowing() {
+    // A relay that pauses for 300 ms at a time is slow, not stalled. Abandoning the GOP each
+    // time sent a keyframe after every pause, and scrolling showed few updates (2026-10-16).
+    let run = stream_through_stall(Some(3_000_000), std::time::Duration::from_millis(60), 120_000, std::time::Duration::ZERO, 3).await;
+    assert!(run.keyframes <= 1, "{} keyframes: a short pause abandoned the GOP", run.keyframes);
+    assert!(run.after.len() > 100, "{} frames", run.after.len());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -814,7 +830,7 @@ async fn a_large_keyframe_on_a_modest_link_does_not_loop() {
 async fn a_long_round_trip_keeps_the_full_frame_rate() {
     // 100 ms round trip: a fixed 256 KB send window capped this near its bandwidth-delay
     // product, and at 200 ms it collapsed to keyframe resets.
-    let run = stream_through_stall(None, std::time::Duration::from_millis(50), 300_000, std::time::Duration::ZERO).await;
+    let run = stream_through_stall(None, std::time::Duration::from_millis(50), 300_000, std::time::Duration::ZERO, 0).await;
     let mut ages: Vec<u64> = run.after.iter().map(|(at, sent)| at - sent).collect();
     ages.sort();
     assert!(run.after.len() > 100, "{} frames in two seconds", run.after.len());
