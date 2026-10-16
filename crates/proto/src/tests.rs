@@ -552,6 +552,17 @@ fn slow_viewer_drops_to_the_next_keyframe() {
     assert_eq!(queue.push(crate::AccessUnit::delta(vec![6])), Pushed::Queued);
 }
 
+#[test]
+fn a_stale_queue_drops_to_the_next_keyframe() {
+    use crate::video::{Pushed, VideoQueue, QUEUE_AGE_US};
+    let queue = VideoQueue::new();
+    assert_eq!(queue.push(crate::AccessUnit::keyframe("avc1.4D0028", vec![1])), Pushed::Queued);
+    // Two frames at a low frame rate, but the first has waited too long.
+    std::thread::sleep(std::time::Duration::from_micros(QUEUE_AGE_US + 50_000));
+    assert_eq!(queue.push(crate::AccessUnit::delta(vec![2])), Pushed::NeedKeyframe);
+    assert_eq!(queue.push(crate::AccessUnit::keyframe("avc1.4D0028", vec![3])), Pushed::Queued);
+}
+
 /// A raw host and viewer connection, so a test can write malformed or partial streams.
 async fn raw_pair() -> (quinn::Connection, quinn::Connection, quinn::Endpoint, quinn::Endpoint) {
     let host_id = Identity::generate().unwrap();
@@ -621,6 +632,187 @@ async fn reset_gop_never_reaches_the_decoder_without_its_keyframe() {
 
     let after: Vec<_> = [video.next().await.unwrap(), video.next().await.unwrap()].into_iter().map(|f| (f.keyframe, f.data)).collect();
     assert_eq!(after, vec![(true, vec![5]), (false, vec![6])]);
+}
+
+/// A UDP relay on loopback that can hold every packet, both ways, and later release them
+/// in a burst: how a relayed (DERP) path behaves when it stalls.
+struct StallingRelay {
+    addr: SocketAddr,
+    held: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Bytes per second the relay passes each way, or `None` for no limit.
+type Rate = Option<u64>;
+/// A packet held during a stall, and whether it was headed to the server.
+type Held = (bool, Vec<u8>);
+
+impl StallingRelay {
+    async fn start(server: SocketAddr, rate: Rate, delay: std::time::Duration) -> Self {
+        use std::sync::atomic::Ordering;
+        let front = Arc::new(tokio::net::UdpSocket::bind(SocketAddr::from(LOOPBACK)).await.unwrap());
+        let back = Arc::new(tokio::net::UdpSocket::bind(SocketAddr::from(LOOPBACK)).await.unwrap());
+        let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client: Arc<Mutex<Option<SocketAddr>>> = Arc::default();
+        let queue: Arc<Mutex<Vec<Held>>> = Arc::default();
+        let addr = front.local_addr().unwrap();
+        for to_server in [true, false] {
+            let (from, front, back, held, client, queue) = (if to_server { front.clone() } else { back.clone() }, front.clone(), back.clone(), held.clone(), client.clone(), queue.clone());
+            tokio::spawn(async move {
+                // Delayed packets leave in order from one task, as from a real link.
+                let (line, mut due) = tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, bool, SocketAddr, Vec<u8>)>();
+                let (f, b) = (front.clone(), back.clone());
+                tokio::spawn(async move {
+                    while let Some((at, up, to, packet)) = due.recv().await {
+                        tokio::time::sleep_until(at).await;
+                        let _ = if up { b.send_to(&packet, to).await } else { f.send_to(&packet, to).await };
+                    }
+                });
+                let mut buf = vec![0u8; 65536];
+                let mut next = tokio::time::Instant::now();
+                loop {
+                    let (n, src) = from.recv_from(&mut buf).await.unwrap();
+                    if to_server {
+                        *client.lock().unwrap() = Some(src);
+                    }
+                    if held.load(Ordering::SeqCst) {
+                        queue.lock().unwrap().push((to_server, buf[..n].to_vec()));
+                        continue;
+                    }
+                    let backlog: Vec<_> = std::mem::take(&mut *queue.lock().unwrap());
+                    let peer = client.lock().unwrap().unwrap();
+                    for (up, packet) in backlog.iter().map(|(u, p)| (*u, &p[..])).chain([(to_server, &buf[..n])]) {
+                        let len = packet.len() as u64;
+                        let to = if up { server } else { peer };
+                        if delay.is_zero() {
+                            let _ = if up { back.send_to(packet, to).await } else { front.send_to(packet, to).await };
+                        } else {
+                            let _ = line.send((tokio::time::Instant::now() + delay, up, to, packet.to_vec()));
+                        }
+                        if let Some(rate) = rate {
+                            let now = tokio::time::Instant::now();
+                            next = next.max(now) + std::time::Duration::from_micros(len * 1_000_000 / rate);
+                            if next > now + std::time::Duration::from_millis(2) {
+                                tokio::time::sleep_until(next).await;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        StallingRelay { addr, held }
+    }
+
+    fn hold(&self, on: bool) {
+        self.held.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct Run {
+    /// (arrived, sent) on the host clock, for frames that arrived after the stall.
+    after: Vec<(u64, u64)>,
+    before: usize,
+    keyframes: usize,
+}
+
+/// Streams about 8 Mbit/s at 60 fps through a relay, like a scrolling desktop, sending a
+/// keyframe of `keyframe_bytes` whenever the queue asks for one, and holds the path for
+/// `stall` after one second.
+async fn stream_through_stall(rate: Rate, delay: std::time::Duration, keyframe_bytes: usize, stall: std::time::Duration) -> Run {
+    use crate::video::{host_us, send_loop, Pushed, VideoQueue};
+    use std::time::Duration;
+    let host_id = Identity::generate().unwrap();
+    let tls = tls::server_builder().unwrap().with_single_cert(vec![host_id.cert()], host_id.key()).unwrap();
+    let server = quinn::Endpoint::server(tls::finish_server(tls).unwrap(), LOOPBACK.into()).unwrap();
+    let relay = StallingRelay::start(server.local_addr().unwrap(), rate, delay).await;
+    let viewer_id = Identity::generate().unwrap();
+    let tls = tls::client_builder(Some(host_id.fingerprint()), Arc::default()).unwrap().with_client_auth_cert(vec![viewer_id.cert()], viewer_id.key()).unwrap();
+    let client = quinn::Endpoint::client(LOOPBACK.into()).unwrap();
+    let connecting = client.connect_with(tls::finish_client(tls).unwrap(), relay.addr, crate::SERVER_NAME).unwrap();
+    let (host, viewer) = tokio::join!(async { server.accept().await.unwrap().await.unwrap() }, connecting);
+    let viewer = viewer.unwrap();
+
+    let queue = VideoQueue::new();
+    let keyframes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    tokio::spawn(send_loop(host, queue.clone()));
+    let encoder = {
+        let (queue, keyframes) = (queue.clone(), keyframes.clone());
+        tokio::spawn(async move {
+            let mut keyframe = true;
+            let mut tick = tokio::time::interval(Duration::from_micros(16_667));
+            loop {
+                tick.tick().await;
+                if keyframe {
+                    keyframes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                let au = if keyframe { crate::AccessUnit::keyframe("avc1.4D0028", vec![1; keyframe_bytes]) } else { crate::AccessUnit::delta(vec![2; 16_000]) };
+                keyframe = matches!(queue.push(au), Pushed::NeedKeyframe);
+            }
+        })
+    };
+
+    let arrivals: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
+    let reader = {
+        let arrivals = arrivals.clone();
+        tokio::spawn(async move {
+            let mut video = crate::VideoReceiver::new(viewer);
+            while let Ok(f) = video.next().await {
+                arrivals.lock().unwrap().push((host_us(), f.host_us));
+            }
+        })
+    };
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    relay.hold(true);
+    tokio::time::sleep(stall).await;
+    relay.hold(false);
+    let resumed = host_us();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    encoder.abort();
+    reader.abort();
+
+    let arrivals = arrivals.lock().unwrap().clone();
+    let after: Vec<_> = arrivals.iter().copied().filter(|(at, _)| *at >= resumed).collect();
+    let run = Run { before: arrivals.len() - after.len(), after, keyframes: keyframes.load(std::sync::atomic::Ordering::SeqCst) };
+    let stale = run.after.iter().filter(|(at, sent)| at - sent > 300_000).count();
+    let oldest = run.after.iter().map(|(at, sent)| at - sent).max().unwrap_or(0) / 1000;
+    eprintln!("{} frames before the stall; {} after it, {stale} over 300 ms old (oldest {oldest} ms); {} keyframes", run.before, run.after.len(), run.keyframes);
+    run
+}
+
+fn fresh(run: &Run) -> usize {
+    run.after.iter().filter(|(at, sent)| at - sent <= 100_000).count()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_path_resumes_without_replaying_stale_video() {
+    let run = stream_through_stall(None, std::time::Duration::ZERO, 120_000, std::time::Duration::from_millis(1500)).await;
+    let stale = run.after.iter().filter(|(at, sent)| at - sent > 300_000).count();
+    assert!(run.before > 30, "video flowed before the stall");
+    assert!(fresh(&run) > 30, "video is live again after the stall");
+    // Only frames already in flight when the path stalled; quinn's default window replayed 20-30.
+    assert!(stale <= 6, "{stale} stale frames were replayed after the stall");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_large_keyframe_on_a_modest_link_does_not_loop() {
+    // 300 KB keyframes over 12 Mbit/s: each takes about 200 ms to send.
+    let run = stream_through_stall(Some(1_500_000), std::time::Duration::ZERO, 300_000, std::time::Duration::ZERO).await;
+    // The link is nearly full, so some delay is expected; a backlog must not keep growing.
+    let oldest = run.after.iter().map(|(at, sent)| at - sent).max().unwrap_or(u64::MAX);
+    assert!(run.after.len() > 60, "video keeps flowing: {} frames", run.after.len());
+    assert!(oldest < 600_000, "video fell {} ms behind", oldest / 1000);
+    assert!(run.keyframes <= 3, "{} keyframes: the host keeps abandoning its own keyframe", run.keyframes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_round_trip_keeps_the_full_frame_rate() {
+    // 100 ms round trip: a fixed 256 KB send window capped this near its bandwidth-delay
+    // product, and at 200 ms it collapsed to keyframe resets.
+    let run = stream_through_stall(None, std::time::Duration::from_millis(50), 300_000, std::time::Duration::ZERO).await;
+    let mut ages: Vec<u64> = run.after.iter().map(|(at, sent)| at - sent).collect();
+    ages.sort();
+    assert!(run.after.len() > 100, "{} frames in two seconds", run.after.len());
+    assert!(ages[ages.len() * 9 / 10] < 150_000, "p90 frame age {} ms", ages[ages.len() * 9 / 10] / 1000);
 }
 
 #[test]

@@ -25,13 +25,27 @@ pub const VIDEO_STREAM_VERSION: u8 = 1;
 pub const MAX_ACCESS_UNIT: usize = 4 * 1024 * 1024;
 /// Frames queued for the controller before the host gives up on the current GOP.
 pub(crate) const QUEUE_FRAMES: usize = 8;
+/// Age of the oldest queued frame, beyond one round trip, at which the host gives up on the
+/// current GOP, so a stalled path at a low frame rate can't build seconds of backlog in a
+/// few frames.
+pub(crate) const QUEUE_AGE_US: u64 = 250_000;
+/// Bytes the host may buffer beyond quinn's congestion window. Quinn's default send window
+/// (about 1.25 MB per stream) let a stalled path absorb over a second of video that then
+/// arrived as a burst. Tracking the congestion window keeps a full path at any round trip
+/// while a stall soon blocks writes, so the queue overflows and skips to a fresh keyframe.
+pub(crate) const SEND_MARGIN: u64 = 256 * 1024;
+const MAX_SEND_WINDOW: u64 = 4 * 1024 * 1024;
+/// While a keyframe is still being written, deltas may queue up to this many: abandoning
+/// the GOP would discard the keyframe and ask for another just as large, which on a slow
+/// link never finishes.
+pub(crate) const QUEUE_FRAMES_BEHIND_KEYFRAME: usize = 60;
 /// Stream reset code when the host abandons a GOP.
 pub(crate) const RESET_GOP: u32 = 1;
 /// Stop code when the viewer abandons a GOP superseded by a newer one.
 const STOP_SUPERSEDED: u32 = 1;
 const FLAG_KEYFRAME: u8 = 1;
 
-fn host_us() -> u64 {
+pub(crate) fn host_us() -> u64 {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     EPOCH.get_or_init(Instant::now).elapsed().as_micros() as u64
 }
@@ -78,7 +92,26 @@ struct QueueState {
     items: VecDeque<Item>,
     /// Dropping deltas until the next keyframe.
     gap: bool,
+    /// The send loop is writing a keyframe.
+    keyframe_in_flight: bool,
+    /// The connection's latest round-trip estimate.
+    rtt_us: u64,
     closed: bool,
+}
+
+impl QueueState {
+    fn overflowing(&self) -> bool {
+        let mut frames = self.items.iter().filter_map(|i| match i {
+            Item::Frame(_, at) => Some(*at),
+            Item::Reset => None,
+        });
+        let oldest = frames.next();
+        let count = oldest.map_or(0, |_| 1 + frames.count());
+        if self.keyframe_in_flight {
+            return count >= QUEUE_FRAMES_BEHIND_KEYFRAME;
+        }
+        count >= QUEUE_FRAMES || oldest.is_some_and(|at| host_us().saturating_sub(at) > QUEUE_AGE_US + self.rtt_us)
+    }
 }
 
 /// Frames waiting to be sent to one controlling session.
@@ -112,7 +145,7 @@ impl VideoQueue {
         if s.gap && !keyframe {
             return Pushed::Dropped;
         }
-        if s.items.iter().filter(|i| matches!(i, Item::Frame(..))).count() >= QUEUE_FRAMES {
+        if s.overflowing() {
             s.items.clear();
             s.items.push_back(Item::Reset);
             self.reset.notify_one();
@@ -128,6 +161,14 @@ impl VideoQueue {
         s.items.push_back(Item::Frame(au, host_us()));
         self.ready.notify_one();
         Pushed::Queued
+    }
+
+    fn rtt(&self, rtt: std::time::Duration) {
+        self.state.lock().unwrap().rtt_us = rtt.as_micros() as u64;
+    }
+
+    fn keyframe_in_flight(&self, on: bool) {
+        self.state.lock().unwrap().keyframe_in_flight = on;
     }
 
     pub(crate) fn close(&self) {
@@ -182,6 +223,13 @@ pub(crate) async fn send_loop(conn: quinn::Connection, queue: Arc<VideoQueue>) -
             }
             Item::Frame(au, at) => (au, at),
         };
+        let path = conn.stats().path;
+        conn.set_send_window((path.cwnd + SEND_MARGIN).min(MAX_SEND_WINDOW));
+        queue.rtt(path.rtt);
+        let keyframe = au.is_keyframe();
+        if keyframe {
+            queue.keyframe_in_flight(true);
+        }
         let write = async {
             if let Some(codec) = &au.codec {
                 if let Some(mut s) = current.take() {
@@ -198,10 +246,14 @@ pub(crate) async fn send_loop(conn: quinn::Connection, queue: Arc<VideoQueue>) -
         };
         // A write blocked on flow control is abandoned when the queue overflows; the
         // queued Reset then discards the stream.
-        tokio::select! {
-            r = write => r?,
-            _ = queue.reset.notified() => {}
+        let written = tokio::select! {
+            r = write => r,
+            _ = queue.reset.notified() => Ok(()),
+        };
+        if keyframe {
+            queue.keyframe_in_flight(false);
         }
+        written?;
     }
     if let Some(mut s) = current.take() {
         let _ = s.finish();

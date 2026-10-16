@@ -136,6 +136,10 @@ pub(crate) fn client_builder(
         .with_custom_certificate_verifier(Arc::new(HostVerifier { pinned, presented, algs })))
 }
 
+/// The host's starting send window; the video send loop then tracks the congestion window
+/// (see `video::SEND_MARGIN`).
+const SEND_WINDOW: u64 = crate::video::SEND_MARGIN;
+
 /// `incoming_uni`: unidirectional streams the peer may open at once (video GOPs, host to
 /// viewer only).
 fn transport(incoming_uni: u32) -> Arc<quinn::TransportConfig> {
@@ -154,7 +158,9 @@ pub(crate) fn finish_server(mut tls: rustls::ServerConfig) -> Result<quinn::Serv
     tls.max_early_data_size = 0;
     let quic = QuicServerConfig::try_from(tls).map_err(|e| Error::Protocol(e.to_string()))?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic));
-    config.transport_config(transport(0));
+    let mut t = transport(0);
+    Arc::get_mut(&mut t).expect("fresh config").send_window(SEND_WINDOW);
+    config.transport_config(t);
     Ok(config)
 }
 
